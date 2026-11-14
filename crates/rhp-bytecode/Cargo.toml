@@ -1,0 +1,9 @@
+[package]
+name = "rhp-bytecode"
+version = "0.1.0"
+edition = "2021"
+description = "Bytecode e geracao de codigo para a linguagem RHP (Fase 1)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rhp-parser = { path = "../rhp-parser" }

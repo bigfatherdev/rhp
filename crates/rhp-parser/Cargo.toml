@@ -1,0 +1,9 @@
+[package]
+name = "rhp-parser"
+version = "0.1.0"
+edition = "2021"
+description = "Parser escrito a mao + AST para a linguagem RHP (Fase 1)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rhp-lexer = { path = "../rhp-lexer" }

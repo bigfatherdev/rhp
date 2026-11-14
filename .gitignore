@@ -1,0 +1,14 @@
+# Artefatos de build (nunca versionar: 186M+ regeneraveis via cargo build)
+target/
+
+# Logs e backups locais
+*.log
+*.orig
+*~
+*.swp
+*.swo
+
+# SO / editores
+.DS_Store
+.idea/
+.vscode/

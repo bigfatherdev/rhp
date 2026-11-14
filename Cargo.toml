@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/rhp-lexer",
+    "crates/rhp-parser",
+    "crates/rhp-bytecode",
+    "crates/rhp-vm",
+    "crates/rhp-fmt",
+    "crates/rhp-cli",
+]
+resolver = "2"
