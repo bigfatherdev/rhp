@@ -1,0 +1,10 @@
+[package]
+name = "rhp-fmt"
+version = "0.1.0"
+edition = "2021"
+description = "Formatador oficial do RHP (Fase 5: canonico e idempotente)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rhp-parser = { path = "../rhp-parser" }
+rhp-lexer = { path = "../rhp-lexer" }
