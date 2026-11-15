@@ -85,6 +85,229 @@ pub(super) fn call_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, Vm
             ))),
         },
         Builtin::Type => Ok(Value::Str(type_name(&args[0]).to_string())),
+        Builtin::Contains => match (&args[0], &args[1]) {
+            (Value::Str(hay), Value::Str(needle)) => Ok(Value::Bool(hay.contains(needle as &str))),
+            (other, _) => Err(VmError::new(format!(
+                "`contains` exige strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::StartsWith => match (&args[0], &args[1]) {
+            (Value::Str(hay), Value::Str(prefix)) => {
+                Ok(Value::Bool(hay.starts_with(prefix as &str)))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`starts_with` exige strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::EndsWith => match (&args[0], &args[1]) {
+            (Value::Str(hay), Value::Str(suffix)) => Ok(Value::Bool(hay.ends_with(suffix as &str))),
+            (other, _) => Err(VmError::new(format!(
+                "`ends_with` exige strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Split => match (&args[0], &args[1]) {
+            (Value::Str(text), Value::Str(sep)) => {
+                let parts: Vec<Value> = if sep.is_empty() {
+                    text.chars().map(|c| Value::Str(c.to_string())).collect()
+                } else {
+                    text.split(sep as &str)
+                        .map(|s| Value::Str(s.to_string()))
+                        .collect()
+                };
+                Ok(Value::Array(parts))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`split` exige strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Join => match (&args[0], &args[1]) {
+            (Value::Array(items), Value::Str(sep)) => {
+                let mut parts: Vec<&str> = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Str(s) => parts.push(s),
+                        other => {
+                            return Err(VmError::new(format!(
+                                "`join` exige array de strings, encontrado {}",
+                                type_name(other)
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::Str(parts.join(sep as &str)))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`join` exige (array, string), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Trim => match &args[0] {
+            Value::Str(s) => Ok(Value::Str(s.trim().to_string())),
+            other => Err(VmError::new(format!(
+                "`trim` exige string, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Upper => match &args[0] {
+            Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+            other => Err(VmError::new(format!(
+                "`upper` exige string, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Lower => match &args[0] {
+            Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+            other => Err(VmError::new(format!(
+                "`lower` exige string, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Replace => match (&args[0], &args[1], &args[2]) {
+            (Value::Str(text), Value::Str(from), Value::Str(to)) => {
+                Ok(Value::Str(text.replace(from as &str, to as &str)))
+            }
+            (other, _, _) => Err(VmError::new(format!(
+                "`replace` exige (string, string, string), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Abs => match &args[0] {
+            Value::Int(v) => v
+                .checked_abs()
+                .map(Value::Int)
+                .ok_or_else(|| VmError::new("estouro de inteiro em `abs`".to_string())),
+            Value::Float(v) => Ok(Value::Float(v.abs())),
+            other => Err(VmError::new(format!(
+                "`abs` exige numero, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Min => match (&args[0], &args[1]) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
+            (other, _) => Err(VmError::new(format!(
+                "`min` exige numeros, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Max => match (&args[0], &args[1]) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
+            (other, _) => Err(VmError::new(format!(
+                "`max` exige numeros, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Sqrt => match &args[0] {
+            Value::Int(v) if *v >= 0 => Ok(Value::Float((*v as f64).sqrt())),
+            Value::Float(v) if *v >= 0.0 => Ok(Value::Float(v.sqrt())),
+            Value::Int(_) | Value::Float(_) => {
+                Err(VmError::new("`sqrt` de numero negativo".to_string()))
+            }
+            other => Err(VmError::new(format!(
+                "`sqrt` exige numero, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Pow => match (&args[0], &args[1]) {
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Float((*a as f64).powf(*b as f64))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.powf(*b))),
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).powf(*b))),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.powf(*b as f64))),
+            (other, _) => Err(VmError::new(format!(
+                "`pow` exige numeros, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Floor => match &args[0] {
+            Value::Int(v) => Ok(Value::Int(*v)),
+            Value::Float(v) => {
+                if !v.is_finite() || *v >= 2f64.powi(63) || *v < -(2f64.powi(63)) {
+                    return Err(VmError::new(format!("`floor` fora do intervalo: {v}")));
+                }
+                Ok(Value::Int(v.floor() as i64))
+            }
+            other => Err(VmError::new(format!(
+                "`floor` exige numero, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Ceil => match &args[0] {
+            Value::Int(v) => Ok(Value::Int(*v)),
+            Value::Float(v) => {
+                if !v.is_finite() || *v >= 2f64.powi(63) || *v < -(2f64.powi(63)) {
+                    return Err(VmError::new(format!("`ceil` fora do intervalo: {v}")));
+                }
+                Ok(Value::Int(v.ceil() as i64))
+            }
+            other => Err(VmError::new(format!(
+                "`ceil` exige numero, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Values => match &args[0] {
+            Value::Map(entries) => {
+                let mut keys: Vec<&String> = entries.keys().collect();
+                keys.sort();
+                Ok(Value::Array(
+                    keys.into_iter()
+                        .map(|k| entries.get(k).expect("chave existe").clone())
+                        .collect(),
+                ))
+            }
+            other => Err(VmError::new(format!(
+                "`values` exige mapa, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Entries => match &args[0] {
+            Value::Map(entries) => {
+                let mut keys: Vec<&String> = entries.keys().collect();
+                keys.sort();
+                Ok(Value::Array(
+                    keys.into_iter()
+                        .map(|k| {
+                            Value::Array(vec![
+                                Value::Str(k.clone()),
+                                entries.get(k).expect("chave existe").clone(),
+                            ])
+                        })
+                        .collect(),
+                ))
+            }
+            other => Err(VmError::new(format!(
+                "`entries` exige mapa, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Merge => match (&args[0], &args[1]) {
+            (Value::Map(a), Value::Map(b)) => {
+                let mut merged = a.clone();
+                for (k, v) in b {
+                    merged.insert(k.clone(), v.clone());
+                }
+                Ok(Value::Map(merged))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`merge` exige dois mapas, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Has => match (&args[0], &args[1]) {
+            (Value::Map(entries), Value::Str(key)) => Ok(Value::Bool(entries.contains_key(key))),
+            (other, _) => Err(VmError::new(format!(
+                "`has` exige (mapa, string), encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::Assert => match &args[0] {
             Value::Bool(true) => Ok(Value::Null),
             Value::Bool(false) => Err(VmError::new("falha de assercao".to_string())),

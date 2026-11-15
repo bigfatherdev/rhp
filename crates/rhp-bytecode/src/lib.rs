@@ -82,6 +82,27 @@ pub enum Builtin {
     Assert,
     /// `http_get(url)` — cliente HTTP minimo (somente `http://`), Fase 6.
     HttpGet,
+    // Biblioteca-padrao: strings, matematica e mapas (prox. evolucao).
+    Contains,
+    StartsWith,
+    EndsWith,
+    Split,
+    Join,
+    Trim,
+    Upper,
+    Lower,
+    Replace,
+    Abs,
+    Min,
+    Max,
+    Sqrt,
+    Pow,
+    Floor,
+    Ceil,
+    Values,
+    Entries,
+    Merge,
+    Has,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -98,6 +119,26 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "type" => Some(Builtin::Type),
         "assert" => Some(Builtin::Assert),
         "http_get" => Some(Builtin::HttpGet),
+        "contains" => Some(Builtin::Contains),
+        "starts_with" => Some(Builtin::StartsWith),
+        "ends_with" => Some(Builtin::EndsWith),
+        "split" => Some(Builtin::Split),
+        "join" => Some(Builtin::Join),
+        "trim" => Some(Builtin::Trim),
+        "upper" => Some(Builtin::Upper),
+        "lower" => Some(Builtin::Lower),
+        "replace" => Some(Builtin::Replace),
+        "abs" => Some(Builtin::Abs),
+        "min" => Some(Builtin::Min),
+        "max" => Some(Builtin::Max),
+        "sqrt" => Some(Builtin::Sqrt),
+        "pow" => Some(Builtin::Pow),
+        "floor" => Some(Builtin::Floor),
+        "ceil" => Some(Builtin::Ceil),
+        "values" => Some(Builtin::Values),
+        "entries" => Some(Builtin::Entries),
+        "merge" => Some(Builtin::Merge),
+        "has" => Some(Builtin::Has),
         _ => None,
     }
 }
@@ -113,8 +154,28 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Float
         | Builtin::Type
         | Builtin::Assert
-        | Builtin::HttpGet => 1,
-        Builtin::Push => 2,
+        | Builtin::HttpGet
+        | Builtin::Trim
+        | Builtin::Upper
+        | Builtin::Lower
+        | Builtin::Abs
+        | Builtin::Sqrt
+        | Builtin::Floor
+        | Builtin::Ceil
+        | Builtin::Values
+        | Builtin::Entries => 1,
+        Builtin::Push
+        | Builtin::Has
+        | Builtin::Contains
+        | Builtin::StartsWith
+        | Builtin::EndsWith
+        | Builtin::Split
+        | Builtin::Join
+        | Builtin::Min
+        | Builtin::Max
+        | Builtin::Pow
+        | Builtin::Merge => 2,
+        Builtin::Replace => 3,
     }
 }
 
@@ -195,6 +256,26 @@ impl BuiltinId {
             7 => Ok(Builtin::Type),
             8 => Ok(Builtin::Assert),
             9 => Ok(Builtin::HttpGet),
+            10 => Ok(Builtin::Contains),
+            11 => Ok(Builtin::StartsWith),
+            12 => Ok(Builtin::EndsWith),
+            13 => Ok(Builtin::Split),
+            14 => Ok(Builtin::Join),
+            15 => Ok(Builtin::Trim),
+            16 => Ok(Builtin::Upper),
+            17 => Ok(Builtin::Lower),
+            18 => Ok(Builtin::Replace),
+            19 => Ok(Builtin::Abs),
+            20 => Ok(Builtin::Min),
+            21 => Ok(Builtin::Max),
+            22 => Ok(Builtin::Sqrt),
+            23 => Ok(Builtin::Pow),
+            24 => Ok(Builtin::Floor),
+            25 => Ok(Builtin::Ceil),
+            26 => Ok(Builtin::Values),
+            27 => Ok(Builtin::Entries),
+            28 => Ok(Builtin::Merge),
+            29 => Ok(Builtin::Has),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -213,6 +294,26 @@ impl From<Builtin> for BuiltinId {
             Builtin::Type => 7,
             Builtin::Assert => 8,
             Builtin::HttpGet => 9,
+            Builtin::Contains => 10,
+            Builtin::StartsWith => 11,
+            Builtin::EndsWith => 12,
+            Builtin::Split => 13,
+            Builtin::Join => 14,
+            Builtin::Trim => 15,
+            Builtin::Upper => 16,
+            Builtin::Lower => 17,
+            Builtin::Replace => 18,
+            Builtin::Abs => 19,
+            Builtin::Min => 20,
+            Builtin::Max => 21,
+            Builtin::Sqrt => 22,
+            Builtin::Pow => 23,
+            Builtin::Floor => 24,
+            Builtin::Ceil => 25,
+            Builtin::Values => 26,
+            Builtin::Entries => 27,
+            Builtin::Merge => 28,
+            Builtin::Has => 29,
         };
         Self(id)
     }
@@ -1016,6 +1117,52 @@ mod tests {
         };
         let err = chunk.validate().expect_err("deve falhar");
         assert!(err.message.contains("altura"));
+    }
+
+    #[test]
+    fn builtin_ids_roundtrip() {
+        let all = [
+            Builtin::Len,
+            Builtin::Push,
+            Builtin::Pop,
+            Builtin::Keys,
+            Builtin::Str,
+            Builtin::Int,
+            Builtin::Float,
+            Builtin::Type,
+            Builtin::Assert,
+            Builtin::HttpGet,
+            Builtin::Contains,
+            Builtin::StartsWith,
+            Builtin::EndsWith,
+            Builtin::Split,
+            Builtin::Join,
+            Builtin::Trim,
+            Builtin::Upper,
+            Builtin::Lower,
+            Builtin::Replace,
+            Builtin::Abs,
+            Builtin::Min,
+            Builtin::Max,
+            Builtin::Sqrt,
+            Builtin::Pow,
+            Builtin::Floor,
+            Builtin::Ceil,
+            Builtin::Values,
+            Builtin::Entries,
+            Builtin::Merge,
+            Builtin::Has,
+        ];
+        for (expected_id, builtin) in all.iter().enumerate() {
+            let id = BuiltinId::from(*builtin);
+            assert_eq!(id.0 as usize, expected_id);
+            assert_eq!(id.resolve().expect("id valido"), *builtin);
+        }
+        assert_eq!(builtin_by_name("len"), Some(Builtin::Len));
+        assert_eq!(builtin_by_name("nao_existe"), None);
+        assert_eq!(builtin_arity(Builtin::Push), 2);
+        assert_eq!(builtin_arity(Builtin::Replace), 3);
+        assert_eq!(builtin_arity(Builtin::Len), 1);
     }
 
     #[test]

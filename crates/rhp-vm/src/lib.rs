@@ -1183,6 +1183,70 @@ mod tests {
     }
 
     #[test]
+    fn runs_stdlib_strings() {
+        assert_eq!(
+            run_src("echo contains(\"ola mundo\", \"mundo\");").expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src("echo starts_with(\"ola\", \"o\");").expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src("echo ends_with(\"ola\", \"a\");").expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src("echo split(\"a,b,c\", \",\");").expect("ok"),
+            "[a, b, c]\n"
+        );
+        assert_eq!(
+            run_src("echo join([\"a\", \"b\"], \"-\");").expect("ok"),
+            "a-b\n"
+        );
+        assert_eq!(run_src("echo trim(\"  x  \");").expect("ok"), "x\n");
+        assert_eq!(run_src("echo upper(\"ola\");").expect("ok"), "OLA\n");
+        assert_eq!(run_src("echo lower(\"OLA\");").expect("ok"), "ola\n");
+        assert_eq!(
+            run_src("echo replace(\"aaa\", \"a\", \"b\");").expect("ok"),
+            "bbb\n"
+        );
+        assert!(run_err("echo join([1], \",\");").contains("strings"));
+    }
+
+    #[test]
+    fn runs_stdlib_math() {
+        assert_eq!(run_src("echo abs(-3);").expect("ok"), "3\n");
+        assert_eq!(run_src("echo abs(-2.5);").expect("ok"), "2.5\n");
+        assert_eq!(run_src("echo min(3, 7);").expect("ok"), "3\n");
+        assert_eq!(run_src("echo max(3, 7.5);").expect("ok"), "7.5\n");
+        assert_eq!(run_src("echo sqrt(9);").expect("ok"), "3\n");
+        assert_eq!(run_src("echo pow(2, 10);").expect("ok"), "1024\n");
+        assert_eq!(run_src("echo floor(2.9);").expect("ok"), "2\n");
+        assert_eq!(run_src("echo ceil(2.1);").expect("ok"), "3\n");
+        assert!(run_err("echo sqrt(-1);").contains("negativo"));
+        assert!(run_err("echo 1 + true;").contains("incompativeis"));
+    }
+
+    #[test]
+    fn runs_stdlib_maps() {
+        assert_eq!(
+            run_src("echo values({b: 1, a: 2});").expect("ok"),
+            "[2, 1]\n"
+        );
+        assert_eq!(
+            run_src("echo entries({b: 1, a: 2});").expect("ok"),
+            "[[a, 2], [b, 1]]\n"
+        );
+        assert_eq!(
+            run_src("echo merge({a: 1}, {a: 2, b: 3});").expect("ok"),
+            "{a: 2, b: 3}\n"
+        );
+        assert_eq!(run_src("echo has({a: 1}, \"a\");").expect("ok"), "true\n");
+        assert_eq!(run_src("echo has({a: 1}, \"z\");").expect("ok"), "false\n");
+    }
+
+    #[test]
     fn reports_http_errors() {
         assert!(run_err("echo http_get(\"ftp://x/y\");").contains("apenas urls `http://`"));
         assert!(run_err("echo http_get(42);").contains("exige string"));
