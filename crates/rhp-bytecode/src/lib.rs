@@ -312,6 +312,7 @@ impl Chunk {
                 _ => {}
             }
         }
+        check_stack_flow(&self.code, context)?;
         Ok(())
     }
 }
@@ -338,6 +339,110 @@ fn check_constant_depth(value: &Value) -> Result<(), CompileError> {
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// Analise estatica de altura da pilha de operandos (NG-202).
+///
+/// Prova que nenhum caminho de execucao sofre underflow e que juncoes de
+/// fluxo concordam na altura. Independente da execucao; roda dentro do
+/// `validate`, para o chunk raiz e cada corpo de funcao (pilha zerada).
+/// Codigo inalancavel apos `Return`/`Jump` e ignorado (mas continua sujeito
+/// as checagens estruturais de `validate_shallow`).
+fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
+    let mut entry: Vec<Option<i64>> = vec![None; code.len()];
+    entry[0] = Some(0);
+    let mut worklist = vec![0usize];
+    while let Some(ip) = worklist.pop() {
+        let height = entry[ip].expect("posicao alcancavel tem altura");
+        let op = code[ip];
+        // Retorna (altura apos a instrucao, alvos; `None` = terminal).
+        let (after, targets): (i64, Option<Vec<usize>>) = match op {
+            Op::Constant(_) | Op::LoadName(_) => (height + 1, Some(vec![ip + 1])),
+            Op::Print | Op::Pop | Op::StoreName(_) | Op::DeclareName(_) => {
+                check_depth(height, 1, op, context)?;
+                (height - 1, Some(vec![ip + 1]))
+            }
+            Op::Neg | Op::Not => {
+                check_depth(height, 1, op, context)?;
+                (height, Some(vec![ip + 1]))
+            }
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::Eq
+            | Op::Ne
+            | Op::Lt
+            | Op::Le
+            | Op::Gt
+            | Op::Ge
+            | Op::Index => {
+                check_depth(height, 2, op, context)?;
+                (height - 1, Some(vec![ip + 1]))
+            }
+            Op::StoreIndex(_) => {
+                check_depth(height, 2, op, context)?;
+                (height - 2, Some(vec![ip + 1]))
+            }
+            Op::JumpIfFalse(target) => {
+                check_depth(height, 1, op, context)?;
+                (height - 1, Some(vec![target as usize, ip + 1]))
+            }
+            Op::Jump(target) => (height, Some(vec![target as usize])),
+            Op::DefineFunc(_) | Op::EnterScope | Op::ExitScope => (height, Some(vec![ip + 1])),
+            Op::Halt | Op::Return => (height, None),
+            Op::Call(arity) => {
+                let arity = arity as usize;
+                check_depth(height, arity as i64 + 1, op, context)?;
+                (height - arity as i64, Some(vec![ip + 1]))
+            }
+            Op::CallBuiltin(id) => {
+                // `validate_shallow` ja rejeitou ids desconhecidos.
+                // Builtins nao recebem callee: desempilha so os argumentos.
+                let arity = builtin_arity(id.resolve()?) as i64;
+                check_depth(height, arity, op, context)?;
+                (height - arity + 1, Some(vec![ip + 1]))
+            }
+            Op::BuildArray(count) => {
+                check_depth(height, count as i64, op, context)?;
+                (height - count as i64 + 1, Some(vec![ip + 1]))
+            }
+            Op::BuildMap(count) => {
+                check_depth(height, count as i64 * 2, op, context)?;
+                (height - count as i64 * 2 + 1, Some(vec![ip + 1]))
+            }
+        };
+        if let Some(targets) = targets {
+            for target in targets {
+                if target == code.len() {
+                    continue; // fim do codigo apos `Halt` final
+                }
+                match entry[target] {
+                    None => {
+                        entry[target] = Some(after);
+                        worklist.push(target);
+                    }
+                    Some(previous) if previous != after => {
+                        return Err(CompileError::new(format!(
+                            "chunk invalido em `{context}`: altura de pilha inconsistente em {target} ({previous} vs {after})"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_depth(height: i64, need: i64, op: Op, context: &str) -> Result<(), CompileError> {
+    if height < need {
+        return Err(CompileError::new(format!(
+            "chunk invalido em `{context}`: pilha insuficiente para `{op:?}` (altura {height})"
+        )));
     }
     Ok(())
 }
@@ -879,6 +984,38 @@ mod tests {
         let chunk = compile(&program).expect("compile deve passar");
         assert_eq!(chunk.constants, vec![Value::Int(1)]);
         assert_eq!(chunk.names.len(), 0);
+    }
+
+    #[test]
+    fn rejects_stack_underflow_statically() {
+        // Print sem nada na pilha: antes so falhava em runtime.
+        let chunk = Chunk {
+            constants: vec![],
+            names: vec![],
+            funcs: vec![],
+            code: vec![Op::Print, Op::Halt],
+        };
+        let err = chunk.validate().expect_err("deve falhar");
+        assert!(err.message.contains("pilha"));
+    }
+
+    #[test]
+    fn rejects_inconsistent_jump_heights() {
+        // pos 2 alcancada com altura 0 (via 1) e altura 1 (via 3).
+        let chunk = Chunk {
+            constants: vec![Value::Int(0)],
+            names: vec![],
+            funcs: vec![],
+            code: vec![
+                Op::Constant(0),
+                Op::JumpIfFalse(4),
+                Op::Constant(0),
+                Op::Jump(2),
+                Op::Halt,
+            ],
+        };
+        let err = chunk.validate().expect_err("deve falhar");
+        assert!(err.message.contains("altura"));
     }
 
     #[test]

@@ -30,8 +30,11 @@
   sistema, sem timeout proprio), teto de corpo de 1 MiB, 2xx + corpo UTF-8;
   resto = erro.
 - Limites de execucao opt-in (`VmLimits`, padrao ilimitado): `max_steps`
-  conta instrucoes de todos os frames e aborta com
-  `limite de instrucoes excedido (N passos)`; CLI: `rhp run --max-steps N`.
+  (instrucoes), `max_stack_depth` (pilha de operandos por frame),
+  `max_collection_len` (bytes de strings/elementos por valor empilhado).
+  CLI: `rhp run --max-steps N`. Runtime separado em
+  `rhp-vm/src/builtins.rs` (builtins e I/O) do nucleo de execucao
+  (`Vm::step`, pilha e frames).
 - `VmError { message }`: sem panics para entradas nao confiaveis; sem
   `unwrap`/`expect` em producao. Mensagens em portugues, ex.:
   `variavel nao definida: x`, `variavel ja declarada: x`,

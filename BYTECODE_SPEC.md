@@ -66,15 +66,20 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 `0 Len(1) 1 Push(2) 2 Pop(1) 3 Keys(1) 4 Str(1) 5 Int(1) 6 Float(1)
 7 Type(1) 8 Assert(1) 9 HttpGet(1)` — ids desconhecidos invalidam o chunk.
 
-## 4. Validacao (obrigatoria, recursiva)
+## 5. Validacao (obrigatoria, recursiva + fluxo de pilha)
 
 `Chunk::validate()`: codigo nao vazio, ultimo op `Halt`, `Constant`/
-`LoadName`/`StoreName`/`DeclareName`/`DefineFunc` dentro dos pools,
-`Jump`/`JumpIfFalse` com alvo `< code.len()`, e recursao nos corpos de
-`fn` (contexto nomeado na mensagem). A VM nunca executa chunk invalido,
+`LoadName`/`StoreName`/`DeclareName`/`StoreIndex` dentro dos pools,
+`DefineFunc` existente, `Jump`/`JumpIfFalse` com alvo `< code.len()`,
+`CallBuiltin` com id conhecido, constantes dentro da profundidade maxima e,
+por fim, **analise estatica de altura de pilha**: cada posicao alcancavel
+tem altura deterministica; underflow estatico e juncao com alturas
+divergentes sao erro. Codigo inalancavel apos `Return`/`Jump` e ignorado
+pelo fluxo (mas segue sujeito as checagens estruturais). Recursao nos corpos
+de `fn` (contexto nomeado na mensagem). A VM nunca executa chunk invalido,
 nem parcialmente.
 
-## 5. Nao especificado ainda
+## 6. Nao especificado ainda
 
 Codificacao binaria em disco, versao de formato, modulos pre-compilados,
 internacao/otimizacoes, limites de pilha de operandos/heap, compatibilidade

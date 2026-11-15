@@ -10,21 +10,24 @@ use std::fmt;
 use std::io::Write;
 use std::rc::Rc;
 
+mod builtins;
+use builtins::call_builtin;
+pub use builtins::MAX_HTTP_BODY;
+
 /// Profundidade maxima da pilha de chamadas (protecao contra estouro).
 pub const MAX_CALL_DEPTH: usize = 512;
-
-/// Corpo maximo aceito por `http_get` (protecao contra exaustao de memoria).
-pub const MAX_HTTP_BODY: usize = 1024 * 1024;
 
 /// Limites opcionais de execucao (opt-in; padrao = ilimitado).
 ///
 /// Preserva compatibilidade: sem limites configurados o comportamento e o
-/// mesmo de antes. `max_steps` conta instrucoes executadas em todos os
-/// frames e aborta com erro limpo ao exceder (protecao contra loops
-/// infinitos e crescimento descontrolado).
+/// mesmo de antes. `max_steps` aborta loops; `max_stack_depth` limita a
+/// pilha de operandos por frame; `max_collection_len` limita tamanho em
+/// bytes (strings) ou elementos (arrays/mapas) de cada valor empilhado.
 #[derive(Debug, Clone, Default)]
 pub struct VmLimits {
     pub max_steps: Option<u64>,
+    pub max_stack_depth: Option<usize>,
+    pub max_collection_len: Option<usize>,
 }
 
 /// Erro de runtime da VM.
@@ -169,7 +172,7 @@ impl Vm {
                     .get(const_idx as usize)
                     .cloned()
                     .ok_or_else(|| VmError::new(format!("constante {const_idx} inexistente")))?;
-                self.frames[idx].stack.push(value);
+                self.push_checked(idx, value)?;
                 self.frames[idx].ip += 1;
             }
             Op::Print => {
@@ -195,13 +198,13 @@ impl Vm {
             Op::Neg => {
                 let value = self.pop(idx, "operador `-`")?;
                 let result = neg_value(&value)?;
-                self.frames[idx].stack.push(result);
+                self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
             Op::Not => {
                 let value = self.pop(idx, "operador `!`")?;
                 let result = not_value(&value)?;
-                self.frames[idx].stack.push(result);
+                self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
             Op::Eq => self.binary(idx, "comparacao", |a, b| {
@@ -256,7 +259,7 @@ impl Vm {
                 let value = self
                     .lookup(idx, &name)
                     .ok_or_else(|| VmError::new(format!("variavel nao definida: {name}")))?;
-                self.frames[idx].stack.push(value);
+                self.push_checked(idx, value)?;
                 self.frames[idx].ip += 1;
             }
             Op::StoreName(name_idx) => {
@@ -304,7 +307,7 @@ impl Vm {
                 }
                 self.frames.pop();
                 let caller = self.frames.len() - 1;
-                self.frames[caller].stack.push(value);
+                self.push_checked(caller, value)?;
             }
             Op::Pop => {
                 self.pop(idx, "descarte de valor")?;
@@ -322,7 +325,7 @@ impl Vm {
                     }
                 }
                 items.reverse();
-                self.frames[idx].stack.push(Value::Array(items));
+                self.push_checked(idx, Value::Array(items))?;
                 self.frames[idx].ip += 1;
             }
             Op::BuildMap(count) => {
@@ -352,14 +355,14 @@ impl Vm {
                         }
                     }
                 }
-                self.frames[idx].stack.push(Value::Map(entries));
+                self.push_checked(idx, Value::Map(entries))?;
                 self.frames[idx].ip += 1;
             }
             Op::Index => {
                 let index = self.pop(idx, "indice")?;
                 let base = self.pop(idx, "indexacao")?;
                 let result = index_value(&base, &index)?;
-                self.frames[idx].stack.push(result);
+                self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
             Op::StoreIndex(name_idx) => {
@@ -370,6 +373,7 @@ impl Vm {
                     .lookup(idx, &name)
                     .ok_or_else(|| VmError::new(format!("variavel nao definida: {name}")))?;
                 let updated = store_index_value(&container, &index, value)?;
+                self.check_collection(&updated)?;
                 if !self.assign(idx, &name, updated) {
                     return Err(VmError::new(format!("variavel nao definida: {name}")));
                 }
@@ -391,10 +395,11 @@ impl Vm {
                 }
                 args.reverse();
                 let result = call_builtin(builtin, &args)?;
-                self.frames[idx].stack.push(result);
+                self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
         }
+        self.check_stack_depth(idx)?;
         Ok(Step::Continue)
     }
 
@@ -403,6 +408,34 @@ impl Vm {
             .stack
             .pop()
             .ok_or_else(|| VmError::new(format!("pilha vazia em {context}")))
+    }
+
+    fn push_checked(&mut self, idx: usize, value: Value) -> Result<(), VmError> {
+        self.check_collection(&value)?;
+        self.frames[idx].stack.push(value);
+        Ok(())
+    }
+
+    fn check_collection(&self, value: &Value) -> Result<(), VmError> {
+        if let Some(max) = self.limits.max_collection_len {
+            if collection_len(value) > max {
+                return Err(VmError::new(format!(
+                    "colecao excede o limite ({max} elementos/bytes)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_stack_depth(&self, idx: usize) -> Result<(), VmError> {
+        if let Some(max) = self.limits.max_stack_depth {
+            if self.frames[idx].stack.len() > max {
+                return Err(VmError::new(format!(
+                    "pilha de operandos excedeu o limite ({max})"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn binary(
@@ -414,7 +447,7 @@ impl Vm {
         let right = self.pop(idx, context)?;
         let left = self.pop(idx, context)?;
         let result = apply(&left, &right)?;
-        self.frames[idx].stack.push(result);
+        self.push_checked(idx, result)?;
         self.frames[idx].ip += 1;
         Ok(())
     }
@@ -525,6 +558,16 @@ impl Vm {
             scopes: vec![scope],
         });
         Ok(())
+    }
+}
+
+/// Tamanho para fins de teto: bytes (strings) ou elementos.
+fn collection_len(value: &Value) -> usize {
+    match value {
+        Value::Str(s) => s.len(),
+        Value::Array(items) => items.len(),
+        Value::Map(entries) => entries.len(),
+        _ => 0,
     }
 }
 
@@ -756,187 +799,6 @@ fn store_index_value(container: &Value, index: &Value, value: Value) -> Result<V
     }
 }
 
-fn call_builtin(builtin: rhp_bytecode::Builtin, args: &[Value]) -> Result<Value, VmError> {
-    match builtin {
-        rhp_bytecode::Builtin::Len => match &args[0] {
-            Value::Array(items) => Ok(Value::Int(items.len() as i64)),
-            Value::Map(entries) => Ok(Value::Int(entries.len() as i64)),
-            Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-            other => Err(VmError::new(format!(
-                "`len` nao suporta {}",
-                type_name(other)
-            ))),
-        },
-        rhp_bytecode::Builtin::Push => match (&args[0], &args[1]) {
-            (Value::Array(items), item) => {
-                let mut updated = items.clone();
-                updated.push(item.clone());
-                Ok(Value::Array(updated))
-            }
-            (other, _) => Err(VmError::new(format!(
-                "`push` exige array, encontrado {}",
-                type_name(other)
-            ))),
-        },
-        rhp_bytecode::Builtin::Pop => match &args[0] {
-            Value::Array(items) => items
-                .last()
-                .cloned()
-                .ok_or_else(|| VmError::new("`pop` de array vazio".to_string())),
-            other => Err(VmError::new(format!(
-                "`pop` exige array, encontrado {}",
-                type_name(other)
-            ))),
-        },
-        rhp_bytecode::Builtin::Keys => match &args[0] {
-            Value::Map(entries) => {
-                let mut keys: Vec<String> = entries.keys().cloned().collect();
-                keys.sort();
-                Ok(Value::Array(keys.into_iter().map(Value::Str).collect()))
-            }
-            other => Err(VmError::new(format!(
-                "`keys` exige mapa, encontrado {}",
-                type_name(other)
-            ))),
-        },
-        rhp_bytecode::Builtin::Str => Ok(Value::Str(args[0].to_string())),
-        rhp_bytecode::Builtin::Int => match &args[0] {
-            Value::Int(v) => Ok(Value::Int(*v)),
-            Value::Float(v) => {
-                if v.fract() != 0.0 || *v >= 2f64.powi(63) || *v < i64::MIN as f64 {
-                    return Err(VmError::new(format!("`int` nao converte {v}")));
-                }
-                Ok(Value::Int(*v as i64))
-            }
-            Value::Str(s) => s
-                .trim()
-                .parse::<i64>()
-                .map(Value::Int)
-                .map_err(|_| VmError::new(format!("`int` nao converte {s:?}"))),
-            other => Err(VmError::new(format!(
-                "`int` nao converte {}",
-                type_name(other)
-            ))),
-        },
-        rhp_bytecode::Builtin::Float => match &args[0] {
-            Value::Float(v) => Ok(Value::Float(*v)),
-            Value::Int(v) => Ok(Value::Float(*v as f64)),
-            Value::Str(s) => s
-                .trim()
-                .parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| VmError::new(format!("`float` nao converte {s:?}"))),
-            other => Err(VmError::new(format!(
-                "`float` nao converte {}",
-                type_name(other)
-            ))),
-        },
-        rhp_bytecode::Builtin::Type => Ok(Value::Str(type_name(&args[0]).to_string())),
-        rhp_bytecode::Builtin::Assert => match &args[0] {
-            Value::Bool(true) => Ok(Value::Null),
-            Value::Bool(false) => Err(VmError::new("falha de assercao".to_string())),
-            other => Err(VmError::new(format!(
-                "`assert` exige bool, encontrado {}",
-                type_name(other)
-            ))),
-        },
-        rhp_bytecode::Builtin::HttpGet => match &args[0] {
-            Value::Str(url) => Ok(Value::Str(http_get_body(url)?)),
-            other => Err(VmError::new(format!(
-                "`http_get` exige string (url), encontrado {}",
-                type_name(other)
-            ))),
-        },
-    }
-}
-
-/// Cliente HTTP minimo (somente `http://`), sem dependencias externas.
-///
-/// Timeouts de 5s para conexao e leitura; aceita apenas status 2xx e
-/// corpo UTF-8 de ate [`MAX_HTTP_BODY`] bytes. A resolucao DNS usa o
-/// resolvedor do sistema e nao tem timeout proprio (limitacao documentada).
-/// Erros sao `VmError` com mensagem (sem panics).
-fn http_get_body(url: &str) -> Result<String, VmError> {
-    use std::io::{Read, Write as _};
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-
-    const TIMEOUT: Duration = Duration::from_secs(5);
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| VmError::new("`http_get` suporta apenas urls `http://`".to_string()))?;
-    let (authority, path) = match rest.find('/') {
-        Some(pos) => (&rest[..pos], &rest[pos..]),
-        None => (rest, "/"),
-    };
-    if authority.is_empty() {
-        return Err(VmError::new("`http_get` com host vazio".to_string()));
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port_text)) if !host.is_empty() => {
-            let port = port_text
-                .parse::<u16>()
-                .map_err(|_| VmError::new(format!("`http_get` com porta invalida: {port_text}")))?;
-            (host, port)
-        }
-        _ => (authority, 80),
-    };
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| VmError::new(format!("`http_get` falhou ao resolver {host}: {e}")))?
-        .next()
-        .ok_or_else(|| VmError::new(format!("`http_get` sem endereco para {host}")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT).map_err(|e| {
-        VmError::new(format!(
-            "`http_get` falhou ao conectar em {host}:{port}: {e}"
-        ))
-    })?;
-    stream
-        .set_read_timeout(Some(TIMEOUT))
-        .map_err(|e| VmError::new(format!("`http_get` falhou ao configurar timeout: {e}")))?;
-    let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| VmError::new(format!("`http_get` falhou ao enviar requisicao: {e}")))?;
-    let mut raw: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                raw.extend_from_slice(&chunk[..n]);
-                if raw.len() > MAX_HTTP_BODY {
-                    return Err(VmError::new(format!(
-                        "`http_get` excedeu o limite de corpo ({MAX_HTTP_BODY} bytes)"
-                    )));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                return Err(VmError::new(format!(
-                    "`http_get` falhou ao ler resposta: {e}"
-                )));
-            }
-        }
-    }
-    let header_end = raw
-        .windows(b"\r\n\r\n".len())
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| VmError::new("`http_get` com resposta sem cabecalhos".to_string()))?;
-    let header = String::from_utf8_lossy(&raw[..header_end]);
-    let status_line = header.lines().next().unwrap_or("");
-    let code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| VmError::new(format!("`http_get` com status invalido: {status_line:?}")))?;
-    if !(200..300).contains(&code) {
-        return Err(VmError::new(format!("`http_get` retornou status {code}")));
-    }
-    String::from_utf8(raw[header_end + 4..].to_vec())
-        .map_err(|e| VmError::new(format!("`http_get` com corpo nao UTF-8: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,6 +817,55 @@ mod tests {
 
     fn run_err(src: &str) -> String {
         run_src(src).expect_err("deve falhar").message
+    }
+
+    fn run_limited(src: &str, limits: VmLimits) -> Result<String, VmError> {
+        let chunk = compile_src(src);
+        let mut vm = Vm::new();
+        vm.set_limits(limits);
+        vm.run_to_string(&chunk)
+    }
+
+    fn limited(max_collection: usize) -> VmLimits {
+        VmLimits {
+            max_collection_len: Some(max_collection),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn respects_stack_depth_limit() {
+        let mut code = Vec::new();
+        for _ in 0..200 {
+            code.push(Op::Constant(0));
+        }
+        code.push(Op::Halt);
+        let chunk = Chunk {
+            constants: vec![Value::Int(1)],
+            names: vec![],
+            funcs: vec![],
+            code,
+        };
+        let mut vm = Vm::new();
+        vm.set_limits(VmLimits {
+            max_stack_depth: Some(100),
+            ..Default::default()
+        });
+        let err = vm.run_to_string(&chunk).expect_err("deve falhar");
+        assert!(err.message.contains("pilha de operandos"));
+    }
+
+    #[test]
+    fn respects_collection_limit() {
+        let err = run_limited("echo [1, 2, 3];", limited(2)).expect_err("deve falhar");
+        assert!(err.message.contains("colecao excede o limite"));
+        let err = run_limited("echo \"ab\" + \"c\";", limited(2)).expect_err("deve falhar");
+        assert!(err.message.contains("colecao excede o limite"));
+        let err =
+            run_limited("let a = [1]; echo push(a, 2);", limited(1)).expect_err("deve falhar");
+        assert!(err.message.contains("colecao excede o limite"));
+        // Sem limite, passa.
+        assert_eq!(run_src("echo [1, 2, 3];").expect("ok"), "[1, 2, 3]\n");
     }
 
     #[test]
@@ -1110,8 +1021,10 @@ mod tests {
             funcs: vec![],
             code: vec![Op::Print, Op::Halt],
         };
+        // Desde a analise estatica de pilha (NG-202), chunks artesanais
+        // assim sao rejeitados ja na validacao, antes de executar.
         let err = Vm::new().run_to_string(&chunk).expect_err("deve falhar");
-        assert!(err.message.contains("pilha vazia"));
+        assert!(err.message.contains("pilha"));
     }
 
     #[test]
@@ -1260,6 +1173,7 @@ mod tests {
         let mut vm = Vm::new();
         vm.set_limits(VmLimits {
             max_steps: Some(1000),
+            ..Default::default()
         });
         let err = vm.run_to_string(&chunk).expect_err("deve falhar");
         assert!(err.message.contains("limite de instrucoes"));

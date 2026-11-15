@@ -14,10 +14,19 @@ name = "rhp-cli"
 version = "0.1.0"
 dependencies = [
  "rhp-bytecode",
+ "rhp-diagnostic",
  "rhp-fmt",
  "rhp-lexer",
  "rhp-parser",
  "rhp-vm",
+]
+
+[[package]]
+name = "rhp-diagnostic"
+version = "0.1.0"
+dependencies = [
+ "rhp-lexer",
+ "rhp-parser",
 ]
 
 [[package]]
