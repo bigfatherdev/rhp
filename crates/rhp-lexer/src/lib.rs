@@ -693,4 +693,36 @@ mod tests {
         assert_eq!((tokens[3].line, tokens[3].col), (2, 1));
         assert_eq!((tokens[4].line, tokens[4].col), (2, 6));
     }
+
+    #[test]
+    fn malformed_inputs_never_panic() {
+        // Corpus de entradas malformadas: lexer nunca entra em panico,
+        // so retorna Ok(tokens) ou Err(posicionado).
+        let inputs = [
+            "",
+            "\"",
+            "\"abc",
+            "echo \"a\\",
+            "echo \"a\\x\"",
+            "echo \"a\\u\"",
+            "echo \"a\\u{\"",
+            "echo \"a\\u{ZZ}\"",
+            "echo 99999999999999999999999999",
+            "echo @#$",
+            "'",
+            "\"a\nb\"",
+            "====",
+            "!!!!",
+            "[[[[",
+            "let ",
+            "echo 1+",
+            "//",
+            "/",
+            "/=",
+            "\"\\u{110000}\"",
+        ];
+        for src in inputs {
+            let _ = lex(src);
+        }
+    }
 }

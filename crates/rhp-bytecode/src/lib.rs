@@ -495,6 +495,12 @@ impl Compiler {
                 self.patch_jump(exit_jump, exit_target);
             }
             Stmt::FnDef { name, params, body } => {
+                let mut seen = std::collections::HashSet::new();
+                for param in params {
+                    if !seen.insert(param) {
+                        return Err(CompileError::new(format!("parametro duplicado: {param}")));
+                    }
+                }
                 let mut fn_compiler = Compiler::new(true);
                 fn_compiler.compile_stmts(body)?;
                 let null_idx = fn_compiler.add_constant(Value::Null)?;
@@ -775,6 +781,13 @@ mod tests {
         );
         assert!(chunk.code.contains(&Op::DefineFunc(0)));
         assert!(chunk.code.contains(&Op::Call(2)));
+    }
+
+    #[test]
+    fn rejects_duplicate_params() {
+        let program = parse_source("fn f(a, a) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(err.message.contains("duplicado"));
     }
 
     #[test]

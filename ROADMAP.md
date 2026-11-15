@@ -1,4 +1,22 @@
-# ROADMAP.md — Planejamento e estado (Fases 3–6 concluidas)
+# ROADMAP.md — Planejamento e estado (missão de engenharia: CP1–CP3 + docs)
+
+## Auditoria e fortalecimento (2026-11-14, ramo `feat/engineering-audit`)
+
+- [x] CHECKPOINT 1: `reports/AUDIT_MASTER.md` (1 P0, 5 P1, 13 P2, 10 P3, 7 P4).
+- [x] CHECKPOINT 3: P0/P1 corrigidos (teto de profundidade 128, fmt roundtrip,
+      `\u{...}`, teto HTTP 1 MiB, DNS documentado) + P2 de núcleo (params
+      duplicados, `int()` estrito, `+` unário, jaula/topo de imports, teto de
+      fonte, `VmLimits`/`--max-steps`, pins de spec).
+- [x] Robustez: corpus malformado, property test determinístico, verificação
+  de exemplos, `check-changes.sh` com renames.
+- [x] Benchmarks std-only + baseline (`docs/BENCHMARKS.md`); sem otimizações
+  (sem necessidade provada; `push` O(n²) é semântica documentada).
+- [x] CHECKPOINT 2: README reestruturado + `docs/` + `CONTRIBUTING.md` +
+  `SECURITY.md`.
+- [ ] Pendente (requer aprovação/planejamento): P2 restantes de baixo risco,
+  RFC de tipos, exports/gerenciador de pacotes, PG/Redis com servidores reais,
+  async (runtime), classes/generics, LSP, otimizações com protocolo
+  antes/depois.
 
 ## Fase 1 — Fundacao (concluida em 2026-11-14)
 

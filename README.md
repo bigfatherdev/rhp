@@ -1,92 +1,131 @@
 # RHP
 
-Linguagem experimental com compilador, bytecode, máquina virtual e runtime
-próprios em Rust — uma evolução independente do PHP, sem depender do PHP.
-Toolchain 100% em Rust stable, sem dependências externas, sem `unsafe`.
+**RHP** e uma linguagem de programacao experimental com compilador, bytecode,
+maquina virtual e runtime proprios em **Rust stable** — uma evolucao
+independente do PHP, sem depender do PHP. Zero crates de terceiros, sem
+`unsafe`.
 
-> Estado: Fases 1–6 implementadas e verificadas (núcleo imperativo, stdlib,
-> módulos, ferramentas e rede mínima). O restante da visão (PostgreSQL/Redis,
-> async, classes/generics) está planejado e **não** implementado — ver
-> `ROADMAP.md` e `ADRs/0004-fase-6-rede-e-fronteira.md`.
+## Caracteristicas principais
+
+- Sintaxe familiar ao PHP (`echo`, `fn`, `if`/`else`, `while`), semantica propria
+- Tipagem dinamica com erros explicitos em runtime (sem coercao silenciosa)
+- Funcoes com recursao, arrays e mapas por valor, builtins (`len`, `push`, `http_get`…)
+- Modulos com `import` (DFS, sem ciclos), formatador canonico (`rhp fmt`)
+- VM em pilha com validacao de bytecode, limites opt-in e aritmetica checada
+
+## Estado real de desenvolvimento
+
+Marco inicial e Fases 2–6 implementadas e verificadas: nucleo imperativo,
+stdlib (`Array`/`Map`/builtins), modulos, ferramentas (`fmt`, CI de
+`changes/`), rede minima (`http_get` std-only). Auditoria integral em
+`reports/AUDIT_MASTER.md` (P0/P1 corrigidos no Checkpoint 3).
+
+**Planejado e NAO implementado**: PostgreSQL/Redis, async/concorrencia,
+classes/generics, exports/privacidade, HTTPS. Ver `ROADMAP.md`.
 
 ## Requisitos
 
-- Rust stable recente (verificado com 1.100.0), edição 2021
-- Zero crates de terceiros (só workspace + std)
+- Rust stable recente (verificado com 1.100.0), edicao 2021
+- Nenhuma dependencia externa (só workspace + std)
 
-## Como compilar, testar e rodar
+## Instalacao e compilacao
 
 ```bash
+git clone https://github.com/bigfatherdev/rhp.git
+cd rhp
 cargo build                    # binario em ./target/debug/rhp
-cargo test --workspace         # 93 testes, 0 falhas (estado verificado)
-cargo fmt --check              # formato
-cargo clippy --workspace --all-targets -- -D warnings   # lint
-
-./target/debug/rhp run hello.rhp        # Hello from RHP!
-./target/debug/rhp run examples/fib.rhp # 55
-./target/debug/rhp fmt [--check] <arquivo.rhp>
 ```
 
-## CLI (`rhp`)
+## Primeiro programa
 
-| Comando | Efeito |
-|---|---|
-| `rhp run <arquivo.rhp>` | Executa o programa (com `import`s resolvidos); saída 0 ok / 1 erro / 2 uso |
-| `rhp fmt <arquivo.rhp>` | Reescreve no formato canônico (idempotente) |
-| `rhp fmt --check <arquivo.rhp>` | Falha (exit 1) se fora do formato |
-| `rhp --help`, `rhp --version` | Ajuda / versão |
+```bash
+echo 'echo "Hello from RHP!";' > hello.rhp
+./target/debug/rhp run hello.rhp   # Hello from RHP!
+```
 
-## A linguagem (resumo do implementado)
+## Sintaxe (resumo)
 
 ```rhp
-import "mat.rhp";          // modulos: DFS, uma vez, ciclo e falta = erro
+import "mat.rhp";
 
-let a = [1, 2];            // arrays (valor/copia), mapas {k: v}
-a = push(a, 3);            // builtins: len push pop keys str int float type assert
-echo a[0] + len(a);        // 1 + 3 = 4
+let a = [1, 2];                // arrays heterogeneos por valor
+let m = {nome: "rhp"};         // mapas (chaves ordenadas no Display)
+echo a[0] + len(a);            // 1 + 2
 
-fn fib(n) {                // funcoes, return, recursao (limite 512)
+fn fib(n) {                    // funcoes, return, recursao (limite 512)
   if n < 2 { return n; }
   return fib(n - 1) + fib(n - 2);
 }
-echo fib(10);              // 55
-
-let dado = http_get("http://127.0.0.1:8080/x");  // rede minima std-only
+echo fib(10);                  // 55
 ```
 
-Regras centrais: tipagem dinâmica com erro explícito em runtime (sem
-coerção silenciosa); `if`/`while` exigem `Bool`; aritmética checada
-(estouro, `/0`, `%0` = erro); `a[i] = v` em um nível; `//` comentários.
-Detalhes normativos em `LANGUAGE_SPEC.md`, `BYTECODE_SPEC.md`, `VM_SPEC.md`.
+Detalhes normativos: `LANGUAGE_SPEC.md`. Referencia rapida: `docs/LANGUAGE_REFERENCE.md`.
 
-## Estrutura do repositório
+## Recursos implementados
 
-| Crate / pasta | Papel |
+Expressoes (`+ - * / %`, comparacoes, `!`/`-` unarios, `+x`), literais
+(`int`/`float`/`string` com `\u{...}`/`bool`/`null`), `let`/atribuicao
+(inclusive `a[i] = v`), blocos/escopos, `if`/`else`, `while`, `fn`/`return`/
+chamadas, `echo` de qualquer valor, comentarios `//`, builtins
+(`len push pop keys str int float type assert http_get`), `import` com
+jaula na arvore do programa, `rhp fmt`, limites (`--max-steps`, teto HTTP
+1 MiB, profundidade sintatica 128).
+
+## Arquitetura resumida
+
+```text
+fonte --loader--> tokens --parser--> AST --compile--> Chunk --vm--> saida
+rhp-lexer -> rhp-parser -> rhp-bytecode -> rhp-vm -> rhp-cli (+rhp-fmt)
+```
+
+Detalhes: `ARCHITECTURE.md` e ADRs em `ADRs/`.
+
+## Estrutura do projeto
+
+| Caminho | Papel |
 |---|---|
-| `crates/rhp-lexer` | Tokenizador manual |
-| `crates/rhp-parser` | Parser de precedência + AST |
-| `crates/rhp-bytecode` | `Value`, `Op`, `Chunk`, `compile()`, builtins |
-| `crates/rhp-vm` | VM em pilha (frames, escopos, `http_get`) |
-| `crates/rhp-fmt` | Formatador canônico |
-| `crates/rhp-cli` | Binário `rhp` (+ loader de módulos) |
-| `examples/` | `fib.rhp` (canônico, saída `55`) |
+| `crates/rhp-*` | Lexer, parser/AST, bytecode, VM, formatador, CLI |
+| `examples/` | Programas `.rhp` versionados (todos executados em teste) |
 | `tools/` | `check-changes.sh` (CI de auditoria) |
-| `ADRs/` | Decisões arquiteturais |
-| `changes/` | Histórico auditável (um arquivo por mudança) |
+| `reports/` | `AUDIT_MASTER.md`, `FINAL_ENGINEERING_REPORT.md` |
+| `docs/` | Guias (getting started, CLI, diagnosticos, benchmarks, FAQ) |
+| `changes/` | Historico auditavel (um arquivo por mudanca) |
 
-Governança: `GOVERNANCE.md` (autoridade máxima), `AGENTS.md`.
-Planejamento: `ROADMAP.md`. Resumo por release: `CHANGELOG.md`.
-
-## Desenvolvimento seguro
+## Testes e validacoes
 
 ```bash
-git log --oneline            # 9 commits: Initial + 7 retrospectivos + licença
-tools/check-changes.sh       # exige registro em changes/ p/ diffs relevantes
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace        # 120+ testes, 0 falhas (estado verificado)
+./target/debug/rhp run examples/fib.rhp   # 55
+tools/check-changes.sh        # exige registro em changes/
 ```
 
-Branches `feat/...`/`fix/...`; hook pre-commit roda fmt+clippy+test;
-push/tags/releases só com autorização; sem `reset --hard`/`push --force`.
+Cobertura: lexer/parser/bytecode/VM/fmt/CLI/rede (servidor local),
+propriedade aritmetica (gerador deterministico), corpus malformado
+(sem panico), exemplos, limites e validacao de bytecode.
 
-## Licença
+## Seguranca e limitacoes conhecidas
+
+Garantido e testado: sem `unsafe`; bytecode validado antes de executar;
+aritmetica inteira checada; profundidade sintatica 128; recursao 512;
+HTTP com timeout 5s e teto 1 MiB; imports confinados + teto de fonte 8 MiB;
+DNS sem timeout proprio (documentado). **Nao** ha sandbox/OS-level:
+programas RHP rodam com seus privilegios; sem HTTPS/redirect; `VmLimits`
+e opt-in. Detalhes: `SECURITY.md`.
+
+## Roadmap
+
+Fases concluidas em `ROADMAP.md`/`CHANGELOG.md`. Proximo (requer aprovacao):
+P2s restantes de baixo risco, tipagem/RFC, modulos com exports, PG/Redis com
+servidores reais, async (runtime), classes/generics, LSP.
+
+## Governanca e contribuicao
+
+Autoridade maxima: `GOVERNANCE.md`. Leia tambem `AGENTS.md` antes de
+qualquer tarefa. Fluxo completo: `CONTRIBUTING.md`. Mudancas sem `changes/`
+sao rejeitadas na CI (`tools/check-changes.sh`).
+
+## Licenciamento
 
 `MIT OR Apache-2.0` — ver `LICENSE-MIT` e `LICENSE-APACHE`.

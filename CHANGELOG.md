@@ -24,6 +24,15 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   Registro: `changes/2026-11-14-feat-fase-5-ferramentas.md`.
 - Escape `\u{HEX}` em strings.
   Registro: `changes/2026-11-14-feat-escape-unicode.md`.
+- Limites de execução opt-in (`VmLimits`, `rhp run --max-steps N`).
+  Registro: `changes/2026-11-14-feat-limites-execucao.md`.
+- Robustez de testes: corpus malformado, property test determinístico,
+  verificação de exemplos, `check-changes.sh` com renames.
+  Registro: `changes/2026-11-14-test-robustez.md`.
+- Benchmarks std-only + baseline documentado (sem otimizações).
+  Registro: `changes/2026-11-14-bench-baseline.md`.
+- Documentação: README reestruturado, `docs/`, `CONTRIBUTING.md`, `SECURITY.md`.
+  Registro: `changes/2026-11-14-docs-checkpoint2.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).
@@ -33,9 +42,14 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 - Teto de profundidade sintatica (128 niveis) e de constantes: entradas
   profundamente aninhadas geram erro em vez de abortar o processo.
-  Registros: `changes/2026-11-14-fix-limite-profundidade.md`.
+  Registro: `changes/2026-11-14-fix-limite-profundidade.md`.
 - `rhp fmt` com roundtrip garantido: floats sem notacao cientifica e chaves
   de mapa citadas quando necessario.
   Registro: `changes/2026-11-14-fix-fmt-roundtrip.md`.
 - `http_get` com teto de corpo de 1 MiB e DNS documentado.
   Registro: `changes/2026-11-14-fix-http-limites.md`.
+- Parametros duplicados rejeitados; `int()` estrito no limite de `i64`;
+  `+x` como identidade; `import` confinado a arvore, teto de 8 MiB e
+  apenas no nivel superior; `VmLimits`/`--max-steps` opt-in.
+  Registros: `changes/2026-11-14-fix-p2-nucleo.md`,
+  `changes/2026-11-14-feat-limites-execucao.md`.

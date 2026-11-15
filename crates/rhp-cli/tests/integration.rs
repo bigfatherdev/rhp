@@ -156,6 +156,27 @@ fn rhp_run_resolves_imports() {
 }
 
 #[test]
+fn rhp_run_max_steps_stops_infinite_loop() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .args(["run", "--max-steps", "1000"])
+        .arg({
+            let dir = std::env::temp_dir().join(format!("rhp-test-loop-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+            let file = dir.join("loop.rhp");
+            std::fs::write(&file, "while true {\n}\n").expect("nao foi possivel escrever loop.rhp");
+            file
+        })
+        .output()
+        .expect("falha ao executar o binario rhp");
+    assert!(!output.status.success(), "loop infinito deveria falhar");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("limite de instrucoes"),
+        "stderr deveria mencionar o limite, obteve: {stderr}"
+    );
+}
+
+#[test]
 fn rhp_run_http_get_against_local_server() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -282,4 +303,35 @@ fn rhp_run_reports_circular_import() {
         stderr.contains("importacao circular"),
         "stderr deveria mencionar ciclo, obteve: {stderr}"
     );
+}
+
+#[test]
+fn rhp_run_all_examples_succeed() {
+    // Auditoria AUD-212: todo exemplo versionado executa com exit 0.
+    // Saidas conhecidas ficam pinadas; demais exemplos ao menos nao falham.
+    let mut count = 0;
+    let examples = workspace_root().join("examples");
+    let mut entries: Vec<_> = std::fs::read_dir(&examples)
+        .expect("nao foi possivel listar examples/")
+        .filter_map(Result::ok)
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rhp") {
+            continue;
+        }
+        count += 1;
+        let output = run_file(&path);
+        assert!(
+            output.status.success(),
+            "exemplo {} falhou: stderr={}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if path.file_name().and_then(|n| n.to_str()) == Some("fib.rhp") {
+            assert_eq!(output.stdout, b"55\n");
+        }
+    }
+    assert!(count >= 1, "nenhum exemplo encontrado em examples/");
 }

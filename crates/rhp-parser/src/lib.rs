@@ -566,6 +566,11 @@ fn parse_unary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
                 expr: Box::new(parse_unary(cursor)?),
             })
         }
+        // `+x` e identidade (compativel; sem no dedicado na AST).
+        Some(TokenKind::Plus) => {
+            cursor.next();
+            parse_unary(cursor)
+        }
         _ => parse_postfix(cursor),
     }
 }
@@ -973,6 +978,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_unary_plus_as_identity() {
+        let program = lex_and_parse("echo +5;").expect("parse deve passar");
+        assert_eq!(program.statements, vec![Stmt::Echo { expr: Expr::Int(5) }]);
+    }
+
+    #[test]
     fn parses_import() {
         let program = lex_and_parse("import \"lib.rhp\"; echo 1;").expect("parse deve passar");
         assert_eq!(program.statements[0], Stmt::Import("lib.rhp".to_string()));
@@ -988,6 +999,46 @@ mod tests {
     fn parse_source_helper_reports_errors() {
         let err = parse_source("echo \"x\"").expect_err("deve falhar");
         assert!(err.contains("esperado `;`"));
+    }
+
+    #[test]
+    fn malformed_inputs_never_panic() {
+        // Tokenizacao valida + parse: nunca panico, so Ok ou Err.
+        let inputs = [
+            ";",
+            "echo",
+            "echo ;",
+            "let",
+            "let = 1;",
+            "let x =",
+            "if",
+            "if true",
+            "if true {",
+            "{",
+            "}",
+            "fn",
+            "fn f(",
+            "fn f(a,",
+            "return return",
+            "import",
+            "import 42",
+            "[1, 2",
+            "{a: 1",
+            "{1: 2}",
+            "f(1,",
+            "(1",
+            "a[0",
+            "== 1;",
+            "echo 1 +;",
+            "\"unterminated",
+            "let x = [;",
+            "while while",
+        ];
+        for src in inputs {
+            if let Ok(tokens) = rhp_lexer::lex(src) {
+                let _ = parse(&tokens);
+            }
+        }
     }
 
     #[test]

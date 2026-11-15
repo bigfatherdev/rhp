@@ -21,14 +21,17 @@
    profundidade; chunks validados nao atingem).
 
 ## 3. Valores e erros
-
 - `Display`: `null`, `true`/`false`, inteiro, float, string crua,
   `[a, b]` (arrays), `{k: v, ...}` com chaves ordenadas (mapas),
   `<fn nome>`.
 - Compostos por valor: atribuicao/chamada/`push` copiam; `push` retorna novo
   array; `pop` retorna o ultimo (vazio = erro); `keys` ordenado.
-- `http_get(url)`: somente `http://`, timeouts 5s, 2xx + corpo UTF-8;
+- `http_get(url)`: somente `http://`, timeouts 5s (DNS usa o resolvedor do
+  sistema, sem timeout proprio), teto de corpo de 1 MiB, 2xx + corpo UTF-8;
   resto = erro.
+- Limites de execucao opt-in (`VmLimits`, padrao ilimitado): `max_steps`
+  conta instrucoes de todos os frames e aborta com
+  `limite de instrucoes excedido (N passos)`; CLI: `rhp run --max-steps N`.
 - `VmError { message }`: sem panics para entradas nao confiaveis; sem
   `unwrap`/`expect` em producao. Mensagens em portugues, ex.:
   `variavel nao definida: x`, `variavel ja declarada: x`,

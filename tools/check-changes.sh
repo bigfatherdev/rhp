@@ -8,6 +8,7 @@
 #   tools/check-changes.sh [base] [--bypass "motivo explicito"]
 #
 # `base` padrao: origin/main. Compara `base...HEAD`.
+# Em CI, use `fetch-depth: 0` para que o historico de `base` exista.
 # `--bypass` registra excecao explicita e justificada (ex.: tipografia pura).
 
 set -u
@@ -61,7 +62,9 @@ if [ -z "$RELEVANT" ]; then
   exit 0
 fi
 
-ADDED="$(git diff --name-only --diff-filter=A "$BASE"...HEAD 2>/dev/null | grep -E '^changes/[0-9]{4}-[0-9]{2}-[0-9]{2}-.+\.md$' || true)"
+# Inclui adicionados e renomeados (--diff-filter=AR): um registro movido
+# continua valendo como registro.
+ADDED="$(git diff --name-only --diff-filter=AR "$BASE"...HEAD 2>/dev/null | grep -E '^changes/[0-9]{4}-[0-9]{2}-[0-9]{2}-.+\.md$' || true)"
 if [ -z "$ADDED" ]; then
   echo "check-changes: FALHOU — mudancas relevantes sem registro novo em changes/:" >&2
   printf '%s\n' "$RELEVANT" >&2

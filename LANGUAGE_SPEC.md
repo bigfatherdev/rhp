@@ -23,6 +23,12 @@ import "mat.rhp";
 echo dobro(21); // 42
 ```
 
+Regras de modulos: caminhos relativos ao arquivo que importa, **confinados
+a arvore do programa** (fora dela = erro); cada modulo executa uma vez;
+ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
+`import` vale **apenas no nivel superior** do arquivo (dentro de `fn`/bloco
+= erro).
+
 - **Limite de profundidade sintatica: 128 niveis** (expressoes e blocos
   aninhados; cadeias planas como `1+1+...` ou instrucoes em sequencia nao
   contam). Acima do limite, erro `profundidade maxima excedida`
@@ -95,6 +101,14 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 - `Display`: `null`, `true`/`false`, inteiro, float, conteudo da string,
   `[a, b]` para arrays, `{k: v, ...}` (chaves ordenadas) para mapas,
   `<fn nome>` para funcoes.
+- `NaN`/`inf` (via `float("nan")`/`float("inf")`): `nan == nan` e `false`
+  (IEEE 754); comparacoes ordenadas com `NaN` sao erro de tipos; `int()` de
+  `NaN`/infinito e erro.
+- Nomes de builtins tem precedencia em posicao de chamada: `len(x)` sempre
+  chama o builtin mesmo havendo variavel `len` (leitura `len` sem chamada
+  acessa a variavel). Evite declarar variaveis com esses nomes.
+- `let` nao sombreia parametro da funcao no mesmo nivel: erro
+  `variavel ja declarada`.
 
 ## 5. Compostos (Fase 3: semantica por valor/copia, sem aliasing)
 
@@ -102,7 +116,8 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
   `a[i]` com `i: Int` em `[0, len)`; fora disso ou negativo = erro.
 - Mapa: `{nome: "rhp", "v": 3}` (chaves string ou identificador; vazio `{}`).
   `m[k]` exige chave existente (`Str`); ausente = erro. Inserir chave nova
-  por atribuicao e permitido.
+  por atribuicao e permitido. **Chaves duplicadas no literal: vence a
+  primeira** (ordem do fonte; pino de compatibilidade).
 - Atribuicao: `a[i] = v` (um nivel: `nome[expr] = valor`; leitura-escrita
   atomica na variavel). Alvos maiores (`f() = v`, `a[0][1] = v`) sao erro
   de parse ("alvo de atribuicao invalido").

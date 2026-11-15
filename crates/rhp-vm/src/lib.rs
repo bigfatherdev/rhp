@@ -16,6 +16,17 @@ pub const MAX_CALL_DEPTH: usize = 512;
 /// Corpo maximo aceito por `http_get` (protecao contra exaustao de memoria).
 pub const MAX_HTTP_BODY: usize = 1024 * 1024;
 
+/// Limites opcionais de execucao (opt-in; padrao = ilimitado).
+///
+/// Preserva compatibilidade: sem limites configurados o comportamento e o
+/// mesmo de antes. `max_steps` conta instrucoes executadas em todos os
+/// frames e aborta com erro limpo ao exceder (protecao contra loops
+/// infinitos e crescimento descontrolado).
+#[derive(Debug, Clone, Default)]
+pub struct VmLimits {
+    pub max_steps: Option<u64>,
+}
+
 /// Erro de runtime da VM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmError {
@@ -62,6 +73,8 @@ enum Step {
 pub struct Vm {
     frames: Vec<Frame>,
     globals: HashMap<String, Value>,
+    limits: VmLimits,
+    steps: u64,
 }
 
 impl Vm {
@@ -70,7 +83,14 @@ impl Vm {
         Self {
             frames: Vec::new(),
             globals: HashMap::new(),
+            limits: VmLimits::default(),
+            steps: 0,
         }
+    }
+
+    /// Define limites opcionais de execucao (ver [`VmLimits`]).
+    pub fn set_limits(&mut self, limits: VmLimits) {
+        self.limits = limits;
     }
 
     /// Executa o chunk escrevendo a saida de `Print` em `output`.
@@ -90,6 +110,7 @@ impl Vm {
 
         self.frames.clear();
         self.globals.clear();
+        self.steps = 0;
         self.frames.push(Frame {
             code: chunk.code.clone(),
             constants: chunk.constants.clone(),
@@ -123,6 +144,14 @@ impl Vm {
     }
 
     fn step(&mut self, idx: usize, output: &mut dyn Write) -> Result<Step, VmError> {
+        self.steps += 1;
+        if let Some(max) = self.limits.max_steps {
+            if self.steps > max {
+                return Err(VmError::new(format!(
+                    "limite de instrucoes excedido ({max} passos)"
+                )));
+            }
+        }
         let op = {
             let frame = self
                 .frames
@@ -774,7 +803,7 @@ fn call_builtin(builtin: rhp_bytecode::Builtin, args: &[Value]) -> Result<Value,
         rhp_bytecode::Builtin::Int => match &args[0] {
             Value::Int(v) => Ok(Value::Int(*v)),
             Value::Float(v) => {
-                if v.fract() != 0.0 || *v > i64::MAX as f64 || *v < i64::MIN as f64 {
+                if v.fract() != 0.0 || *v >= 2f64.powi(63) || *v < i64::MIN as f64 {
                     return Err(VmError::new(format!("`int` nao converte {v}")));
                 }
                 Ok(Value::Int(*v as i64))
@@ -1150,6 +1179,93 @@ mod tests {
         assert_eq!(run_src("echo [1, 2] == [1, 2];").expect("ok"), "true\n");
         assert_eq!(run_src("echo {a: 1} != {};").expect("ok"), "true\n");
         assert!(run_err("echo [1] < [2];").contains("incompativeis"));
+    }
+
+    #[test]
+    fn rejects_int_overflow_boundary() {
+        // 2^63 nao cabe em i64: deve errar, nao saturar.
+        assert!(run_err("echo int(9223372036854775808.0);").contains("nao converte"));
+        assert_eq!(run_src("echo int(42.0);").expect("ok"), "42\n");
+    }
+
+    #[test]
+    fn pins_duplicate_map_keys_first_wins() {
+        assert_eq!(run_src("echo {a: 1, a: 2};").expect("ok"), "{a: 1}\n");
+    }
+
+    #[test]
+    fn pins_let_shadowing_param_is_error() {
+        assert!(run_err("fn f(a) { let a = 1; } echo f(0);").contains("ja declarada"));
+    }
+
+    #[test]
+    fn pins_builtin_name_precedence_in_call_position() {
+        assert_eq!(
+            run_src("let len = 5; echo len; echo len([1, 2]);").expect("ok"),
+            "5\n2\n"
+        );
+    }
+
+    #[test]
+    fn pins_nan_semantics() {
+        assert_eq!(
+            run_src("echo float(\"nan\") == float(\"nan\");").expect("ok"),
+            "false\n"
+        );
+        assert!(run_err("echo float(\"nan\") < 1;").contains("incompativeis"));
+    }
+
+    /// Gerador pseudoaleatorio deterministico (LCG; sem dependencias externas).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    /// Gera expressao de `+`/`*` sobre 0..=9 com valor de referencia.
+    /// Faixa sem overflow possivel: so soma/multiplicacao de digitos.
+    fn gen_arith(rng: &mut Lcg, depth: u32) -> (String, i64) {
+        if depth == 0 || rng.next(3) == 0 {
+            let v = rng.next(10) as i64;
+            return (v.to_string(), v);
+        }
+        let (l_src, l_val) = gen_arith(rng, depth - 1);
+        let (r_src, r_val) = gen_arith(rng, depth - 1);
+        if rng.next(2) == 0 {
+            (format!("({l_src} + {r_src})"), l_val + r_val)
+        } else {
+            (format!("({l_src} * {r_src})"), l_val * r_val)
+        }
+    }
+
+    #[test]
+    fn property_arithmetic_matches_reference() {
+        let mut rng = Lcg(0x1234_5678_9ABC_DEF0);
+        for _ in 0..200 {
+            let (src, expected) = gen_arith(&mut rng, 4);
+            let got = run_src(&format!("echo {src};")).expect("programa gerado deve rodar");
+            assert_eq!(got, format!("{expected}\n"), "fonte: {src}");
+        }
+    }
+
+    #[test]
+    fn respects_step_limit() {
+        let chunk = compile_src("let i = 0; while true { i = i + 1; }");
+        let mut vm = Vm::new();
+        vm.set_limits(VmLimits {
+            max_steps: Some(1000),
+        });
+        let err = vm.run_to_string(&chunk).expect_err("deve falhar");
+        assert!(err.message.contains("limite de instrucoes"));
+        // Sem limite, programa finito passa normalmente.
+        let out = run_src("let i = 0; while i < 3 { i = i + 1; } echo i;").expect("ok");
+        assert_eq!(out, "3\n");
     }
 
     #[test]
