@@ -323,6 +323,23 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+        Builtin::Sort => match &args[0] {
+            Value::Array(items) => Ok(Value::Array(sort_array(items)?)),
+            other => Err(VmError::new(format!(
+                "`sort` exige array, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Exit => match &args[0] {
+            Value::Int(code) if (0..=255).contains(code) => Err(VmError::exit(*code as i32)),
+            Value::Int(code) => Err(VmError::new(format!(
+                "`exit` exige codigo entre 0 e 255, encontrado {code}"
+            ))),
+            other => Err(VmError::new(format!(
+                "`exit` exige codigo inteiro, encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)
@@ -389,6 +406,55 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+    }
+}
+
+/// Ordena copia do array (estavel). Aceita arrays homogeneos — numeros
+/// (`Int`/`Float` misturados comparam exato quando possivel), `Str`
+/// (ordem lexicografica de bytes UTF-8) ou `Bool` (`false` < `true`) —
+/// e o array vazio. Qualquer mistura com outros tipos e erro.
+fn sort_array(items: &[Value]) -> Result<Vec<Value>, VmError> {
+    let numeric = items
+        .iter()
+        .all(|v| matches!(v, Value::Int(_) | Value::Float(_)));
+    let strings = items.iter().all(|v| matches!(v, Value::Str(_)));
+    let bools = items.iter().all(|v| matches!(v, Value::Bool(_)));
+    if !numeric && !strings && !bools {
+        return Err(VmError::new(
+            "`sort` exige array de numeros, strings ou bools (homogeneo)".to_string(),
+        ));
+    }
+    let mut sorted = items.to_vec();
+    sorted.sort_by(compare_sort_values);
+    Ok(sorted)
+}
+
+fn compare_sort_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+        (Value::Int(x), Value::Float(y)) => compare_int_float(*x, *y),
+        (Value::Float(x), Value::Int(y)) => compare_int_float(*y, *x).reverse(),
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        // Inalcancavel: misturas sao rejeitadas em `sort_array`.
+        _ => Ordering::Equal,
+    }
+}
+
+/// Compara `Int` com `Float`: exato quando o float e inteiro representavel
+/// em `i64`; senao, via `f64` (deterministico; `NaN` vai para o fim,
+/// como em `total_cmp`).
+fn compare_int_float(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return Ordering::Less;
+    }
+    if f.fract() == 0.0 && f >= i64::MIN as f64 && f < 2f64.powi(63) {
+        i.cmp(&(f as i64))
+    } else {
+        (i as f64).total_cmp(&f)
     }
 }
 

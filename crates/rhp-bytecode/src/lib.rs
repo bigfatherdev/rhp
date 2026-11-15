@@ -109,6 +109,10 @@ pub enum Builtin {
     FsExists,
     Argv,
     Env,
+    /// `sort(array)` — copia ordenada (homogeneo: numeros, strings ou bools).
+    Sort,
+    /// `exit(codigo)` — encerra com codigo 0–255 (via erro especial).
+    Exit,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -151,6 +155,8 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "fs_exists" => Some(Builtin::FsExists),
         "argv" => Some(Builtin::Argv),
         "env" => Some(Builtin::Env),
+        "sort" => Some(Builtin::Sort),
+        "exit" => Some(Builtin::Exit),
         _ => None,
     }
 }
@@ -179,7 +185,9 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Entries
         | Builtin::FsRead
         | Builtin::FsExists
-        | Builtin::Env => 1,
+        | Builtin::Env
+        | Builtin::Sort
+        | Builtin::Exit => 1,
         Builtin::Push
         | Builtin::Contains
         | Builtin::StartsWith
@@ -262,6 +270,9 @@ pub enum Op {
     Index,
     /// Desempilha valor e indice; grava em `names[idx][indice]`.
     StoreIndex(u32),
+    /// Desempilha iteravel e empilha lista de iteracao: array vira copia;
+    /// mapa vira array de chaves `Str` ordenadas; outro tipo e erro.
+    IterList,
     /// Chama o builtin `id` (`n` = aridade fixa do builtin).
     CallBuiltin(BuiltinId),
 }
@@ -310,6 +321,8 @@ impl BuiltinId {
             33 => Ok(Builtin::FsExists),
             34 => Ok(Builtin::Argv),
             35 => Ok(Builtin::Env),
+            36 => Ok(Builtin::Sort),
+            37 => Ok(Builtin::Exit),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -354,6 +367,8 @@ impl From<Builtin> for BuiltinId {
             Builtin::FsExists => 33,
             Builtin::Argv => 34,
             Builtin::Env => 35,
+            Builtin::Sort => 36,
+            Builtin::Exit => 37,
         };
         Self(id)
     }
@@ -511,6 +526,10 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
                 check_depth(height, 1, op, context)?;
                 (height, Some(vec![ip + 1]))
             }
+            Op::IterList => {
+                check_depth(height, 1, op, context)?;
+                (height, Some(vec![ip + 1]))
+            }
             Op::Add
             | Op::Sub
             | Op::Mul
@@ -637,17 +656,24 @@ struct Compiler {
     /// desenrolamento correto e para proibir atribuicao a constantes.
     scopes: Vec<std::collections::HashSet<String>>,
     loops: Vec<LoopCtx>,
+    /// Contador de lacos `for` (nomes ocultos unicos por laco).
+    for_counter: u32,
 }
 
-/// Contexto de compilacao de um laco `while` (para `break`/`continue`).
+/// Contexto de compilacao de um laco (para `break`/`continue`).
 struct LoopCtx {
-    /// Profundidade de escopo do corpo (para desenrolar ate aqui).
-    scope_depth: usize,
-    /// Inicio do laco (reavaliacao da condicao).
-    start: u32,
+    /// Profundidade de escopo a manter ao sair com `break`.
+    /// (`while`: fecha tambem o escopo do corpo; `for`: mantem o escopo
+    /// do laco, fechado na saida, pois a condicao vive dentro dele.)
+    break_depth: usize,
+    /// Profundidade de escopo a manter ao voltar com `continue`.
+    continue_depth: usize,
+    /// Inicio do laco (`while`: salto direto do `continue`; `for`: `None`,
+    /// pois o `continue` salta ao incremento — remendado depois do corpo).
+    start: Option<u32>,
     /// Posicoes de salto a remendar para a saida.
     breaks: Vec<usize>,
-    /// Posicoes de salto a remendar para o inicio.
+    /// Posicoes de salto a remendar para o ponto de continuacao.
     continues: Vec<usize>,
 }
 
@@ -672,6 +698,7 @@ impl Compiler {
             constants: std::collections::HashMap::new(),
             scopes: vec![std::collections::HashSet::new()],
             loops: Vec::new(),
+            for_counter: 0,
         }
     }
 
@@ -767,6 +794,93 @@ impl Compiler {
         Ok(())
     }
 
+    /// Nome oculto do laco `for` (lista ou indice): contem NUL, impossivel
+    /// de escrever no fonte, logo nunca colide com variaveis do usuario.
+    fn hidden_for_name(&mut self, what: &str) -> String {
+        let id = self.for_counter;
+        self.for_counter += 1;
+        format!("\0for:{what}:{id}")
+    }
+
+    /// Compila `for VAR in ITER BLOCO`.
+    ///
+    /// Estrategia (sem runtime novo): avalia `ITER` uma vez, normaliza com
+    /// `IterList` (array = copia; mapa = chaves ordenadas) e itera por
+    /// indice, como um `while` com incremento. `VAR` e declarada a cada
+    /// iteracao no escopo do corpo. `break` fecha corpo + laco; `continue`
+    /// salta ao incremento.
+    fn compile_for(&mut self, var: &str, iter: &Expr, body: &[Stmt]) -> Result<(), CompileError> {
+        self.emit_scope_open();
+        let for_depth = self.scopes.len();
+        let list_name = self.hidden_for_name("lista");
+        let idx_name = self.hidden_for_name("indice");
+        self.compile_expr(iter)?;
+        self.emit(Op::IterList);
+        let list_idx = self.intern_name(&list_name)?;
+        self.emit(Op::DeclareName(list_idx));
+        let zero = self.add_constant(Value::Int(0))?;
+        self.emit(Op::Constant(zero));
+        let idx_pos = self.intern_name(&idx_name)?;
+        self.emit(Op::DeclareName(idx_pos));
+        let loop_start = self.chunk.code.len() as u32;
+        // Condicao: H_idx < len(H_list).
+        let idx_ref = self.intern_name(&idx_name)?;
+        self.emit(Op::LoadName(idx_ref));
+        let list_ref = self.intern_name(&list_name)?;
+        self.emit(Op::LoadName(list_ref));
+        self.emit(Op::CallBuiltin(BuiltinId::from(Builtin::Len)));
+        self.emit(Op::Lt);
+        let exit_jump = self.emit(Op::JumpIfFalse(u32::MAX));
+        self.emit_scope_open();
+        let body_depth = self.scopes.len();
+        self.loops.push(LoopCtx {
+            break_depth: for_depth,
+            continue_depth: body_depth,
+            start: None,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
+        // VAR = H_list[H_idx].
+        let list_elem = self.intern_name(&list_name)?;
+        self.emit(Op::LoadName(list_elem));
+        let idx_elem = self.intern_name(&idx_name)?;
+        self.emit(Op::LoadName(idx_elem));
+        self.emit(Op::Index);
+        let var_idx = self.intern_name(var)?;
+        self.emit(Op::DeclareName(var_idx));
+        // Como no `while`: desvios no corpo mexem no rastreamento estatico;
+        // restaura-o para o caminho normal (incremento apos o corpo).
+        let saved_scopes = self.scopes.clone();
+        self.compile_stmts(body)?;
+        self.scopes = saved_scopes;
+        let continue_target = self.chunk.code.len() as u32;
+        self.emit_scope_close()?;
+        // H_idx = H_idx + 1.
+        let idx_inc = self.intern_name(&idx_name)?;
+        self.emit(Op::LoadName(idx_inc));
+        let one = self.add_constant(Value::Int(1))?;
+        self.emit(Op::Constant(one));
+        self.emit(Op::Add);
+        let idx_store = self.intern_name(&idx_name)?;
+        self.emit(Op::StoreName(idx_store));
+        self.emit(Op::Jump(loop_start));
+        let exit_target = self.chunk.code.len() as u32;
+        self.patch_jump(exit_jump, exit_target);
+        let Some(loop_ctx) = self.loops.pop() else {
+            return Err(CompileError::new(
+                "desequilibrio interno de lacos".to_string(),
+            ));
+        };
+        for pos in &loop_ctx.breaks {
+            self.patch_jump(*pos, exit_target);
+        }
+        for pos in &loop_ctx.continues {
+            self.patch_jump(*pos, continue_target);
+        }
+        self.emit_scope_close()?;
+        Ok(())
+    }
+
     fn compile_if(
         &mut self,
         cond: &Expr,
@@ -829,8 +943,8 @@ impl Compiler {
                 let Some(loop_ctx) = self.loops.last() else {
                     return Err(CompileError::new("`break` fora de laco".to_string()));
                 };
-                let scope_depth = loop_ctx.scope_depth;
-                while self.scopes.len() > scope_depth {
+                let break_depth = loop_ctx.break_depth;
+                while self.scopes.len() > break_depth {
                     self.emit_scope_close()?;
                 }
                 let pos = self.emit(Op::Jump(u32::MAX));
@@ -839,14 +953,24 @@ impl Compiler {
                 }
             }
             Stmt::Continue => {
-                let (scope_depth, start) = match self.loops.last() {
-                    Some(loop_ctx) => (loop_ctx.scope_depth, loop_ctx.start),
+                let (continue_depth, start) = match self.loops.last() {
+                    Some(loop_ctx) => (loop_ctx.continue_depth, loop_ctx.start),
                     None => return Err(CompileError::new("`continue` fora de laco".to_string())),
                 };
-                while self.scopes.len() > scope_depth {
+                while self.scopes.len() > continue_depth {
                     self.emit_scope_close()?;
                 }
-                self.emit(Op::Jump(start));
+                match start {
+                    Some(target) => {
+                        self.emit(Op::Jump(target));
+                    }
+                    None => {
+                        let pos = self.emit(Op::Jump(u32::MAX));
+                        if let Some(top) = self.loops.last_mut() {
+                            top.continues.push(pos);
+                        }
+                    }
+                }
             }
             Stmt::Assign { target, expr } => match target {
                 AssignTarget::Var(name) => {
@@ -878,15 +1002,25 @@ impl Compiler {
                 let loop_start = self.chunk.code.len() as u32;
                 self.compile_expr(cond)?;
                 let exit_jump = self.emit(Op::JumpIfFalse(u32::MAX));
+                // Profundidade ANTES de abrir o escopo do corpo: `break` e
+                // `continue` fecham tambem o escopo do corpo, sem vazar
+                // `let`s internos para fora do laco.
+                let base_depth = self.scopes.len();
                 self.emit_scope_open();
-                let scope_depth = self.scopes.len();
                 self.loops.push(LoopCtx {
-                    scope_depth,
-                    start: loop_start,
+                    break_depth: base_depth,
+                    continue_depth: base_depth,
+                    start: Some(loop_start),
                     breaks: Vec::new(),
                     continues: Vec::new(),
                 });
+                // `break`/`continue` no corpo fecham escopos no rastreamento
+                // estatico; restaura-o para o caminho normal (corpo sem
+                // desvio), que fecha o escopo do corpo logo abaixo. So o
+                // rastreamento e restaurado — pools e saltos sao mantidos.
+                let saved_scopes = self.scopes.clone();
                 self.compile_stmts(body)?;
+                self.scopes = saved_scopes;
                 self.emit_scope_close()?;
                 self.emit(Op::Jump(loop_start));
                 let exit_target = self.chunk.code.len() as u32;
@@ -902,6 +1036,9 @@ impl Compiler {
                 for pos in &loop_ctx.continues {
                     self.patch_jump(*pos, loop_start);
                 }
+            }
+            Stmt::For { var, iter, body } => {
+                self.compile_for(var, iter, body)?;
             }
             Stmt::FnDef { name, params, body } => {
                 let mut seen = std::collections::HashSet::new();
@@ -1291,6 +1428,27 @@ mod tests {
     }
 
     #[test]
+    fn compiles_for_loop_with_break_continue() {
+        let chunk = compile_src("for x in [1, 2] { if x == 1 { continue; } break; }");
+        chunk.validate().expect("for deve validar");
+        assert!(chunk.code.contains(&Op::IterList));
+        // `for` aninhado usa nomes ocultos distintos (sem colisao).
+        let nested = compile_src("for a in [1] { for b in [2] { echo b; } }");
+        nested.validate().expect("for aninhado deve validar");
+        // `for` dentro de funcao compila.
+        let in_fn = compile_src("fn f() { for x in [1] { echo x; } }");
+        in_fn.validate().expect("for em funcao deve validar");
+        // Aridade dos novos builtins.
+        let program = parse_source("echo sort([2, 1]); exit(0);").expect("parse deve passar");
+        compile(&program).expect("sort/exit com aridade certa deve passar");
+        let wrong = parse_source("echo sort([1], [2]);").expect("parse deve passar");
+        assert!(compile(&wrong)
+            .expect_err("deve falhar")
+            .message
+            .contains("espera 1"));
+    }
+
+    #[test]
     fn compiles_bitwise_ops() {
         let chunk = compile_src("echo 6 & 3 | 1 ^ 2; echo ~5; echo 1 << 4;");
         assert!(chunk.code.contains(&Op::BitAnd));
@@ -1429,6 +1587,8 @@ mod tests {
             Builtin::FsExists,
             Builtin::Argv,
             Builtin::Env,
+            Builtin::Sort,
+            Builtin::Exit,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

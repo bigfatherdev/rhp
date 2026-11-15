@@ -34,13 +34,32 @@ pub struct VmLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmError {
     pub message: String,
+    /// Codigo de `exit(codigo)` quando o erro e um pedido de saida;
+    /// `None` para erros comuns. Leitura publica; construcao interna.
+    exit_code: Option<i32>,
 }
 
 impl VmError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            exit_code: None,
         }
+    }
+
+    /// Pedido de `exit(codigo)` (0–255): desenrola frames como erro, mas a
+    /// CLI o traduz em codigo de saida em vez de mensagem de falha.
+    pub(crate) fn exit(code: i32) -> Self {
+        Self {
+            message: format!("exit({code})"),
+            exit_code: Some(code),
+        }
+    }
+
+    /// Codigo de saida pedido por `exit`, se for o caso.
+    #[must_use]
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
     }
 }
 
@@ -412,6 +431,25 @@ impl Vm {
                 if !self.assign(idx, &name, updated) {
                     return Err(VmError::new(format!("variavel nao definida: {name}")));
                 }
+                self.frames[idx].ip += 1;
+            }
+            Op::IterList => {
+                let value = self.pop(idx, "iteracao")?;
+                let list = match value {
+                    Value::Array(items) => items,
+                    Value::Map(entries) => {
+                        let mut keys: Vec<String> = entries.keys().cloned().collect();
+                        keys.sort();
+                        keys.into_iter().map(Value::Str).collect()
+                    }
+                    other => {
+                        return Err(VmError::new(format!(
+                            "`for` exige array ou mapa, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                };
+                self.push_checked(idx, Value::Array(list))?;
                 self.frames[idx].ip += 1;
             }
             Op::CallBuiltin(id) => {
@@ -1402,6 +1440,138 @@ mod tests {
             .expect_err("deve falhar")
             .message
             .contains("fora de laco"));
+    }
+
+    #[test]
+    fn while_body_scope_does_not_leak_on_break() {
+        // Regressao: `let` no corpo do `while` + `break` vazava para fora.
+        let err = run_err("while true { let vazou = 1; break; } echo vazou;");
+        assert!(err.contains("nao definida"), "obteve: {err}");
+        // E o caminho normal continua fechando o escopo a cada iteracao.
+        let err = run_err("let i = 0; while i < 2 { let tmp = i; i = i + 1; } echo tmp;");
+        assert!(err.contains("nao definida"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_for_over_array_and_map() {
+        assert_eq!(
+            run_src("for x in [3, 1, 2] { echo x; }").expect("ok"),
+            "3\n1\n2\n"
+        );
+        // Mapa: itera chaves ordenadas (mesma ordem de `keys`).
+        assert_eq!(
+            run_src("for k in {b: 1, a: 2} { echo k; }").expect("ok"),
+            "a\nb\n"
+        );
+        // Vazio: corpo nunca executa.
+        assert_eq!(
+            run_src("for x in [] { echo x; } echo \"fim\";").expect("ok"),
+            "fim\n"
+        );
+        assert_eq!(
+            run_src("for k in {} { echo k; } echo \"fim\";").expect("ok"),
+            "fim\n"
+        );
+        // Fora do laco, a variavel nao existe.
+        let err = run_err("for x in [1] { } echo x;");
+        assert!(err.contains("nao definida"), "obteve: {err}");
+        // Nao iteravel e erro com tipo.
+        let err = run_err("for x in 42 { echo x; }");
+        assert!(err.contains("array ou mapa"), "obteve: {err}");
+        let err = run_err("for x in \"ab\" { echo x; }");
+        assert!(err.contains("array ou mapa"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_for_with_break_continue_and_nesting() {
+        assert_eq!(
+            run_src(
+                "for i in [1, 2, 3, 4] { if i % 2 == 0 { continue; } if i > 2 { break; } echo i; }"
+            )
+            .expect("ok"),
+            "1\n"
+        );
+        // `continue` pula para a proxima iteracao (nao trava no incremento).
+        assert_eq!(
+            run_src("let s = 0; for i in [1, 2, 3] { if i == 2 { continue; } s = s + i; } echo s;")
+                .expect("ok"),
+            "4\n"
+        );
+        // Aninhado com soma de pares.
+        assert_eq!(
+            run_src("let n = 0; for a in [1, 2] { for b in [10, 20] { n = n + a + b; } } echo n;")
+                .expect("ok"),
+            "66\n"
+        );
+        // Dentro de funcao e com `while` externo.
+        assert_eq!(
+            run_src("fn soma(xs) { let t = 0; for x in xs { t = t + x; } return t; } echo soma([1, 2, 3]);").expect("ok"),
+            "6\n"
+        );
+        // Iteravel avaliado uma vez (mutar a origem nao afeta a iteracao).
+        assert_eq!(
+            run_src("let a = [1, 2]; for x in a { a = push(a, 9); echo x; }").expect("ok"),
+            "1\n2\n"
+        );
+    }
+
+    #[test]
+    fn runs_sort_builtin() {
+        assert_eq!(run_src("echo sort([3, 1, 2]);").expect("ok"), "[1, 2, 3]\n");
+        assert_eq!(
+            run_src("echo sort([2.5, 1, 2]);").expect("ok"),
+            "[1, 2, 2.5]\n"
+        );
+        assert_eq!(
+            run_src("echo sort([\"b\", \"a\", \"c\"]);").expect("ok"),
+            "[a, b, c]\n"
+        );
+        assert_eq!(
+            run_src("echo sort([true, false, true]);").expect("ok"),
+            "[false, true, true]\n"
+        );
+        assert_eq!(run_src("echo sort([]);").expect("ok"), "[]\n");
+        // Devolve copia: o original nao muda.
+        assert_eq!(
+            run_src("let a = [2, 1]; let b = sort(a); echo a; echo b;").expect("ok"),
+            "[2, 1]\n[1, 2]\n"
+        );
+        // Heterogeneo e erro; nao-array e erro.
+        let err = run_err("echo sort([1, \"a\"]);");
+        assert!(err.contains("homogeneo"), "obteve: {err}");
+        let err = run_err("echo sort({a: 1});");
+        assert!(err.contains("exige array"), "obteve: {err}");
+    }
+
+    #[test]
+    fn reports_exit_code_and_unwinds() {
+        let chunk = compile_src("echo 1; exit(3); echo 2;");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&chunk, &mut out).expect_err("exit deve interromper");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(out, b"1\n");
+        // `exit(0)` tambem e pedido de saida (codigo 0).
+        let chunk = compile_src("exit(0);");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&chunk, &mut out).expect_err("exit deve interromper");
+        assert_eq!(err.exit_code(), Some(0));
+        // Desenrola chamadas: sai de dentro de funcao.
+        let chunk = compile_src("fn f() { exit(7); } f(); echo \"nunca\";");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&chunk, &mut out).expect_err("exit deve interromper");
+        assert_eq!(err.exit_code(), Some(7));
+        assert!(out.is_empty());
+        // Codigo fora de 0-255 e erro comum (sem codigo de saida).
+        let err = run_err("exit(256);");
+        assert!(err.contains("0 e 255"), "obteve: {err}");
+        let no_code = compile_src("exit(256);");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&no_code, &mut out).expect_err("deve falhar");
+        assert_eq!(err.exit_code(), None);
     }
 
     #[test]

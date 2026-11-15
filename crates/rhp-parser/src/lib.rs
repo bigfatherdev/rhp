@@ -6,7 +6,7 @@
 //! Program    := Stmt*
 //! Block      := "{" Stmt* "}"
 //! Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt
-//!             | WhileStmt | BreakStmt | ContinueStmt | FnDef
+//!             | WhileStmt | ForStmt | BreakStmt | ContinueStmt | FnDef
 //!             | ReturnStmt | Block | ImportStmt | ExprStmt
 //! LetStmt    := "let" Ident ("=" Expr)? ";"
 //! ConstStmt  := "const" Ident "=" Expr ";"
@@ -15,6 +15,7 @@
 //! EchoStmt   := "echo" Expr ";"
 //! IfStmt     := "if" Expr Block ("else" Block)?
 //! WhileStmt  := "while" Expr Block
+//! ForStmt    := "for" Ident "in" Expr Block
 //! BreakStmt  := "break" ";"
 //! ContinueStmt := "continue" ";"
 //! FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
@@ -78,6 +79,15 @@ pub enum Stmt {
     },
     While {
         cond: Expr,
+        body: Vec<Stmt>,
+    },
+    /// `for VAR in ITER BLOCO` — itera elementos de array ou chaves
+    /// ordenadas de mapa. `ITER` e avaliado uma vez (snapshot por valor);
+    /// `VAR` e declarada a cada iteracao no escopo do corpo.
+    /// `in` e contextual (identificador posicional, nao palavra-chave).
+    For {
+        var: String,
+        iter: Expr,
         body: Vec<Stmt>,
     },
     FnDef {
@@ -267,6 +277,7 @@ fn token_width(token: &Token) -> usize {
         | TokenKind::If
         | TokenKind::Else
         | TokenKind::While
+        | TokenKind::For
         | TokenKind::Fn
         | TokenKind::Import
         | TokenKind::Null
@@ -330,6 +341,7 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         }
         TokenKind::If => parse_if(cursor),
         TokenKind::While => parse_while(cursor),
+        TokenKind::For => parse_for(cursor),
         TokenKind::Fn => parse_fn_def(cursor),
         TokenKind::Return => parse_return(cursor),
         TokenKind::Import => parse_import(cursor),
@@ -438,6 +450,39 @@ fn parse_while(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     let cond = parse_expr(cursor)?;
     let body = parse_block(cursor)?;
     Ok(Stmt::While { cond, body })
+}
+
+fn parse_for(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let var = expect_ident(cursor)?;
+    // `in` e contextual: aceita apenas o identificador `in` nesta posicao,
+    // sem reservar a palavra no resto da linguagem.
+    match cursor.next() {
+        Some(t) => match &t.kind {
+            TokenKind::Ident(name) if name == "in" => {}
+            other => {
+                return Err(ParseError::new(
+                    format!(
+                        "esperado `in` apos variavel do `for`, encontrado {}",
+                        describe(other)
+                    ),
+                    t.line,
+                    t.col,
+                ));
+            }
+        },
+        None => {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                "esperado `in` apos variavel do `for`, encontrado fim de arquivo",
+                line,
+                col,
+            ));
+        }
+    }
+    let iter = parse_expr(cursor)?;
+    let body = parse_block(cursor)?;
+    Ok(Stmt::For { var, iter, body })
 }
 
 fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -911,6 +956,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::If => "`if`".to_string(),
         TokenKind::Else => "`else`".to_string(),
         TokenKind::While => "`while`".to_string(),
+        TokenKind::For => "`for`".to_string(),
         TokenKind::Fn => "`fn`".to_string(),
         TokenKind::Const => "`const`".to_string(),
         TokenKind::Break => "`break`".to_string(),
@@ -1105,6 +1151,48 @@ mod tests {
             }
         ));
         assert!(matches!(program.statements[1], Stmt::While { .. }));
+    }
+
+    #[test]
+    fn parses_for_in_loop() {
+        let program = lex_and_parse("for x in [1, 2] { echo x; }").expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::For {
+                var: "x".to_string(),
+                iter: Expr::Array(vec![Expr::Int(1), Expr::Int(2)]),
+                body: vec![Stmt::Echo {
+                    expr: Expr::Var("x".to_string()),
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_in_as_plain_identifier_elsewhere() {
+        // `in` so tem sentido apos `for VAR`; no resto, e identificador comum.
+        let program = lex_and_parse("let in = 1; echo in;").expect("parse deve passar");
+        assert!(matches!(program.statements[0], Stmt::Let { .. }));
+    }
+
+    #[test]
+    fn rejects_for_without_in() {
+        let err = lex_and_parse("for x [1, 2] { echo x; }").expect_err("deve falhar");
+        assert!(
+            err.message.contains("esperado `in`"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_for_without_block() {
+        let err = lex_and_parse("for x in [1];").expect_err("deve falhar");
+        assert!(
+            err.message.contains("esperado `{`"),
+            "obteve: {}",
+            err.message
+        );
     }
 
     #[test]

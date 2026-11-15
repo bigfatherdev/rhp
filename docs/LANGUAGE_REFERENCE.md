@@ -33,12 +33,16 @@ Locais: parametros + lets da ativacao. `let` nao sombreia parametro.
 ```rhp
 if x > 1 { echo "maior"; } else { echo "menor"; }
 while i < 3 { i = i + 1; }
+for x in [1, 2] { echo x; }
+for k in {b: 1, a: 2} { echo k; }   // a, b (chaves ordenadas)
 fn soma(a, b) { return a + b; }
 echo soma(3, 4);   // 7
 ```
 
-`if`/`while` exigem `Bool`. `return` (com ou sem valor) so em funcao;
-fim do corpo retorna `null`. Recursao ate 512 frames.
+`if`/`while` exigem `Bool`. `for` itera array (elementos) ou mapa
+(chaves ordenadas); o iteravel e avaliado uma vez. `break`/`continue`
+fecham o escopo do corpo (`let` interno nao vaza). `return` (com ou sem
+valor) so em funcao; fim do corpo retorna `null`. Recursao ate 512 frames.
 
 ## Compostos e builtins
 
@@ -46,7 +50,9 @@ fim do corpo retorna `null`. Recursao ate 512 frames.
 let a = [1, 2]; a[0] = 9; a = push(a, 3);
 echo len(a); echo pop(a); echo keys({b: 1});
 echo str(42); echo int("42"); echo float(2); echo type(a);
+echo sort([3, 1, 2]); echo split("a,b", ",");
 assert(a == [9, 2, 3]); echo http_get("http://127.0.0.1:8080/x");
+exit(0);
 ```
 
 Index fora do intervalo, chave ausente, tipos errados e aridade divergente

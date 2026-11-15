@@ -21,7 +21,8 @@ fn main() -> ExitCode {
                 Ok(max_steps) => {
                     match run_file_limited(path, rest, &mut std::io::stdout(), Some(max_steps)) {
                         Ok(()) => ExitCode::SUCCESS,
-                        Err(message) => {
+                        Err(Fail::Exit(code)) => ExitCode::from(code as u8),
+                        Err(Fail::Msg(message)) => {
                             let _ = writeln!(std::io::stderr(), "rhp: {message}");
                             ExitCode::from(1)
                         }
@@ -39,7 +40,8 @@ fn main() -> ExitCode {
         [_, cmd, path, rest @ ..] if cmd == "run" => {
             match run_file_with_args(path, rest, &mut std::io::stdout()) {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(message) => {
+                Err(Fail::Exit(code)) => ExitCode::from(code as u8),
+                Err(Fail::Msg(message)) => {
                     let _ = writeln!(std::io::stderr(), "rhp: {message}");
                     ExitCode::from(1)
                 }
@@ -311,8 +313,11 @@ fn run_tests(target: &Path) -> Result<(), String> {
             let chunk = rhp_bytecode::compile(&program)
                 .map_err(|e| LoadError::Plain(format!("erro de compilacao: {e}")))?;
             let mut vm = rhp_vm::Vm::new();
-            vm.run(&chunk, &mut sink)
-                .map_err(|e| LoadError::Plain(format!("erro de execucao: {e}")))
+            // `exit(codigo)` em teste nao mata o corredor: vira falha do arquivo.
+            vm.run(&chunk, &mut sink).map_err(|e| match e.exit_code() {
+                Some(code) => LoadError::Plain(format!("exit({code})")),
+                None => LoadError::Plain(format!("erro de execucao: {e}")),
+            })
         }) {
             Ok(()) => println!("ok {}", file.display()),
             Err(err) => {
@@ -374,8 +379,28 @@ fn run_doctor() -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
+/// Falha de execucao: mensagem de erro ou pedido de `exit(codigo)`.
+/// `Exit` vira codigo de saida do processo no `rhp run` (sem mensagem);
+/// no `rhp test`, vira falha do arquivo (o corredor possui o exit code).
+#[derive(Debug)]
+enum Fail {
+    Msg(String),
+    Exit(i32),
+}
+
+impl Fail {
+    /// Mensagem para assercoes de teste e diagnosticos (inclui `exit(N)`).
+    #[cfg(test)]
+    fn into_message(self) -> String {
+        match self {
+            Fail::Msg(message) => message,
+            Fail::Exit(code) => format!("exit({code})"),
+        }
+    }
+}
+
 /// Executa um arquivo `.rhp`, repassando argumentos extras para `argv()`.
-fn run_file_with_args(path: &str, args: &[String], output: &mut dyn Write) -> Result<(), String> {
+fn run_file_with_args(path: &str, args: &[String], output: &mut dyn Write) -> Result<(), Fail> {
     run_file_limited(path, args, output, None)
 }
 
@@ -385,8 +410,8 @@ fn run_file_limited(
     args: &[String],
     output: &mut dyn Write,
     max_steps: Option<u64>,
-) -> Result<(), String> {
-    let program = load_program(path).map_err(|e| e.human())?;
+) -> Result<(), Fail> {
+    let program = load_program(path).map_err(|e| Fail::Msg(e.human()))?;
     run_program(
         &program,
         path,
@@ -406,17 +431,28 @@ fn run_program(
     args: &[String],
     output: &mut dyn Write,
     limits: rhp_vm::VmLimits,
-) -> Result<(), String> {
+) -> Result<(), Fail> {
     let chunk = rhp_bytecode::compile(program).map_err(|e| {
         let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
-        with_code(code, help, &format!("{origin}: erro de compilacao: {e}"))
+        Fail::Msg(with_code(
+            code,
+            help,
+            &format!("{origin}: erro de compilacao: {e}"),
+        ))
     })?;
     let mut vm = rhp_vm::Vm::new();
     vm.set_limits(limits);
     vm.set_argv(args.to_vec());
-    vm.run(&chunk, output).map_err(|e| {
-        let (code, help) = rhp_diagnostic::runtime_code(&e.to_string());
-        with_code(code, help, &format!("{origin}: erro de execucao: {e}"))
+    vm.run(&chunk, output).map_err(|e| match e.exit_code() {
+        Some(code) => Fail::Exit(code),
+        None => {
+            let (code, help) = rhp_diagnostic::runtime_code(&e.to_string());
+            Fail::Msg(with_code(
+                code,
+                help,
+                &format!("{origin}: erro de execucao: {e}"),
+            ))
+        }
     })
 }
 
@@ -446,7 +482,12 @@ fn parse_with_diagnostics(origin: &str, source: &str) -> Result<Program, LoadErr
 #[cfg(test)]
 fn run_source(source: &str, origin: &str, output: &mut dyn Write) -> Result<(), String> {
     let program = rhp_parser::parse_source(source).map_err(|e| format!("{origin}:{e}"))?;
-    run_program(&program, origin, &[], output, rhp_vm::VmLimits::default())
+    run_program(&program, origin, &[], output, rhp_vm::VmLimits::default()).map_err(|fail| {
+        match fail {
+            Fail::Msg(message) => message,
+            Fail::Exit(code) => format!("exit({code})"),
+        }
+    })
 }
 
 /// Teto de tamanho de fonte por arquivo (protecao contra OOM no loader).
@@ -566,6 +607,7 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
                 }
             }
             Stmt::While { body, .. } => check_block_imports(body, "em `while`")?,
+            Stmt::For { body, .. } => check_block_imports(body, "em `for`")?,
             Stmt::FnDef { body, name, .. } => {
                 check_block_imports(body, &format!("na funcao `{name}`"))?;
             }
@@ -628,7 +670,8 @@ mod tests {
     fn reports_missing_file() {
         let mut buf: Vec<u8> = Vec::new();
         let err = run_file_with_args("/caminho/que/nao/existe-12345.rhp", &[], &mut buf)
-            .expect_err("deve falhar");
+            .expect_err("deve falhar")
+            .into_message();
         assert!(err.contains("modulo nao encontrado"));
     }
 
@@ -638,8 +681,9 @@ mod tests {
         write_temp_module(&dir, "lib.rhp", "let x = 1;\n");
         let main = write_temp_module(&dir, "main.rhp", "fn f() {\n  import \"lib.rhp\";\n}\n");
         let mut buf: Vec<u8> = Vec::new();
-        let err =
-            run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect_err("deve falhar");
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
         assert!(err.contains("nivel superior"), "obteve: {err}");
     }
 
@@ -651,8 +695,9 @@ mod tests {
         write_temp_module(&dir, "fora.rhp", "let smuggled = 1;\n");
         let main = write_temp_module(&sub, "main.rhp", "import \"../fora.rhp\";\n");
         let mut buf: Vec<u8> = Vec::new();
-        let err =
-            run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect_err("deve falhar");
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
         assert!(err.contains("fora da arvore"), "obteve: {err}");
     }
 
@@ -663,8 +708,9 @@ mod tests {
         let content = "echo 1;\n".repeat(2 * 1024 * 1024);
         std::fs::write(&big, content).expect("nao foi possivel escrever big.rhp");
         let mut buf: Vec<u8> = Vec::new();
-        let err =
-            run_file_with_args(&big.to_string_lossy(), &[], &mut buf).expect_err("deve falhar");
+        let err = run_file_with_args(&big.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
         assert!(err.contains("muito grande"), "obteve: {err}");
     }
 
@@ -674,7 +720,8 @@ mod tests {
         let main = write_temp_module(&dir, "loop.rhp", "while true {\n}\n");
         let mut buf: Vec<u8> = Vec::new();
         let err = run_file_limited(&main.to_string_lossy(), &[], &mut buf, Some(500))
-            .expect_err("deve falhar");
+            .expect_err("deve falhar")
+            .into_message();
         assert!(err.contains("limite de instrucoes"), "obteve: {err}");
     }
 
@@ -699,7 +746,9 @@ mod tests {
         write_temp_module(&dir, "a.rhp", "import \"b.rhp\";\n");
         let b = write_temp_module(&dir, "b.rhp", "import \"a.rhp\";\n");
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_file_with_args(&b.to_string_lossy(), &[], &mut buf).expect_err("deve falhar");
+        let err = run_file_with_args(&b.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
         assert!(err.contains("importacao circular"));
     }
 }

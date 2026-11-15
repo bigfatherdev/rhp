@@ -108,6 +108,13 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str("}\n");
         }
+        Stmt::For { var, iter, body } => {
+            indent(level, out);
+            let _ = writeln!(out, "for {var} in {} {{", fmt_expr(iter, 0));
+            fmt_block(body, level + 1, out);
+            indent(level, out);
+            out.push_str("}\n");
+        }
         Stmt::FnDef { name, params, body } => {
             indent(level, out);
             let _ = writeln!(out, "fn {name}({}) {{", params.join(", "));
@@ -361,6 +368,19 @@ mod tests {
             "echo (a ? b : c) ? d : e;\n"
         );
         check_idempotent("const N = 10;\nwhile true {\n  if N > 1 {\n    break;\n  } else {\n    continue;\n  }\n}\n");
+    }
+
+    #[test]
+    fn formats_for_loop_canonically() {
+        assert_eq!(
+            fmt("for x in [1,2]{echo x;}"),
+            "for x in [1, 2] {\n  echo x;\n}\n"
+        );
+        check_idempotent(
+            "for k in {b: 1, a: 2} {\n  if k == \"a\" {\n    continue;\n  }\n  break;\n}\n",
+        );
+        // `in` continua identificador comum fora do `for`.
+        check_idempotent("let in = 1;\necho in;\n");
     }
 
     #[test]

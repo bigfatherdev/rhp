@@ -106,6 +106,63 @@ fn rhp_run_control_flow() {
 }
 
 #[test]
+fn rhp_run_for_sort_and_scopes() {
+    let output = run_temp_source(
+        "laco.rhp",
+        "for x in [3, 1, 2] {\n  echo x;\n}\nfor k in {b: 1, a: 2} {\n  echo k;\n}\nlet t = 0;\nfor i in [1, 2, 3, 4] {\n  if i % 2 == 0 {\n    continue;\n  }\n  if i > 2 {\n    break;\n  }\n  t = t + i;\n}\necho t;\necho sort([3, 1, 2]);\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"3\n1\n2\na\nb\n1\n[1, 2, 3]\n");
+}
+
+#[test]
+fn rhp_run_exit_codes() {
+    // `exit(3)`: stdout anterior preservado + codigo 3, sem mensagem de erro.
+    let output = run_temp_source("sai3.rhp", "echo \"antes\";\nexit(3);\necho \"depois\";\n");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"antes\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `exit(0)`: sucesso.
+    let output = run_temp_source("sai0.rhp", "exit(0);\n");
+    assert!(output.status.success());
+    // Codigo fora de 0-255: erro comum (exit 1).
+    let output = run_temp_source("sai_ruim.rhp", "exit(256);\n");
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn rhp_run_while_scope_does_not_leak() {
+    // Regressao: `let` no corpo do `while` + `break` nao vaza para fora.
+    let output = run_temp_source(
+        "vazou.rhp",
+        "while true {\n  let vazou = 1;\n  break;\n}\necho vazou;\n",
+    );
+    assert!(
+        !output.status.success(),
+        "vazamento de escopo voltou a passar"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nao definida"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn rhp_run_functions_and_fib_example() {
     // Recursao direta no programa temporario.
     let output = run_temp_source(
@@ -310,7 +367,8 @@ fn vscode_grammar_covers_language() {
     let text = std::fs::read_to_string(&grammar).expect("nao foi possivel ler gramatica");
     assert!(text.contains("\"scopeName\": \"source.rhp\""));
     for keyword in [
-        "echo", "let", "if", "else", "while", "fn", "return", "import", "true", "false", "null",
+        "echo", "let", "const", "if", "else", "while", "for", "break", "continue", "fn", "return",
+        "import", "true", "false", "null",
     ] {
         assert!(
             text.contains(keyword),
@@ -318,7 +376,44 @@ fn vscode_grammar_covers_language() {
         );
     }
     for builtin in [
-        "len", "push", "pop", "keys", "str", "int", "float", "type", "assert", "http_get",
+        "len",
+        "push",
+        "pop",
+        "keys",
+        "str",
+        "int",
+        "float",
+        "type",
+        "assert",
+        "http_get",
+        "contains",
+        "starts_with",
+        "ends_with",
+        "split",
+        "join",
+        "trim",
+        "upper",
+        "lower",
+        "replace",
+        "abs",
+        "min",
+        "max",
+        "sqrt",
+        "pow",
+        "floor",
+        "ceil",
+        "values",
+        "entries",
+        "merge",
+        "has",
+        "fs_read",
+        "fs_write",
+        "fs_append",
+        "fs_exists",
+        "argv",
+        "env",
+        "sort",
+        "exit",
     ] {
         assert!(
             text.contains(builtin),

@@ -1,10 +1,14 @@
 //! Lexer escrito a mao para o RHP (Fase 2 / Marco 2).
 //!
 //! Reconhece o subconjunto implementado: palavras-chave (`echo`, `let`,
-//! `if`, `else`, `while`, `fn`, `return`, `true`, `false`, `null`),
-//! identificadores, literais (string, inteiro, float), operadores e
-//! pontuacao. Comentarios de linha `//` sao ignorados. Erros carregam
-//! linha/coluna.
+//! `const`, `if`, `else`, `while`, `for`, `break`, `continue`, `fn`,
+//! `return`, `import`, `true`, `false`, `null`), identificadores, literais
+//! (string, inteiro, float), operadores e pontuacao. Comentarios de linha
+//! `//` sao ignorados. Erros carregam linha/coluna.
+//!
+//! Nota: `in` (do `for x in ...`) NAO e palavra-chave: e lido como
+//! identificador comum e reconhecido posicionalmente pelo parser, para
+//! nao quebrar programas que usam `in` como nome de variavel.
 
 use std::fmt;
 
@@ -18,6 +22,7 @@ pub enum TokenKind {
     If,
     Else,
     While,
+    For,
     Break,
     Continue,
     Fn,
@@ -556,6 +561,7 @@ fn lex_ident_or_keyword(
         "if" => TokenKind::If,
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
+        "for" => TokenKind::For,
         "fn" => TokenKind::Fn,
         "return" => TokenKind::Return,
         "import" => TokenKind::Import,
@@ -657,18 +663,21 @@ mod tests {
     #[test]
     fn lexes_identifiers_and_keywords() {
         assert_eq!(
-            kinds("let if else while fn return import echo"),
+            kinds("let if else while for fn return import echo"),
             vec![
                 TokenKind::Let,
                 TokenKind::If,
                 TokenKind::Else,
                 TokenKind::While,
+                TokenKind::For,
                 TokenKind::Fn,
                 TokenKind::Return,
                 TokenKind::Import,
                 TokenKind::Echo,
             ]
         );
+        // `in` e contextual (do `for x in ...`): continua identificador.
+        assert_eq!(kinds("in"), vec![TokenKind::Ident("in".to_string())]);
         assert_eq!(
             kinds("x _y z9"),
             vec![

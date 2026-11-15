@@ -42,6 +42,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   Registro: `changes/2026-11-15-feat-cli-test-doctor.md`.
 - Sintaxe lote 2: bitwise, ternário, `??`, `break`/`continue`, `const`.
   Registro: `changes/2026-11-15-feat-sintaxe-lote2.md`.
+- Laco `for x in ...` (array = elementos; mapa = chaves ordenadas),
+  builtins `sort(array)` (copia ordenada estavel) e `exit(codigo)`
+  (0-255; vira exit code no `rhp run`).
+  Registro: `changes/2026-11-15-feat-laco-for-sort-exit.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).
@@ -80,3 +84,6 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   apenas no nivel superior; `VmLimits`/`--max-steps` opt-in.
   Registros: `changes/2026-11-14-fix-p2-nucleo.md`,
   `changes/2026-11-14-feat-limites-execucao.md`.
+- Escopo de `while`/`for` nao vaza em `break`/`continue` (`let` do corpo
+  invisivel fora do laco).
+  Registro: `changes/2026-11-15-fix-laco-escopo-break.md`.
