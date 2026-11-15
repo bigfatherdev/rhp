@@ -78,6 +78,20 @@ fn rhp_run_expressions_and_variables() {
 }
 
 #[test]
+fn rhp_run_new_syntax_batch() {
+    let output = run_temp_source(
+        "novo.rhp",
+        "const LIMITE = 3;\nlet i = 0;\nwhile i < 10 {\n  i = i + 1;\n  if i % 2 == 0 {\n    continue;\n  }\n  if i > LIMITE {\n    break;\n  }\n  echo i;\n}\necho 6 & 3;\necho 1 << 4;\necho null ?? \"padrao\";\necho true ? \"s\" : \"n\";\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1\n3\n2\n16\npadrao\ns\n");
+}
+
+#[test]
 fn rhp_run_control_flow() {
     let output = run_temp_source(
         "ctrl.rhp",

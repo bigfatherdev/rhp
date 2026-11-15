@@ -38,14 +38,18 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 ## 2. Instrucoes
 
 ```text
-Stmt       := LetStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt | FnDef
-           | ReturnStmt | Block | ExprStmt
+Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt
+           | BreakStmt | ContinueStmt | FnDef | ReturnStmt | Block | ImportStmt
+           | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
+ConstStmt  := "const" Ident "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
 Target     := Ident | Ident "[" Expr "]"
 EchoStmt   := "echo" Expr ";"
 IfStmt     := "if" Expr Block ("else" Block)?
 WhileStmt  := "while" Expr Block
+BreakStmt  := "break" ";"
+ContinueStmt := "continue" ";"
 FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
 ReturnStmt := "return" Expr? ";"
 ImportStmt := "import" String ";"
@@ -57,8 +61,12 @@ ExprStmt   := Expr ";"
 - `x = e;` exige variavel visivel (escopos internos -> externos -> globais).
 - `echo e;` escreve `Display` do valor + `\n` (qualquer tipo).
 - `if`/`while` exigem condicao `Bool` (sem truthiness implicita). `while`
-  reavalia a condicao a cada iteracao. Blocos `{}` criam escopo; shadowing
+  reavalia a condicao a cada iteracao. `break`/`continue` (sempre dentro de
+  `while`, mesmo aninhados em `if`/blocos) saem da iteracao ou do laco;
+  fora de laco e erro de compilacao. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
+- `const NOME = expr;` declara como `let`, mas imutavel: atribuir depois
+  (inclusive `NOME[i] = v`) e erro de compilacao.
 - `fn nome(params) { ... }` declara funcao no escopo atual. Chamada
   `nome(args)` avalia callee e argumentos da esquerda para a direita;
   aridade deve coincidir. `return e;` sai da funcao com o valor (`return;`
@@ -70,8 +78,11 @@ ExprStmt   := Expr ";"
 
 ## 3. Expressoes e precedencia (da menor para a maior)
 
-Igualdade (`==`, `!=`) < comparacao (`<`, `<=`, `>`, `>=`) < aditiva
-(`+`, `-`) < multiplicativa (`*`, `/`, `%`) < unaria (`!`, `-`) < primaria.
+Ternario (`a ? b : c`, associativo a direita) < coalescencia nula
+(`a ?? b`, avalia `a` uma vez; `null` usa `b`) < igualdade (`==`, `!=`) <
+OU-bit (`|`) < XOR-bit (`^`) < E-bit (`&`) < comparacao (`<`, `<=`, `>`,
+`>=`) < deslocamento (`<<`, `>>`) < aditiva (`+`, `-`) < multiplicativa
+(`*`, `/`, `%`) < unaria (`!`, `-`, `~` e `+x` como identidade) < primaria.
 
 ```text
 Primary   := Int | Float | String | "true" | "false" | "null"
@@ -98,6 +109,10 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
   `Str`-`Str` (lexicografica); resto e erro. `==`/`!=` aceitam quaisquer
   valores: `Int`/`Float` comparam numericamente, funcoes por identidade,
   tipos diferentes sao diferentes.
+- Bitwise (`& | ^`, so `Int`): E/OU/XOR bit a bit; `~x` inverte os bits de
+  `Int`; `<<`/`>>` deslocam (deslocamento negativo ou >= 64 = erro).
+- Ternario `c ? a : b` avalia so o ramo escolhido (`c` deve ser `Bool`).
+  `a ?? b` avalia `a` uma vez: se nao-`null`, usa `a`; senao avalia `b`.
 - `Display`: `null`, `true`/`false`, inteiro, float, conteudo da string,
   `[a, b]` para arrays, `{k: v, ...}` (chaves ordenadas) para mapas,
   `<fn nome>` para funcoes.

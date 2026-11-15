@@ -5,24 +5,34 @@
 //! ```text
 //! Program    := Stmt*
 //! Block      := "{" Stmt* "}"
-//! Stmt       := LetStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt | FnDef
+//! Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt
+//!             | WhileStmt | BreakStmt | ContinueStmt | FnDef
 //!             | ReturnStmt | Block | ImportStmt | ExprStmt
 //! LetStmt    := "let" Ident ("=" Expr)? ";"
+//! ConstStmt  := "const" Ident "=" Expr ";"
 //! AssignStmt := Target "=" Expr ";"
 //! Target     := Ident | Ident "[" Expr "]"
 //! EchoStmt   := "echo" Expr ";"
 //! IfStmt     := "if" Expr Block ("else" Block)?
 //! WhileStmt  := "while" Expr Block
+//! BreakStmt  := "break" ";"
+//! ContinueStmt := "continue" ";"
 //! FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
 //! ReturnStmt := "return" Expr? ";"
 //! ImportStmt := "import" String ";"
 //! ExprStmt   := Expr ";"
-//! Expr       := Equality
-//! Equality   := Comparison (("==" | "!=") Comparison)*
-//! Comparison := Addition (("<" | "<=" | ">" | ">=") Addition)*
+//! Expr       := Ternary
+//! Ternary    := NullCoalesce ("?" Ternary ":" Ternary)?
+//! NullCoalesce := Equality ("??" NullCoalesce)?
+//! Equality   := BitOr (("==" | "!=") BitOr)*
+//! BitOr      := BitXor (("|") BitXor)*
+//! BitXor     := BitAnd ("^" BitAnd)*
+//! BitAnd     := Comparison (("&") Comparison)*
+//! Comparison := Shift (("<" | "<=" | ">" | ">=") Shift)*
+//! Shift      := Addition (("<<" | ">>") Addition)*
 //! Addition   := Multiplication (("+" | "-") Multiplication)*
 //! Multiplication := Unary (("*" | "/" | "%") Unary)*
-//! Unary      := ("!" | "-") Unary | Postfix
+//! Unary      := ("!" | "-" | "~" | "+") Unary | Postfix
 //! Postfix    := Primary ("[" Expr "]")*
 //! Primary    := Int | Float | String | "true" | "false" | "null"
 //!             | Array | Map | Ident | Call | "(" Expr ")"
@@ -50,6 +60,13 @@ pub enum Stmt {
         name: String,
         init: Option<Expr>,
     },
+    /// `const NOME = expr;` — como `let`, mas imutavel (atribuicao posterior e erro de compilacao).
+    Const {
+        name: String,
+        init: Expr,
+    },
+    Break,
+    Continue,
     Assign {
         target: AssignTarget,
         expr: Expr,
@@ -106,6 +123,11 @@ pub enum Expr {
         op: UnaryOp,
         expr: Box<Expr>,
     },
+    Ternary {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
     Binary {
         op: BinOp,
         left: Box<Expr>,
@@ -131,6 +153,12 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    NullCoalesce,
 }
 
 /// Operador unario.
@@ -138,6 +166,7 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    BitNot,
 }
 
 /// Erro sintatico com posicao.
@@ -248,7 +277,13 @@ fn token_width(token: &Token) -> usize {
         TokenKind::StringLiteral(s) => s.len() + 2,
         TokenKind::IntLiteral(v) => v.to_string().len(),
         TokenKind::FloatLiteral(v) => v.to_string().len(),
-        TokenKind::EqEq | TokenKind::BangEq | TokenKind::LtEq | TokenKind::GtEq => 2,
+        TokenKind::EqEq
+        | TokenKind::BangEq
+        | TokenKind::LtEq
+        | TokenKind::GtEq
+        | TokenKind::Shl
+        | TokenKind::Shr
+        | TokenKind::QuestionQuestion => 2,
         _ => 1,
     }
 }
@@ -282,6 +317,17 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     match &tok.kind {
         TokenKind::Echo => parse_echo(cursor),
         TokenKind::Let => parse_let(cursor),
+        TokenKind::Const => parse_const(cursor),
+        TokenKind::Break => {
+            cursor.next();
+            expect_semicolon(cursor)?;
+            Ok(Stmt::Break)
+        }
+        TokenKind::Continue => {
+            cursor.next();
+            expect_semicolon(cursor)?;
+            Ok(Stmt::Continue)
+        }
         TokenKind::If => parse_if(cursor),
         TokenKind::While => parse_while(cursor),
         TokenKind::Fn => parse_fn_def(cursor),
@@ -297,6 +343,19 @@ fn parse_echo(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     let expr = parse_expr(cursor)?;
     expect_semicolon(cursor)?;
     Ok(Stmt::Echo { expr })
+}
+
+fn parse_const(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let name = expect_ident(cursor)?;
+    expect_token(
+        cursor,
+        &TokenKind::Assign,
+        "esperado `=` apos nome da constante",
+    )?;
+    let init = parse_expr(cursor)?;
+    expect_semicolon(cursor)?;
+    Ok(Stmt::Const { name, init })
 }
 
 fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -468,11 +527,45 @@ fn parse_block(cursor: &mut Cursor<'_>) -> Result<Vec<Stmt>, ParseError> {
 }
 
 fn parse_expr(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
-    cursor.nest("expressao", parse_equality)
+    cursor.nest("expressao", parse_ternary)
+}
+
+fn parse_ternary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let cond = parse_null_coalesce(cursor)?;
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Question)) {
+        cursor.next();
+        let then_branch = parse_ternary(cursor)?;
+        expect_token(cursor, &TokenKind::Colon, "esperado `:` no ternario")?;
+        let else_branch = parse_ternary(cursor)?;
+        return Ok(Expr::Ternary {
+            cond: Box::new(cond),
+            then_branch: Box::new(then_branch),
+            else_branch: Box::new(else_branch),
+        });
+    }
+    Ok(cond)
+}
+
+fn parse_null_coalesce(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let left = parse_equality(cursor)?;
+    if matches!(
+        cursor.peek().map(|t| &t.kind),
+        Some(TokenKind::QuestionQuestion)
+    ) {
+        cursor.next();
+        // Associativo a direita: `a ?? b ?? c` = `a ?? (b ?? c)`.
+        let right = parse_null_coalesce(cursor)?;
+        return Ok(Expr::Binary {
+            op: BinOp::NullCoalesce,
+            left: Box::new(left),
+            right: Box::new(right),
+        });
+    }
+    Ok(left)
 }
 
 fn parse_equality(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
-    let mut expr = parse_comparison(cursor)?;
+    let mut expr = parse_bitor(cursor)?;
     loop {
         let op = match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::EqEq) => BinOp::Eq,
@@ -480,7 +573,7 @@ fn parse_equality(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             _ => break,
         };
         cursor.next();
-        let right = parse_comparison(cursor)?;
+        let right = parse_bitor(cursor)?;
         expr = Expr::Binary {
             op,
             left: Box::new(expr),
@@ -490,14 +583,75 @@ fn parse_equality(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     Ok(expr)
 }
 
+fn parse_bitor(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let mut expr = parse_bitxor(cursor)?;
+    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::BitOr)) {
+        cursor.next();
+        let right = parse_bitxor(cursor)?;
+        expr = Expr::Binary {
+            op: BinOp::BitOr,
+            left: Box::new(expr),
+            right: Box::new(right),
+        };
+    }
+    Ok(expr)
+}
+
+fn parse_bitxor(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let mut expr = parse_bitand(cursor)?;
+    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::BitXor)) {
+        cursor.next();
+        let right = parse_bitand(cursor)?;
+        expr = Expr::Binary {
+            op: BinOp::BitXor,
+            left: Box::new(expr),
+            right: Box::new(right),
+        };
+    }
+    Ok(expr)
+}
+
+fn parse_bitand(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let mut expr = parse_comparison(cursor)?;
+    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::BitAnd)) {
+        cursor.next();
+        let right = parse_comparison(cursor)?;
+        expr = Expr::Binary {
+            op: BinOp::BitAnd,
+            left: Box::new(expr),
+            right: Box::new(right),
+        };
+    }
+    Ok(expr)
+}
+
 fn parse_comparison(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
-    let mut expr = parse_addition(cursor)?;
+    let mut expr = parse_shift(cursor)?;
     loop {
         let op = match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::Lt) => BinOp::Lt,
             Some(TokenKind::LtEq) => BinOp::Le,
             Some(TokenKind::Gt) => BinOp::Gt,
             Some(TokenKind::GtEq) => BinOp::Ge,
+            _ => break,
+        };
+        cursor.next();
+        let right = parse_shift(cursor)?;
+        expr = Expr::Binary {
+            op,
+            left: Box::new(expr),
+            right: Box::new(right),
+        };
+    }
+    Ok(expr)
+}
+
+fn parse_shift(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let mut expr = parse_addition(cursor)?;
+    loop {
+        let op = match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::Shl) => BinOp::Shl,
+            Some(TokenKind::Shr) => BinOp::Shr,
             _ => break,
         };
         cursor.next();
@@ -563,6 +717,13 @@ fn parse_unary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             cursor.next();
             Ok(Expr::Unary {
                 op: UnaryOp::Neg,
+                expr: Box::new(parse_unary(cursor)?),
+            })
+        }
+        Some(TokenKind::BitNot) => {
+            cursor.next();
+            Ok(Expr::Unary {
+                op: UnaryOp::BitNot,
                 expr: Box::new(parse_unary(cursor)?),
             })
         }
@@ -751,6 +912,9 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Else => "`else`".to_string(),
         TokenKind::While => "`while`".to_string(),
         TokenKind::Fn => "`fn`".to_string(),
+        TokenKind::Const => "`const`".to_string(),
+        TokenKind::Break => "`break`".to_string(),
+        TokenKind::Continue => "`continue`".to_string(),
         TokenKind::Return => "`return`".to_string(),
         TokenKind::Import => "`import`".to_string(),
         TokenKind::True | TokenKind::False => "booleano".to_string(),
@@ -771,6 +935,14 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Minus => "`-`".to_string(),
         TokenKind::Star => "`*`".to_string(),
         TokenKind::Slash => "`/`".to_string(),
+        TokenKind::BitAnd => "`&`".to_string(),
+        TokenKind::BitOr => "`|`".to_string(),
+        TokenKind::BitXor => "`^`".to_string(),
+        TokenKind::BitNot => "`~`".to_string(),
+        TokenKind::Shl => "`<<`".to_string(),
+        TokenKind::Shr => "`>>`".to_string(),
+        TokenKind::Question => "`?`".to_string(),
+        TokenKind::QuestionQuestion => "`??`".to_string(),
         TokenKind::Percent => "`%`".to_string(),
         TokenKind::Bang => "`!`".to_string(),
         TokenKind::Assign => "`=`".to_string(),
@@ -981,6 +1153,58 @@ mod tests {
     fn parses_unary_plus_as_identity() {
         let program = lex_and_parse("echo +5;").expect("parse deve passar");
         assert_eq!(program.statements, vec![Stmt::Echo { expr: Expr::Int(5) }]);
+    }
+
+    #[test]
+    fn parses_bitwise_with_precedence() {
+        // `1 | 2 & 3` => BitOr(1, BitAnd(2, 3)); `1 + 2 << 3` => Shl(Add(1,2),3)
+        let program = lex_and_parse("echo 1 | 2 & 3;").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::Binary {
+                    op: BinOp::BitOr,
+                    ..
+                }
+            }
+        ));
+        let program = lex_and_parse("echo 1 + 2 << 3;").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::Binary { op: BinOp::Shl, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_ternary_and_null_coalescing() {
+        let program = lex_and_parse("echo true ? 1 : 2;").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::Ternary { .. }
+            }
+        ));
+        let program = lex_and_parse("echo a ?? b;").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::Binary {
+                    op: BinOp::NullCoalesce,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_break_continue_and_const() {
+        let program = lex_and_parse("while true { break; } while true { continue; } const N = 10;")
+            .expect("parse deve passar");
+        assert_eq!(program.statements.len(), 3);
+        assert!(matches!(program.statements[0], Stmt::While { .. }));
+        assert!(matches!(program.statements[2], Stmt::Const { .. }));
     }
 
     #[test]

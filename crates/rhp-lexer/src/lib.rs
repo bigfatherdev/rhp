@@ -14,9 +14,12 @@ pub enum TokenKind {
     // Palavras-chave.
     Echo,
     Let,
+    Const,
     If,
     Else,
     While,
+    Break,
+    Continue,
     Fn,
     Return,
     Import,
@@ -35,6 +38,14 @@ pub enum TokenKind {
     Slash,
     Percent,
     Bang,
+    BitNot,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Question,
+    QuestionQuestion,
     Assign,
     EqEq,
     BangEq,
@@ -200,6 +211,38 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 chars.next();
                 col += 1;
             }
+            '&' => {
+                tokens.push(Token::new(TokenKind::BitAnd, line, col));
+                chars.next();
+                col += 1;
+            }
+            '|' => {
+                tokens.push(Token::new(TokenKind::BitOr, line, col));
+                chars.next();
+                col += 1;
+            }
+            '^' => {
+                tokens.push(Token::new(TokenKind::BitXor, line, col));
+                chars.next();
+                col += 1;
+            }
+            '~' => {
+                tokens.push(Token::new(TokenKind::BitNot, line, col));
+                chars.next();
+                col += 1;
+            }
+            '?' => {
+                let start_col = col;
+                chars.next();
+                col += 1;
+                if chars.peek().copied().is_some_and(|(_, c)| c == '?') {
+                    chars.next();
+                    col += 1;
+                    tokens.push(Token::new(TokenKind::QuestionQuestion, line, start_col));
+                } else {
+                    tokens.push(Token::new(TokenKind::Question, line, start_col));
+                }
+            }
             '=' => {
                 let start_col = col;
                 chars.next();
@@ -228,24 +271,36 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 let start_col = col;
                 chars.next();
                 col += 1;
-                if chars.peek().copied().is_some_and(|(_, c)| c == '=') {
-                    chars.next();
-                    col += 1;
-                    tokens.push(Token::new(TokenKind::LtEq, line, start_col));
-                } else {
-                    tokens.push(Token::new(TokenKind::Lt, line, start_col));
+                match chars.peek().copied() {
+                    Some((_, '=')) => {
+                        chars.next();
+                        col += 1;
+                        tokens.push(Token::new(TokenKind::LtEq, line, start_col));
+                    }
+                    Some((_, '<')) => {
+                        chars.next();
+                        col += 1;
+                        tokens.push(Token::new(TokenKind::Shl, line, start_col));
+                    }
+                    _ => tokens.push(Token::new(TokenKind::Lt, line, start_col)),
                 }
             }
             '>' => {
                 let start_col = col;
                 chars.next();
                 col += 1;
-                if chars.peek().copied().is_some_and(|(_, c)| c == '=') {
-                    chars.next();
-                    col += 1;
-                    tokens.push(Token::new(TokenKind::GtEq, line, start_col));
-                } else {
-                    tokens.push(Token::new(TokenKind::Gt, line, start_col));
+                match chars.peek().copied() {
+                    Some((_, '=')) => {
+                        chars.next();
+                        col += 1;
+                        tokens.push(Token::new(TokenKind::GtEq, line, start_col));
+                    }
+                    Some((_, '>')) => {
+                        chars.next();
+                        col += 1;
+                        tokens.push(Token::new(TokenKind::Shr, line, start_col));
+                    }
+                    _ => tokens.push(Token::new(TokenKind::Gt, line, start_col)),
                 }
             }
             '"' => {
@@ -495,6 +550,9 @@ fn lex_ident_or_keyword(
     let kind = match ident.as_str() {
         "echo" => TokenKind::Echo,
         "let" => TokenKind::Let,
+        "const" => TokenKind::Const,
+        "break" => TokenKind::Break,
+        "continue" => TokenKind::Continue,
         "if" => TokenKind::If,
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
@@ -672,6 +730,27 @@ mod tests {
                 TokenKind::LBracket,
                 TokenKind::RBracket,
             ]
+        );
+    }
+
+    #[test]
+    fn lexes_bitwise_and_ternary_operators() {
+        assert_eq!(
+            kinds("& | ^ ~ << >> ? ??"),
+            vec![
+                TokenKind::BitAnd,
+                TokenKind::BitOr,
+                TokenKind::BitXor,
+                TokenKind::BitNot,
+                TokenKind::Shl,
+                TokenKind::Shr,
+                TokenKind::Question,
+                TokenKind::QuestionQuestion,
+            ]
+        );
+        assert_eq!(
+            kinds("break continue const"),
+            vec![TokenKind::Break, TokenKind::Continue, TokenKind::Const]
         );
     }
 

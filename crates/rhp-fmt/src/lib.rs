@@ -54,6 +54,18 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
                 }
             }
         }
+        Stmt::Const { name, init } => {
+            indent(level, out);
+            let _ = writeln!(out, "const {name} = {};", fmt_expr(init, 0));
+        }
+        Stmt::Break => {
+            indent(level, out);
+            out.push_str("break;\n");
+        }
+        Stmt::Continue => {
+            indent(level, out);
+            out.push_str("continue;\n");
+        }
         Stmt::Assign { target, expr } => {
             indent(level, out);
             match target {
@@ -137,16 +149,23 @@ fn fmt_block(stmts: &[Stmt], level: usize, out: &mut String) {
 }
 
 /// Precedencia para parenteses minimos (maior = liga mais forte).
+/// Espelha a gramatica do parser (ternario < `??` < igualdade < bits).
 fn prec_of(expr: &Expr) -> u8 {
     match expr {
+        Expr::Ternary { .. } => 0,
         Expr::Binary { op, .. } => match op {
-            BinOp::Eq | BinOp::Ne => 1,
-            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 2,
-            BinOp::Add | BinOp::Sub => 3,
-            BinOp::Mul | BinOp::Div | BinOp::Mod => 4,
+            BinOp::NullCoalesce => 1,
+            BinOp::Eq | BinOp::Ne => 2,
+            BinOp::BitOr => 3,
+            BinOp::BitXor => 4,
+            BinOp::BitAnd => 5,
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 6,
+            BinOp::Shl | BinOp::Shr => 7,
+            BinOp::Add | BinOp::Sub => 8,
+            BinOp::Mul | BinOp::Div | BinOp::Mod => 9,
         },
-        Expr::Unary { .. } => 5,
-        _ => 6,
+        Expr::Unary { .. } => 10,
+        _ => 11,
     }
 }
 
@@ -185,10 +204,28 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             let symbol = match op {
                 UnaryOp::Neg => "-",
                 UnaryOp::Not => "!",
+                UnaryOp::BitNot => "~",
             };
             // O proprio filho binario adiciona parenteses quando
-            // `prec < 5`; aqui basta concatenar.
-            format!("{symbol}{}", fmt_expr(expr, 5))
+            // `prec < 10`; aqui basta concatenar.
+            format!("{symbol}{}", fmt_expr(expr, 10))
+        }
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let inner = format!(
+                "{} ? {} : {}",
+                fmt_expr(cond, 1),
+                fmt_expr(then_branch, 1),
+                fmt_expr(else_branch, 0)
+            );
+            if 0 < parent_prec {
+                format!("({inner})")
+            } else {
+                inner
+            }
         }
         Expr::Binary { op, left, right } => {
             let symbol = match op {
@@ -203,12 +240,22 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
                 BinOp::Le => "<=",
                 BinOp::Gt => ">",
                 BinOp::Ge => ">=",
+                BinOp::BitAnd => "&",
+                BinOp::BitOr => "|",
+                BinOp::BitXor => "^",
+                BinOp::Shl => "<<",
+                BinOp::Shr => ">>",
+                BinOp::NullCoalesce => "??",
             };
             let my_prec = prec_of(expr);
             let left_text = fmt_expr(left, my_prec);
-            // Associatividade a esquerda: o lado direito com mesma
+            // Associatividade a esquerda (padrao): o lado direito com mesma
             // precedencia precisa de parenteses (`a - (b - c)`).
-            let right_text = fmt_expr(right, my_prec + 1);
+            // Excecao: `??` e associativo a direita (`a ?? b ?? c`).
+            let right_text = match op {
+                BinOp::NullCoalesce => fmt_expr(right, my_prec),
+                _ => fmt_expr(right, my_prec + 1),
+            };
             let inner = format!("{left_text} {symbol} {right_text}");
             if my_prec < parent_prec {
                 format!("({inner})")
@@ -297,6 +344,23 @@ mod tests {
         let expected = "fn f(a, b) {\n  if a {\n    echo 1;\n  } else {\n    echo 2;\n  }\n  while a {\n    a = a - 1;\n  }\n  return a;\n}\n";
         assert_eq!(fmt(src), expected);
         check_idempotent(src);
+    }
+
+    #[test]
+    fn formats_bitwise_ternary_and_control() {
+        assert_eq!(fmt("echo 1 + 2 << 3;"), "echo 1 + 2 << 3;\n");
+        assert_eq!(fmt("echo a & b | c;"), "echo a & b | c;\n");
+        assert_eq!(fmt("echo ~x;"), "echo ~x;\n");
+        assert_eq!(fmt("echo a ? b : c;"), "echo a ? b : c;\n");
+        assert_eq!(fmt("echo a ?? b;"), "echo a ?? b;\n");
+        // `??` e associativo a direita: formata sem parenteses redundantes.
+        assert_eq!(fmt("echo a ?? b ?? c;"), "echo a ?? b ?? c;\n");
+        // Ternario aninhado a esquerda precisa de parenteses.
+        assert_eq!(
+            fmt("echo (a ? b : c) ? d : e;"),
+            "echo (a ? b : c) ? d : e;\n"
+        );
+        check_idempotent("const N = 10;\nwhile true {\n  if N > 1 {\n    break;\n  } else {\n    continue;\n  }\n}\n");
     }
 
     #[test]

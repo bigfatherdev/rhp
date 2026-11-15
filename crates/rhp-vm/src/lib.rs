@@ -195,6 +195,20 @@ impl Vm {
             Op::Mul => self.binary(idx, "multiplicacao", mul_values)?,
             Op::Div => self.binary(idx, "divisao", div_values)?,
             Op::Mod => self.binary(idx, "resto", mod_values)?,
+            Op::BitAnd => self.binary(idx, "`&`", bitand_values)?,
+            Op::BitOr => self.binary(idx, "`|`", bitor_values)?,
+            Op::BitXor => self.binary(idx, "`^`", bitxor_values)?,
+            Op::Shl => self.binary(idx, "`<<`", shl_values)?,
+            Op::Shr => self.binary(idx, "`>>`", shr_values)?,
+            Op::Dup => {
+                let value = self.frames[idx]
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| VmError::new("pilha vazia em duplicacao".to_string()))?;
+                self.push_checked(idx, value)?;
+                self.frames[idx].ip += 1;
+            }
             Op::Neg => {
                 let value = self.pop(idx, "operador `-`")?;
                 let result = neg_value(&value)?;
@@ -204,6 +218,12 @@ impl Vm {
             Op::Not => {
                 let value = self.pop(idx, "operador `!`")?;
                 let result = not_value(&value)?;
+                self.push_checked(idx, result)?;
+                self.frames[idx].ip += 1;
+            }
+            Op::BitNot => {
+                let value = self.pop(idx, "operador `~`")?;
+                let result = bitnot_value(&value)?;
                 self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
@@ -253,6 +273,14 @@ impl Vm {
             }
             Op::Jump(target) => {
                 self.frames[idx].ip = target as usize;
+            }
+            Op::JumpIfNotNull(target) => {
+                let value = self.pop(idx, "condicao nula")?;
+                if matches!(value, Value::Null) {
+                    self.frames[idx].ip += 1;
+                } else {
+                    self.frames[idx].ip = target as usize;
+                }
             }
             Op::LoadName(name_idx) => {
                 let name = self.name_of(idx, name_idx)?;
@@ -746,6 +774,77 @@ fn compare_values(left: &Value, right: &Value, op: Ordering) -> Result<Value, Vm
         Ordering::GreaterOrEqual => order != std::cmp::Ordering::Less,
     };
     Ok(Value::Bool(result))
+}
+
+fn bitand_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a & b)),
+        _ => Err(VmError::new(format!(
+            "operador `&` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn bitor_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a | b)),
+        _ => Err(VmError::new(format!(
+            "operador `|` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn bitxor_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
+        _ => Err(VmError::new(format!(
+            "operador `^` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn shl_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => a
+            .checked_shl(*b as u32)
+            .map(Value::Int)
+            .ok_or_else(|| VmError::new(format!("deslocamento invalido em `<<`: {b}"))),
+        _ => Err(VmError::new(format!(
+            "operador `<<` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn shr_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => a
+            .checked_shr(*b as u32)
+            .map(Value::Int)
+            .ok_or_else(|| VmError::new(format!("deslocamento invalido em `>>`: {b}"))),
+        _ => Err(VmError::new(format!(
+            "operador `>>` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn bitnot_value(value: &Value) -> Result<Value, VmError> {
+    match value {
+        Value::Int(v) => Ok(Value::Int(!v)),
+        other => Err(VmError::new(format!(
+            "operador `~` exige int, encontrado {}",
+            type_name(other)
+        ))),
+    }
 }
 
 fn index_value(base: &Value, index: &Value) -> Result<Value, VmError> {
@@ -1244,6 +1343,58 @@ mod tests {
         );
         assert_eq!(run_src("echo has({a: 1}, \"a\");").expect("ok"), "true\n");
         assert_eq!(run_src("echo has({a: 1}, \"z\");").expect("ok"), "false\n");
+    }
+
+    #[test]
+    fn runs_bitwise_ops() {
+        assert_eq!(run_src("echo 6 & 3;").expect("ok"), "2\n");
+        assert_eq!(run_src("echo 6 | 3;").expect("ok"), "7\n");
+        assert_eq!(run_src("echo 6 ^ 3;").expect("ok"), "5\n");
+        assert_eq!(run_src("echo ~5;").expect("ok"), "-6\n");
+        assert_eq!(run_src("echo 1 << 4;").expect("ok"), "16\n");
+        assert_eq!(run_src("echo 256 >> 4;").expect("ok"), "16\n");
+        assert!(run_err("echo 1 & true;").contains("exige int"));
+        assert!(run_err("echo 1 << -1;").contains("deslocamento"));
+        assert!(run_err("echo 1 << 64;").contains("deslocamento"));
+        assert!(run_err("echo ~1.5;").contains("exige int"));
+    }
+
+    #[test]
+    fn runs_ternary_and_null_coalescing() {
+        assert_eq!(run_src("echo true ? 1 : 2;").expect("ok"), "1\n");
+        assert_eq!(run_src("echo false ? 1 : 2;").expect("ok"), "2\n");
+        assert_eq!(run_src("echo null ?? \"x\";").expect("ok"), "x\n");
+        assert_eq!(run_src("echo 0 ?? \"x\";").expect("ok"), "0\n");
+        assert_eq!(run_src("echo false ?? \"x\";").expect("ok"), "false\n");
+        // `??` avalia o lado esquerdo uma unica vez.
+        assert_eq!(
+            run_src("let i = 0; fn inc() { i = i + 1; return i; } echo inc() ?? 99; echo i;")
+                .expect("ok"),
+            "1\n1\n"
+        );
+    }
+
+    #[test]
+    fn runs_break_continue_and_const() {
+        // Pares sao pulados pelo `continue` (inclusive o 6); o `break`
+        // acontece no 7.
+        assert_eq!(
+            run_src("let i = 0; while i < 10 { i = i + 1; if i % 2 == 0 { continue; } if i > 5 { break; } } echo i;").expect("ok"),
+            "7\n"
+        );
+        assert_eq!(run_src("const N = 40 + 2; echo N;").expect("ok"), "42\n");
+        // Erro de compilacao: usa compile() direto (run_src so transporta erros de runtime).
+        let program = rhp_parser::parse_source("const N = 1; N = 2;").expect("parse deve passar");
+        assert!(rhp_bytecode::compile(&program)
+            .expect_err("deve falhar")
+            .message
+            .contains("constante"));
+        // `break`/`continue` fora de laco e erro de compilacao.
+        let program = rhp_parser::parse_source("break;").expect("parse deve passar");
+        assert!(rhp_bytecode::compile(&program)
+            .expect_err("deve falhar")
+            .message
+            .contains("fora de laco"));
     }
 
     #[test]
