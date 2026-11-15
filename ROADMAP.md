@@ -72,8 +72,9 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 - [x] A4: datas/horas std-only (`now`, `sleep`, `date_str`).
 - [x] A5: rede v2 (`http_fetch`: redirects, headers, timeout).
   **Fase A concluída** (fundação do runtime de sistemas).
-- [ ] Fase B: persistência (ADR SQLite, driver, PostgreSQL com servidor
-  real).
+- [x] B1: ADR 0011 — persistência (SQLite FFI, PG protocolo).
+- [x] B2: SQLite (`db_open/exec/query/close` via `libsqlite3`).
+- [ ] B3: PostgreSQL com servidor real.
 - [ ] Fase C: servidor HTTP (RFC concorrência, router, middleware,
   sessões).
 - [ ] Fase D: produção (TLS via ADR, pacotes v0, `rhp build`, auth,

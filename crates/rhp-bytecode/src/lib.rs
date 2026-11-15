@@ -125,6 +125,14 @@ pub enum Builtin {
     DateStr,
     /// `http_fetch(url, opts)` — GET com redirects/headers/timeout (Fase A5).
     HttpFetch,
+    /// `db_open(caminho)` — abre/cria SQLite (`Int` = handle).
+    DbOpen,
+    /// `db_exec(h, sql, params)` — executa; devolve linhas afetadas.
+    DbExec,
+    /// `db_query(h, sql, params)` — consulta; devolve array de mapas.
+    DbQuery,
+    /// `db_close(h)` — fecha handle (invalida para reuso).
+    DbClose,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -175,6 +183,10 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "sleep" => Some(Builtin::Sleep),
         "date_str" => Some(Builtin::DateStr),
         "http_fetch" => Some(Builtin::HttpFetch),
+        "db_open" => Some(Builtin::DbOpen),
+        "db_exec" => Some(Builtin::DbExec),
+        "db_query" => Some(Builtin::DbQuery),
+        "db_close" => Some(Builtin::DbClose),
         _ => None,
     }
 }
@@ -209,7 +221,9 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::JsonParse
         | Builtin::JsonStringify
         | Builtin::Sleep
-        | Builtin::DateStr => 1,
+        | Builtin::DateStr
+        | Builtin::DbOpen
+        | Builtin::DbClose => 1,
         Builtin::Push
         | Builtin::Contains
         | Builtin::StartsWith
@@ -224,6 +238,7 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::FsWrite
         | Builtin::FsAppend
         | Builtin::HttpFetch => 2,
+        Builtin::DbExec | Builtin::DbQuery => 3,
         Builtin::Replace => 3,
     }
 }
@@ -361,6 +376,10 @@ impl BuiltinId {
             41 => Ok(Builtin::Sleep),
             42 => Ok(Builtin::DateStr),
             43 => Ok(Builtin::HttpFetch),
+            44 => Ok(Builtin::DbOpen),
+            45 => Ok(Builtin::DbExec),
+            46 => Ok(Builtin::DbQuery),
+            47 => Ok(Builtin::DbClose),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -413,6 +432,10 @@ impl From<Builtin> for BuiltinId {
             Builtin::Sleep => 41,
             Builtin::DateStr => 42,
             Builtin::HttpFetch => 43,
+            Builtin::DbOpen => 44,
+            Builtin::DbExec => 45,
+            Builtin::DbQuery => 46,
+            Builtin::DbClose => 47,
         };
         Self(id)
     }
@@ -1871,6 +1894,10 @@ mod tests {
             Builtin::Sleep,
             Builtin::DateStr,
             Builtin::HttpFetch,
+            Builtin::DbOpen,
+            Builtin::DbExec,
+            Builtin::DbQuery,
+            Builtin::DbClose,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

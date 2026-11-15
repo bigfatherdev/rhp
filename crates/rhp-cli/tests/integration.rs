@@ -171,6 +171,27 @@ fn rhp_run_try_catch_finally() {
 }
 
 #[test]
+fn rhp_run_sqlite_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("rhp-cli-db-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir temporario");
+    let path = dir.join("app.db");
+    let output = run_temp_source(
+        "banco.rhp",
+        &format!(
+            "let h = db_open(\"{}\");\necho db_exec(h, \"CREATE TABLE u (id, nome)\", []);\necho db_exec(h, \"INSERT INTO u VALUES (?, ?)\", [7, \"ana\"]);\necho db_query(h, \"SELECT id, nome FROM u\", []);\necho db_close(h);\n",
+            path.display()
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "sqlite falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"0\n1\n[{id: 7, nome: ana}]\nnull\n");
+    assert!(path.is_file(), "arquivo do banco nao foi criado");
+}
+
+#[test]
 fn rhp_run_time_builtins() {
     let output = run_temp_source(
         "hora.rhp",
@@ -659,6 +680,10 @@ fn vscode_grammar_covers_language() {
         "now",
         "sleep",
         "date_str",
+        "db_open",
+        "db_exec",
+        "db_query",
+        "db_close",
     ] {
         assert!(
             text.contains(builtin),
