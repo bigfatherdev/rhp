@@ -177,6 +177,31 @@ fn rhp_run_max_steps_stops_infinite_loop() {
 }
 
 #[test]
+fn rhp_run_reports_structured_diagnostics() {
+    // Erro lexico: codigo E0001 + trecho com caret.
+    let lex = run_temp_source("lexerr.rhp", "echo @;\n");
+    assert!(!lex.status.success());
+    let lex_err = String::from_utf8_lossy(&lex.stderr);
+    assert!(lex_err.contains("Error[E0001]"), "obteve: {lex_err}");
+    assert!(lex_err.contains('^'), "obteve: {lex_err}");
+
+    // Erro sintatico: codigo E1004 + snippet da fonte.
+    let syn = run_temp_source("synerr.rhp", "echo \"x\"\n");
+    assert!(!syn.status.success());
+    let syn_err = String::from_utf8_lossy(&syn.stderr);
+    assert!(syn_err.contains("Error[E1004]"), "obteve: {syn_err}");
+    assert!(syn_err.contains("echo \"x\""), "obteve: {syn_err}");
+    assert!(syn_err.contains("help:"), "obteve: {syn_err}");
+
+    // Erro de runtime: codigo E3001 + ajuda.
+    let run = run_temp_source("runerr.rhp", "echo 1 + true;\n");
+    assert!(!run.status.success());
+    let run_err = String::from_utf8_lossy(&run.stderr);
+    assert!(run_err.contains("Error[E3001]"), "obteve: {run_err}");
+    assert!(run_err.contains("help:"), "obteve: {run_err}");
+}
+
+#[test]
 fn rhp_run_http_get_against_local_server() {
     use std::io::{Read, Write};
     use std::net::TcpListener;

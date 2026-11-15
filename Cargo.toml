@@ -5,6 +5,7 @@ members = [
     "crates/rhp-bytecode",
     "crates/rhp-vm",
     "crates/rhp-fmt",
+    "crates/rhp-diagnostic",
     "crates/rhp-cli",
 ]
 resolver = "2"

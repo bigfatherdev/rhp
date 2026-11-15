@@ -15,3 +15,4 @@ rhp-parser = { path = "../rhp-parser" }
 rhp-bytecode = { path = "../rhp-bytecode" }
 rhp-vm = { path = "../rhp-vm" }
 rhp-fmt = { path = "../rhp-fmt" }
+rhp-diagnostic = { path = "../rhp-diagnostic" }

@@ -74,7 +74,15 @@ fn main() -> ExitCode {
 fn fmt_file(path: &str, check: bool) -> Result<(), String> {
     let source =
         std::fs::read_to_string(path).map_err(|e| format!("nao foi possivel ler `{path}`: {e}"))?;
-    let formatted = rhp_fmt::format_source(&source).map_err(|e| format!("{path}:{e}"))?;
+    let tokens = rhp_lexer::lex(&source).map_err(|e| {
+        let diag = rhp_diagnostic::lex_diagnostic(path, &e);
+        rhp_diagnostic::render(&diag, Some(&source))
+    })?;
+    let program = rhp_parser::parse(&tokens).map_err(|e| {
+        let diag = rhp_diagnostic::parse_diagnostic(path, &e);
+        rhp_diagnostic::render(&diag, Some(&source))
+    })?;
+    let formatted = rhp_fmt::format(&program);
     if check {
         if formatted == source {
             Ok(())
@@ -105,19 +113,41 @@ fn run_file_limited(
     run_program(&program, path, output, rhp_vm::VmLimits { max_steps })
 }
 
-/// Pipeline programa -> bytecode -> VM.
+/// Pipeline programa -> bytecode -> VM (erros com codigo estavel).
 fn run_program(
     program: &Program,
     origin: &str,
     output: &mut dyn Write,
     limits: rhp_vm::VmLimits,
 ) -> Result<(), String> {
-    let chunk =
-        rhp_bytecode::compile(program).map_err(|e| format!("{origin}: erro de compilacao: {e}"))?;
+    let chunk = rhp_bytecode::compile(program).map_err(|e| {
+        let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
+        with_code(code, help, &format!("{origin}: erro de compilacao: {e}"))
+    })?;
     let mut vm = rhp_vm::Vm::new();
     vm.set_limits(limits);
-    vm.run(&chunk, output)
-        .map_err(|e| format!("{origin}: erro de execucao: {e}"))
+    vm.run(&chunk, output).map_err(|e| {
+        let (code, help) = rhp_diagnostic::runtime_code(&e.to_string());
+        with_code(code, help, &format!("{origin}: erro de execucao: {e}"))
+    })
+}
+
+/// Prefixa `Error[CODIGO]` + ajuda a uma mensagem de erro.
+fn with_code(code: &str, help: Option<&str>, message: &str) -> String {
+    match help {
+        Some(help) => format!("Error[{code}]: {message}\nhelp: {help}"),
+        None => format!("Error[{code}]: {message}"),
+    }
+}
+
+/// Lex + parse com diagnosticos estruturados (snippet da fonte).
+fn parse_with_diagnostics(origin: &str, source: &str) -> Result<Program, String> {
+    let tokens = rhp_lexer::lex(source).map_err(|e| {
+        rhp_diagnostic::render(&rhp_diagnostic::lex_diagnostic(origin, &e), Some(source))
+    })?;
+    rhp_parser::parse(&tokens).map_err(|e| {
+        rhp_diagnostic::render(&rhp_diagnostic::parse_diagnostic(origin, &e), Some(source))
+    })
 }
 
 /// Pipeline fonte (sem arquivos) -> tokens -> parser -> bytecode -> VM.
@@ -196,7 +226,7 @@ fn load_file(
     let source = std::fs::read_to_string(&canonical)
         .map_err(|e| format!("nao foi possivel ler `{shown}`: {e}"))?;
     let origin = canonical.display().to_string();
-    let program = rhp_parser::parse_source(&source).map_err(|e| format!("{origin}:{e}"))?;
+    let program = parse_with_diagnostics(&origin, &source)?;
     let base_dir: PathBuf = canonical
         .parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);

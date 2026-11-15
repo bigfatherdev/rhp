@@ -1,49 +1,62 @@
-# Diagnostics — catalogo de erros do RHP
+# Diagnostics — catálogo de erros do RHP
 
-Formato geral: `origem:linha:coluna: mensagem` no stderr. O normativo e
-`LANGUAGE_SPEC.md` (§ de erros); aqui vao os casos reais com exemplo.
+Erros seguem o formato de referência (implementado por `rhp-diagnostic`,
+independente de apresentação para futuro LSP):
 
-## Lexicos (`erro lexico em`)
+```text
+Error[E1004]: 1:13: esperado `;`, encontrado fim de arquivo
+  --> app.rhp:1:13
+1 | echo "x"
+  |             ^
+help: toda instrucao termina com `;`
+```
 
-| Entrada | Mensagem |
-|---|---|
-| `echo @;` | `1:6: caractere inesperado: @` |
-| `echo "abc` | `1:6: string nao terminada` |
-| `echo "a\qb";` | `escape invalido: \q` |
-| `echo "a\uz";` | `escape invalido: \u (use \u{HEX})` |
-| `echo "a\u{110000}";` | ponto fora do intervalo / formato invalido |
-| `99999…9` (> i64) | `literal inteiro fora do intervalo: …` |
+- `E0xxx`: léxicos · `E1xxx`: sintáticos · `E2xxx`: compilação ·
+  `E3xxx`: execução · `E4xxx`: carregador/módulos.
+- Léxico/sintaxe incluem trecho da fonte com `^` (`len 0` = até o fim da
+  linha). Compilação/execução não têm posição de fonte (bytecode) e saem
+  como `Error[CODIGO]: mensagem` + `help:` quando aplicável.
 
-## Sintaticos (`erro sintatico em`)
+## Léxicos (`erro lexico em`)
 
-| Entrada | Mensagem |
-|---|---|
-| `echo "x"` | `esperado ';'` |
-| `echo ;` | `esperado expressao, encontrado ';'` |
-| `let echo = 1;` | `esperado identificador, encontrado 'echo'` |
-| `f() = 1;` | `alvo de atribuicao invalido (use 'nome' ou 'nome[indice]')` |
-| `if true { echo 1;` | `esperado '}', encontrado fim de arquivo` |
-| `import 42;` | `esperado caminho de modulo (string)…` |
-| aninhamento > 128 niveis | `profundidade maxima excedida em expressao (limite 128)` |
-| `fn f(a, a)` | `parametro duplicado: a` |
+| Entrada | Código | Mensagem |
+|---|---|---|
+| `echo @;` | E0001 | `caractere inesperado: @` |
+| `echo "abc` | E0002 | `string nao terminada` |
+| `echo "a\qb";` | E0003 | `escape invalido: \q` (+ `\u` malformado) |
+| `echo "a` + quebra | E0002 | `quebra de linha sem escape dentro de string` |
+| `999…9` (> i64) | E0004 | `literal inteiro fora do intervalo` |
 
-## Compilacao (`erro de compilacao`)
+## Sintáticos (`erro sintatico em`)
 
-`return` fora de funcao; aridade de builtin (`len` espera 1…);
-chunk invalido (constante/nome/funcao fora do pool, salto fora do codigo,
-builtin desconhecido, sem `Halt`, constante profunda demais).
+| Entrada | Código | Mensagem |
+|---|---|---|
+| `echo "x"` | E1004 | `esperado ';'` (+ ajuda) |
+| `echo ;` | E1001 | `esperado expressao…` |
+| `if true { echo 1;` | E1002 | `esperado '}', encontrado fim de arquivo` |
+| `f() = 1;` | E1003 | `alvo de atribuicao invalido…` |
+| `let echo = 1;` | E1005 | `esperado identificador…` |
+| `import 42;` / import aninhado | E1007 | caminho de módulo / nível superior |
+| demais `esperado …` | E1006 | (genérico de sintaxe) |
 
-## Execucao (`erro de execucao`)
+## Compilação (`Error[E2xxx]`)
 
-Tipos incompativeis (`1 + true`), `divisao por zero`, `estouro de inteiro`,
-`variavel nao definida: x` / `ja declarada: x`, `condicao deve ser bool`,
-chamada de nao-funcao, aridade (`espera 1 argumentos, recebeu 2`),
-`` `return` fora de funcao ``, `limite de chamadas excedido`,
-`indice 5 fora do intervalo (tamanho 2)`, `chave inexistente no mapa: k`,
-falhas de `assert`/`int`/`float`/`pop`, `http_get` (esquema, DNS, conexao,
-status nao-2xx, corpo nao UTF-8, `excedeu o limite de corpo`),
-`limite de instrucoes excedido`, `importacao circular`, import fora da
-arvore, arquivo muito grande, `import` fora do nivel superior.
+E2001 `return` fora de função · E2002 aridade de builtin · E2003 limites
+(constantes/nomes/funções, profundidade) · E2004 chunk inválido · E2000
+genérico.
 
-Dica: condicoes de `if`/`while` exigem `Bool` (sem truthiness); `+` com
-tipos mistos (fora `Str+Str` e numero+numero) e sempre erro.
+## Execução (`Error[E3xxx]`)
+
+E3001 tipos (`incompativeis`, `exige`, `nao converte`) · E3002
+`nao definida`/`ja declarada` · E3003 condição não-bool · E3004 chamada
+(`como funcao`, aridade) · E3005 `return` fora de função (interno) · E3006
+limite de chamadas · E3007 índice/chave · E3008 I/O · E3009
+modulos (`modulo`, `circular`, `fora da arvore`, `muito grande`, nível
+superior) · E3010 limites (`instrucoes`, corpo HTTP) · E3011 `http_get` ·
+E3000 genérico.
+
+## Dicas recorrentes
+
+Condicoes de `if`/`while` exigem `Bool` (E3003: use comparação explícita).
+Tipos mistos (fora `Str+Str` e número+número) são erro E3001: converta com
+`int()`/`float()`/`str()`. `a[i]`: confira com `len()`/`keys()` (E3007).
