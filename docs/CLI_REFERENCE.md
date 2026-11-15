@@ -27,6 +27,19 @@ rhp run --max-steps 1000 loop.rhp
 Reescreve no formato canonico (2 espacos, `;` sempre, parenteses minimos,
 `\n` final unico; idempotente). `--check` so verifica (exit 1 se divergir).
 
+## `rhp test [dir|arquivo.rhp]`
+
+Executa arquivos de teste (`*_test.rhp`, que usam `assert`): um por um,
+com relatorio `ok <arquivo>` / `FALHOU <arquivo>: <motivo>` e resumo final
+(`N teste(s), M falha(s)`). Exit 0 se todos passam, 1 caso contrario.
+Sem argumento, usa o diretorio atual.
+
+## `rhp doctor`
+
+Diagnostico do ambiente: versao do `rhp`, versoes de `rustc`/`cargo` (ou
+"nao encontrado no PATH") e autoteste em memoria (`6 * 7 == 42`). Exit 0
+se o autoteste passa.
+
 ## `rhp check [--json] <arquivo.rhp>`
 
 Lex + imports + compilacao, sem executar. Exit 0 e `<arquivo>: ok` se

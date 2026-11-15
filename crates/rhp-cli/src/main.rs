@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use rhp_parser::{Program, Stmt};
 
-const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> | rhp fmt [--check] <arquivo.rhp> | rhp check [--json] <arquivo.rhp>";
+const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> [args] | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -79,6 +79,30 @@ fn main() -> ExitCode {
             println!("RHP (linguagem experimental)\n\n{USAGE}");
             ExitCode::SUCCESS
         }
+        [_, cmd] if cmd == "test" => match run_tests(Path::new(".")) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "{message}");
+                ExitCode::from(1)
+            }
+        },
+        [_, cmd, path] if cmd == "test" => match run_tests(Path::new(path)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "{message}");
+                ExitCode::from(1)
+            }
+        },
+        [_, cmd] if cmd == "doctor" => match run_doctor() {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "{message}");
+                ExitCode::from(1)
+            }
+        },
         [_, flag] if flag == "--version" || flag == "-V" => {
             println!("rhp {}", env!("CARGO_PKG_VERSION"));
             ExitCode::from(0)
@@ -242,6 +266,112 @@ fn check_file(path: &str, json: bool) -> Result<(), String> {
         },
         Err(err) => Err(if json { err.json(path) } else { err.human() }),
     }
+}
+
+/// Executa todos os testes `*_test.rhp` de um arquivo ou diretorio.
+///
+/// Convenção: arquivos terminados em `_test.rhp`; usam `assert` (falha =
+/// erro de runtime). Relata por arquivo + resumo; exit != 0 se falhar.
+fn run_tests(target: &Path) -> Result<(), String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    if target.is_file() {
+        files.push(target.to_path_buf());
+    } else if target.is_dir() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(target)
+            .map_err(|e| format!("nao foi possivel listar `{}`: {e}", target.display()))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path.extension().and_then(|ext| ext.to_str()) == Some("rhp")
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem.ends_with("_test"))
+            })
+            .collect();
+        entries.sort();
+        files = entries;
+    } else {
+        return Err(format!(
+            "caminho de teste inexistente: `{}`",
+            target.display()
+        ));
+    }
+    if files.is_empty() {
+        return Err(format!(
+            "nenhum teste `*_test.rhp` em `{}`",
+            target.display()
+        ));
+    }
+    let mut failures = 0usize;
+    for file in &files {
+        let mut sink = std::io::sink();
+        match load_program(&file.to_string_lossy()).and_then(|program| {
+            let chunk = rhp_bytecode::compile(&program)
+                .map_err(|e| LoadError::Plain(format!("erro de compilacao: {e}")))?;
+            let mut vm = rhp_vm::Vm::new();
+            vm.run(&chunk, &mut sink)
+                .map_err(|e| LoadError::Plain(format!("erro de execucao: {e}")))
+        }) {
+            Ok(()) => println!("ok {}", file.display()),
+            Err(err) => {
+                failures += 1;
+                let rendered = err.human();
+                let first = rendered.lines().next().unwrap_or("erro");
+                println!("FALHOU {}: {first}", file.display());
+            }
+        }
+    }
+    if failures == 0 {
+        println!("{} teste(s), 0 falhas", files.len());
+        Ok(())
+    } else {
+        Err(format!("{} teste(s), {failures} falha(s)", files.len()))
+    }
+}
+
+/// Diagnostico do ambiente: versao, toolchain e autoteste em memoria.
+fn tool_version(cmd: &str) -> String {
+    std::process::Command::new(cmd)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.lines().next().unwrap_or("?").to_string())
+        .unwrap_or_else(|| "nao encontrado no PATH".to_string())
+}
+
+fn run_doctor() -> Result<String, String> {
+    let mut lines = Vec::new();
+    lines.push(format!("rhp {}", env!("CARGO_PKG_VERSION")));
+    lines.push(format!("rustc: {}", tool_version("rustc")));
+    lines.push(format!("cargo: {}", tool_version("cargo")));
+    // Autoteste em memoria: lex + parse + compile + execucao.
+    match rhp_parser::parse_source("echo 6 * 7;") {
+        Err(e) => return Err(format!("autoteste falhou no parse: {e}")),
+        Ok(program) => match rhp_bytecode::compile(&program) {
+            Err(e) => return Err(format!("autoteste falhou na compilacao: {e}")),
+            Ok(chunk) => {
+                let mut vm = rhp_vm::Vm::new();
+                let mut out = Vec::new();
+                match vm.run(&chunk, &mut out) {
+                    Err(e) => return Err(format!("autoteste falhou na execucao: {e}")),
+                    Ok(()) if out == b"42\n" => {
+                        lines.push("autoteste: ok (6 * 7 = 42)".to_string())
+                    }
+                    Ok(()) => {
+                        return Err(format!(
+                            "autoteste com saida inesperada: {}",
+                            String::from_utf8_lossy(&out)
+                        ));
+                    }
+                }
+            }
+        },
+    }
+    Ok(lines.join("\n"))
 }
 
 /// Executa um arquivo `.rhp`, repassando argumentos extras para `argv()`.

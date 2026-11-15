@@ -193,6 +193,45 @@ fn rhp_run_passes_extra_args_to_argv() {
 }
 
 #[test]
+fn rhp_test_runs_test_files() {
+    let dir = std::env::temp_dir().join(format!("rhp-test-runner-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    std::fs::write(dir.join("a_test.rhp"), "assert(1 + 1 == 2);\n").expect("write");
+    std::fs::write(dir.join("b_test.rhp"), "assert(false);\n").expect("write");
+    std::fs::write(dir.join("nao_teste.rhp"), "assert(false);\n").expect("write");
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+
+    let mixed = Command::new(rhp_bin)
+        .args(["test", &dir.to_string_lossy()])
+        .output()
+        .expect("rhp test");
+    assert!(!mixed.status.success(), "b_test deveria falhar");
+    let out = String::from_utf8_lossy(&mixed.stdout);
+    let err = String::from_utf8_lossy(&mixed.stderr);
+    assert!(out.contains("a_test.rhp"), "obteve: {out}");
+    assert!(out.contains("FALHOU"), "obteve: {out}");
+    assert!(err.contains("1 falha(s)"), "obteve: {err}");
+
+    let single = Command::new(rhp_bin)
+        .args(["test", &dir.join("a_test.rhp").to_string_lossy()])
+        .output()
+        .expect("rhp test arquivo");
+    assert!(single.status.success(), "a_test deveria passar");
+}
+
+#[test]
+fn rhp_doctor_reports_environment() {
+    let out = Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .arg("doctor")
+        .output()
+        .expect("rhp doctor");
+    assert!(out.status.success(), "doctor deveria passar");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("rhp "), "obteve: {text}");
+    assert!(text.contains("autoteste: ok"), "obteve: {text}");
+}
+
+#[test]
 fn rhp_run_max_steps_stops_infinite_loop() {
     let output = Command::new(env!("CARGO_BIN_EXE_rhp"))
         .args(["run", "--max-steps", "1000"])

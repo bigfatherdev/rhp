@@ -153,6 +153,23 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `type(v)` | `"null"`, `"bool"`, `"int"`, `"float"`, `"string"`, `"array"`, `"mapa"`, `"funcao"`. |
 | `assert(cond)` | `true`->`null`; `false`/nao-bool = erro. |
 | `contains(s, parte)` | `true` se `parte` ocorre em `s` (ambos `Str`). |
+| `starts_with(s, prefix)` | `true` se `s` comeca com `prefixo`. |
+| `ends_with(s, sufixo)` | `true` se `s` termina com `sufixo`. |
+| `split(s, sep)` | `Array` de pedacos; separador vazio divide em caracteres. |
+| `join(arr, sep)` | Junta `Array` de `Str`; nao-`Str` = erro. |
+| `trim(s)` | Remove espacos das pontas (Unicode). |
+| `upper(s)` / `lower(s)` | Caixa alta/baixa (Unicode). |
+| `replace(s, de, para)` | Substitui todas as ocorrencias. |
+| `abs(x)` | Valor absoluto (`Int` com checagem; `Float` direto). |
+| `min(a, b)` / `max(a, b)` | Minimo/maximo numericos (misto vira `Float`). |
+| `sqrt(x)` | Raiz quadrada (`Float`); negativo = erro. |
+| `pow(base, exp)` | Potencia (`Float`; tipos numericos). |
+| `floor(x)` / `ceil(x)` | Para baixo/cima (`Int`); fora de `i64` = erro. |
+| `values(m)` | `Array` com os valores (ordem das chaves). |
+| `entries(m)` | `Array` de pares `[chave, valor]` (ordem das chaves). |
+| `merge(a, b)` | Une dois mapas; chaves de `b` vencem. |
+| `has(m, chave)` | `true` se a chave existe. |
+| `contains(s, parte)` | `true` se `parte` ocorre em `s` (ambos `Str`). |
 | `starts_with(s, prefixo)` / `ends_with(s, sufixo)` | Prefixo/sufixo (`Str`, `Str`). |
 | `split(s, sep)` | `Array` de pedacos; separador vazio divide por caractere. |
 | `join(arr, sep)` | Junta `Array` de `Str` com separador; nao-`Str` = erro. |
