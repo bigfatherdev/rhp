@@ -23,6 +23,12 @@ import "mat.rhp";
 echo dobro(21); // 42
 ```
 
+- **Limite de profundidade sintatica: 128 niveis** (expressoes e blocos
+  aninhados; cadeias planas como `1+1+...` ou instrucoes em sequencia nao
+  contam). Acima do limite, erro `profundidade maxima excedida`
+  (protecao contra estouro de pilha — ver ADR 0005). Constantes de bytecode
+  artesanais alem de 128 niveis sao rejeitadas na validacao.
+
 ## 2. Instrucoes
 
 ```text
@@ -71,7 +77,9 @@ Call      := Ident "(" (Expr ("," Expr)*)? ")"
 ```
 
 Literais: inteiros `i64` (`42`), floats (`1.5`, ao menos um digito apos o
-ponto), strings `"..."` com escapes `\" \\ \n \r \t`, `true`/`false`/`null`.
+ponto), strings `"..."` com escapes `\" \\ \n \r \t \u{HEX}` (`\u` exige
+chaves com 1–6 digitos hexadecimais formando ponto de codigo Unicode valido,
+ex.: `\u{41}` = `A`, `\u{1F600}` = 😀), `true`/`false`/`null`.
 Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 
 ## 4. Semantica de operadores
@@ -114,7 +122,7 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `float(v)` | `Float`->igual; `Int`->converte; `Str`->parse; resto erro. |
 | `type(v)` | `"null"`, `"bool"`, `"int"`, `"float"`, `"string"`, `"array"`, `"mapa"`, `"funcao"`. |
 | `assert(cond)` | `true`->`null`; `false`/nao-bool = erro. |
-| `http_get(url)` | (Fase 6) GET `http://host[:porta]/caminho` com timeout de 5s; so 2xx e corpo UTF-8; resto = erro. Somente esquema `http://`. |
+| `http_get(url)` | (Fase 6) GET `http://host[:porta]/caminho` com timeouts de 5s (conexao/leitura; DNS usa o resolvedor do sistema, sem timeout proprio), teto de corpo de 1 MiB, so 2xx e corpo UTF-8; resto = erro. Somente esquema `http://`. |
 
 Exemplo:
 

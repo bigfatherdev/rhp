@@ -192,6 +192,42 @@ fn rhp_run_http_get_against_local_server() {
 }
 
 #[test]
+fn rhp_run_http_get_rejects_huge_body() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local deve passar");
+    let port = listener
+        .local_addr()
+        .expect("addr local deve existir")
+        .port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept deve passar");
+        let mut request = vec![0u8; 1024];
+        let _ = stream.read(&mut request);
+        let big = "x".repeat(2 * 1024 * 1024);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{big}",
+            big.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write deve passar");
+    });
+    let output = run_temp_source(
+        "http-big.rhp",
+        &format!("echo http_get(\"http://127.0.0.1:{port}/grande\");\n"),
+    );
+    server.join().expect("servidor deve terminar");
+    assert!(!output.status.success(), "corpo gigante deveria falhar");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("limite"),
+        "stderr deveria mencionar o limite, obteve: {stderr}"
+    );
+}
+
+#[test]
 fn rhp_fmt_rewrites_and_checks() {
     let rhp_bin = env!("CARGO_BIN_EXE_rhp");
     let dir = std::env::temp_dir().join(format!("rhp-test-fmt-{}", std::process::id()));

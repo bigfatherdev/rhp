@@ -22,7 +22,20 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - Fase 5 (ferramentas): crate `rhp-fmt` + `rhp fmt [--check]` idempotente e
   `tools/check-changes.sh` de CI (ADR 0003).
   Registro: `changes/2026-11-14-feat-fase-5-ferramentas.md`.
+- Escape `\u{HEX}` em strings.
+  Registro: `changes/2026-11-14-feat-escape-unicode.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).
   Registro: `changes/2026-11-14-feat-fase-6-rede-minima.md`.
+
+### Fixed
+
+- Teto de profundidade sintatica (128 niveis) e de constantes: entradas
+  profundamente aninhadas geram erro em vez de abortar o processo.
+  Registros: `changes/2026-11-14-fix-limite-profundidade.md`.
+- `rhp fmt` com roundtrip garantido: floats sem notacao cientifica e chaves
+  de mapa citadas quando necessario.
+  Registro: `changes/2026-11-14-fix-fmt-roundtrip.md`.
+- `http_get` com teto de corpo de 1 MiB e DNS documentado.
+  Registro: `changes/2026-11-14-fix-http-limites.md`.

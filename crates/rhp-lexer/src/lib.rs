@@ -315,6 +315,10 @@ fn lex_string(
                         value.push('"');
                         *col += 1;
                     }
+                    Some((_, 'u')) => {
+                        *col += 1;
+                        value.push(lex_unicode_escape(chars, line, col, start_line, start_col)?);
+                    }
                     Some((_, other)) => {
                         return Err(LexError::new(
                             format!("escape invalido: \\{other}"),
@@ -348,6 +352,55 @@ fn lex_string(
         start_line,
         start_col,
     ))
+}
+
+/// Le `\u{HEX}` apos o `u` ja consumido (1–6 digitos, ponto valido).
+fn lex_unicode_escape(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    line: &mut usize,
+    col: &mut usize,
+    start_line: usize,
+    start_col: usize,
+) -> Result<char, LexError> {
+    const HINT: &str = "escape unicode invalido (use \\u{HEX}, 1-6 digitos)";
+    match chars.next() {
+        Some((_, '{')) => {
+            *col += 1;
+        }
+        _ => {
+            return Err(LexError::new(
+                "escape invalido: \\u (use \\u{HEX})",
+                *line,
+                *col,
+            ));
+        }
+    }
+    let mut hex = String::new();
+    let mut closed = false;
+    for (_, c) in chars.by_ref() {
+        *col += 1;
+        if c == '}' {
+            closed = true;
+            break;
+        }
+        if c.is_ascii_hexdigit() && hex.len() < 6 {
+            hex.push(c);
+        } else {
+            return Err(LexError::new(HINT, *line, *col));
+        }
+    }
+    if !closed || hex.is_empty() {
+        return Err(LexError::new(HINT, start_line, start_col));
+    }
+    let code =
+        u32::from_str_radix(&hex, 16).map_err(|_| LexError::new(HINT, start_line, start_col))?;
+    char::from_u32(code).ok_or_else(|| {
+        LexError::new(
+            "escape unicode invalido (ponto de codigo fora do intervalo)",
+            start_line,
+            start_col,
+        )
+    })
 }
 
 fn lex_number(
@@ -502,6 +555,29 @@ mod tests {
     fn reports_invalid_escape() {
         let err = lex("echo \"a\\qb\";").expect_err("escape invalido deve falhar");
         assert!(err.message.contains("escape invalido"));
+    }
+
+    #[test]
+    fn resolves_unicode_escapes() {
+        let tokens = lex("echo \"A\\u{41}\\u{1F600}\";").expect("lex deve passar");
+        assert_eq!(
+            tokens[1],
+            Token::new(TokenKind::StringLiteral("AA\u{1F600}".to_string()), 1, 6)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_unicode_escapes() {
+        for src in [
+            "echo \"\\u\";",
+            "echo \"\\u{}\";",
+            "echo \"\\u{110000}\";",
+            "echo \"\\u{D800}\";",
+            "echo \"\\u{41\";",
+            "echo \"\\u{ZZ}\";",
+        ] {
+            assert!(lex(src).is_err(), "deve falhar: {src}");
+        }
     }
 
     #[test]

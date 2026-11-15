@@ -169,11 +169,22 @@ impl std::error::Error for ParseError {}
 struct Cursor<'a> {
     tokens: &'a [Token],
     pos: usize,
+    depth: u32,
 }
+
+/// Profundidade sintatica maxima (protecao contra estouro de pilha com
+/// entradas patologicas; ver AUD-001). Cadeias planas (`1+1+...`, instrucoes
+/// em sequencia) nao acumulam profundidade. Calibrado para caber com folga
+/// na pilha de 2 MiB das threads de teste (~9 frames Rust por nivel).
+pub const MAX_PARSE_DEPTH: u32 = 128;
 
 impl<'a> Cursor<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> Option<&'a Token> {
@@ -197,6 +208,26 @@ impl<'a> Cursor<'a> {
             },
             |t| (t.line, t.col),
         )
+    }
+
+    /// Executa `f` um nivel sintatico abaixo, recusando alem do limite.
+    fn nest<T>(
+        &mut self,
+        what: &str,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            let (line, col) = self.end_pos();
+            return Err(ParseError::new(
+                format!("profundidade maxima excedida em {what} (limite {MAX_PARSE_DEPTH})"),
+                line,
+                col,
+            ));
+        }
+        self.depth += 1;
+        let result = f(&mut *self);
+        self.depth -= 1;
+        result
     }
 }
 
@@ -240,6 +271,10 @@ pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
 }
 
 fn parse_stmt(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.nest("instrucao", parse_stmt_inner)
+}
+
+fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     let tok = cursor.peek().cloned().ok_or_else(|| {
         let (line, col) = cursor.end_pos();
         ParseError::new("esperado instrucao, encontrado fim de arquivo", line, col)
@@ -433,7 +468,7 @@ fn parse_block(cursor: &mut Cursor<'_>) -> Result<Vec<Stmt>, ParseError> {
 }
 
 fn parse_expr(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
-    parse_equality(cursor)
+    cursor.nest("expressao", parse_equality)
 }
 
 fn parse_equality(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
@@ -953,5 +988,25 @@ mod tests {
     fn parse_source_helper_reports_errors() {
         let err = parse_source("echo \"x\"").expect_err("deve falhar");
         assert!(err.contains("esperado `;`"));
+    }
+
+    #[test]
+    fn rejects_excessive_expression_nesting() {
+        let src = format!("echo {}1{};", "(".repeat(400), ")".repeat(400));
+        let err = lex_and_parse(&src).expect_err("aninhamento excessivo deve falhar");
+        assert!(err.message.contains("profundidade maxima"));
+    }
+
+    #[test]
+    fn rejects_excessive_block_nesting() {
+        let src = format!("{}echo 1;{}", "if true {".repeat(400), "}".repeat(400));
+        let err = lex_and_parse(&src).expect_err("aninhamento excessivo deve falhar");
+        assert!(err.message.contains("profundidade maxima"));
+    }
+
+    #[test]
+    fn accepts_nesting_within_limit() {
+        let src = format!("echo {}1{};", "(".repeat(100), ")".repeat(100));
+        lex_and_parse(&src).expect("100 niveis devem passar");
     }
 }

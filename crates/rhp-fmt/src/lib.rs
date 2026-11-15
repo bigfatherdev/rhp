@@ -154,8 +154,16 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
     match expr {
         Expr::StringLiteral(s) => format!("{s:?}"),
         Expr::Int(v) => v.to_string(),
-        // `{:?}` em float garante ponto decimal (`2.0`, nao `2`).
-        Expr::Float(v) => format!("{v:?}"),
+        // `Display` de `f64` nunca usa notacao cientifica (ao contrario de
+        // `{:?}`); sem ponto, completa com `.0` para continuar literal
+        // float valido e reparavel (AUD-101).
+        Expr::Float(v) => {
+            let mut text = format!("{v}");
+            if !text.contains('.') {
+                text.push_str(".0");
+            }
+            text
+        }
         Expr::Bool(b) => b.to_string(),
         Expr::Null => "null".to_string(),
         Expr::Var(name) => name.clone(),
@@ -166,7 +174,7 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
         Expr::Map(entries) => {
             let inner: Vec<String> = entries
                 .iter()
-                .map(|(key, value)| format!("{key}: {}", fmt_expr(value, 0)))
+                .map(|(key, value)| format!("{}: {}", fmt_map_key(key), fmt_expr(value, 0)))
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
@@ -212,6 +220,22 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             let inner: Vec<String> = args.iter().map(|arg| fmt_expr(arg, 0)).collect();
             format!("{name}({})", inner.join(", "))
         }
+    }
+}
+
+/// Chave de mapa: nua se identificador valido, com aspas caso contrario
+/// (chaves com espacos/simbolos precisam de `"..."` para reparsear).
+fn fmt_map_key(key: &str) -> String {
+    let mut bytes = key.bytes();
+    let bare = !key.is_empty()
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if bare {
+        key.to_string()
+    } else {
+        format!("{key:?}")
     }
 }
 
@@ -287,6 +311,20 @@ mod tests {
     fn formats_fib_example_idempotently() {
         let fib = include_str!("../../../examples/fib.rhp");
         check_idempotent(fib);
+    }
+
+    #[test]
+    fn formats_floats_reparseably() {
+        assert_eq!(fmt("echo 0.000001;"), "echo 0.000001;\n");
+        assert_eq!(fmt("echo 2.0;"), "echo 2.0;\n");
+        check_idempotent("echo 0.000001;\necho 2.0;\necho 1.5;\n");
+    }
+
+    #[test]
+    fn quotes_map_keys_when_needed() {
+        assert_eq!(fmt("echo {\"a b\": 1};"), "echo {\"a b\": 1};\n");
+        assert_eq!(fmt("echo {x: 1};"), "echo {x: 1};\n");
+        check_idempotent("echo {\"a b\": 1, x: 2};\n");
     }
 
     #[test]

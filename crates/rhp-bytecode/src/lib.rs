@@ -227,6 +227,10 @@ pub struct Chunk {
     pub code: Vec<Op>,
 }
 
+/// Profundidade maxima de valores compostos aninhados em constantes
+/// (protecao contra estouro de pilha em `Display`/execucao; ver AUD-001).
+pub const MAX_VALUE_DEPTH: usize = 128;
+
 impl Chunk {
     #[must_use]
     pub fn new() -> Self {
@@ -238,18 +242,29 @@ impl Chunk {
         }
     }
 
-    /// Valida o chunk e, recursivamente, os corpos das funcoes.
+    /// Valida o chunk e, iterativamente, os corpos das funcoes.
+    ///
+    /// Iterativo de proposito: chunks artesanais (fora do compilador) podem
+    /// aninhar definicoes sem limite, e a validacao nao deve estourar a
+    /// pilha antes de rejeita-los.
     ///
     /// # Erros
     ///
     /// Retorna [`CompileError`] se o codigo estiver vazio, nao terminar com
-    /// [`Op::Halt`], referenciar constante/nome/funcao/builtin inexistente
-    /// ou salto fora do codigo.
+    /// [`Op::Halt`], referenciar constante/nome/funcao/builtin inexistente,
+    /// salto fora do codigo ou constante alem da profundidade maxima.
     pub fn validate(&self) -> Result<(), CompileError> {
-        self.validate_inner("principal")
+        let mut pending: Vec<(&Chunk, String)> = vec![(self, "principal".to_string())];
+        while let Some((chunk, context)) = pending.pop() {
+            chunk.validate_shallow(&context)?;
+            for func in &chunk.funcs {
+                pending.push((&func.body, format!("funcao `{}`", func.name)));
+            }
+        }
+        Ok(())
     }
 
-    fn validate_inner(&self, context: &str) -> Result<(), CompileError> {
+    fn validate_shallow(&self, context: &str) -> Result<(), CompileError> {
         if self.code.is_empty() {
             return Err(CompileError::new(format!(
                 "chunk vazio em `{context}`: sem instrucoes"
@@ -259,6 +274,9 @@ impl Chunk {
             return Err(CompileError::new(format!(
                 "chunk invalido em `{context}`: sem `Halt` final"
             )));
+        }
+        for value in &self.constants {
+            check_constant_depth(value)?;
         }
         let len = self.code.len();
         for op in &self.code {
@@ -294,12 +312,34 @@ impl Chunk {
                 _ => {}
             }
         }
-        for func in &self.funcs {
-            func.body
-                .validate_inner(&format!("funcao `{}`", func.name))?;
-        }
         Ok(())
     }
+}
+
+/// Checa profundidade de uma constante sem recursao (pilha explicita).
+fn check_constant_depth(value: &Value) -> Result<(), CompileError> {
+    let mut stack: Vec<(&Value, usize)> = vec![(value, 0)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > MAX_VALUE_DEPTH {
+            return Err(CompileError::new(format!(
+                "constante excede profundidade maxima ({MAX_VALUE_DEPTH})"
+            )));
+        }
+        match current {
+            Value::Array(items) => {
+                for item in items {
+                    stack.push((item, depth + 1));
+                }
+            }
+            Value::Map(entries) => {
+                for item in entries.values() {
+                    stack.push((item, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 impl Default for Chunk {
@@ -462,7 +502,7 @@ impl Compiler {
                 fn_compiler.emit(Op::Return);
                 fn_compiler.emit(Op::Halt);
                 let body_chunk = fn_compiler.chunk;
-                body_chunk.validate_inner(&format!("funcao `{name}`"))?;
+                body_chunk.validate()?;
                 if self.chunk.funcs.len() >= u32::MAX as usize {
                     return Err(CompileError::new("limite de funcoes excedido"));
                 }
@@ -790,6 +830,37 @@ mod tests {
         };
         let err = chunk.validate().expect_err("deve falhar");
         assert!(err.message.contains("builtin"));
+    }
+
+    #[test]
+    fn rejects_deeply_nested_constant() {
+        let mut nested = Value::Int(0);
+        for _ in 0..(MAX_VALUE_DEPTH + 10) {
+            nested = Value::Array(vec![nested]);
+        }
+        let chunk = Chunk {
+            constants: vec![nested],
+            names: vec![],
+            funcs: vec![],
+            code: vec![Op::Constant(0), Op::Print, Op::Halt],
+        };
+        let err = chunk.validate().expect_err("deve falhar");
+        assert!(err.message.contains("profundidade maxima"));
+    }
+
+    #[test]
+    fn accepts_constant_within_depth_limit() {
+        let mut nested = Value::Int(0);
+        for _ in 0..MAX_VALUE_DEPTH {
+            nested = Value::Array(vec![nested]);
+        }
+        let chunk = Chunk {
+            constants: vec![nested],
+            names: vec![],
+            funcs: vec![],
+            code: vec![Op::Constant(0), Op::Print, Op::Halt],
+        };
+        chunk.validate().expect("deve passar");
     }
 
     #[test]

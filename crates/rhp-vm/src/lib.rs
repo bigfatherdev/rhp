@@ -13,6 +13,9 @@ use std::rc::Rc;
 /// Profundidade maxima da pilha de chamadas (protecao contra estouro).
 pub const MAX_CALL_DEPTH: usize = 512;
 
+/// Corpo maximo aceito por `http_get` (protecao contra exaustao de memoria).
+pub const MAX_HTTP_BODY: usize = 1024 * 1024;
+
 /// Erro de runtime da VM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmError {
@@ -821,7 +824,9 @@ fn call_builtin(builtin: rhp_bytecode::Builtin, args: &[Value]) -> Result<Value,
 /// Cliente HTTP minimo (somente `http://`), sem dependencias externas.
 ///
 /// Timeouts de 5s para conexao e leitura; aceita apenas status 2xx e
-/// corpo UTF-8. Erros sao `VmError` com mensagem (sem panics).
+/// corpo UTF-8 de ate [`MAX_HTTP_BODY`] bytes. A resolucao DNS usa o
+/// resolvedor do sistema e nao tem timeout proprio (limitacao documentada).
+/// Erros sao `VmError` com mensagem (sem panics).
 fn http_get_body(url: &str) -> Result<String, VmError> {
     use std::io::{Read, Write as _};
     use std::net::{TcpStream, ToSocketAddrs};
@@ -865,9 +870,26 @@ fn http_get_body(url: &str) -> Result<String, VmError> {
         .write_all(request.as_bytes())
         .map_err(|e| VmError::new(format!("`http_get` falhou ao enviar requisicao: {e}")))?;
     let mut raw: Vec<u8> = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .map_err(|e| VmError::new(format!("`http_get` falhou ao ler resposta: {e}")))?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if raw.len() > MAX_HTTP_BODY {
+                    return Err(VmError::new(format!(
+                        "`http_get` excedeu o limite de corpo ({MAX_HTTP_BODY} bytes)"
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(VmError::new(format!(
+                    "`http_get` falhou ao ler resposta: {e}"
+                )));
+            }
+        }
+    }
     let header_end = raw
         .windows(b"\r\n\r\n".len())
         .position(|window| window == b"\r\n\r\n")
@@ -1135,5 +1157,8 @@ mod tests {
         assert!(run_err("echo http_get(\"ftp://x/y\");").contains("apenas urls `http://`"));
         assert!(run_err("echo http_get(42);").contains("exige string"));
         assert!(run_err("echo http_get(\"http://127.0.0.1:1/\");").contains("falhou ao conectar"));
+        // `.invalid` nunca resolve (RFC 2606): falha rapida, sem travar.
+        assert!(run_err("echo http_get(\"http://nao-existe.invalid/\");")
+            .contains("falhou ao resolver"));
     }
 }
