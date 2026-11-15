@@ -65,8 +65,8 @@ cargo build
 
 - **Sintaxe familiar, semântica própria** — `echo`, `fn`, `if`/`else`, `while`, com tipagem dinâmica e erros explícitos em runtime (sem coerção silenciosa).
 - **Compilador de verdade** — lexer e parser escritos à mão, AST própria, geração de bytecode com pool de constantes e validação estática (incluindo análise de fluxo de pilha).
-- **VM em pilha** — frames explícitos, escopos léxicos, recursão limitada, builtins e `http_get` std-only.
-- **Biblioteca-padrão nascente** — arrays e mapas por valor, `len push pop keys str int float type assert`, `import` com resolução DFS.
+- **VM em pilha** — frames explícitos, escopos léxicos, recursão limitada, exceções (`try`/`catch`/`finally`), builtins e HTTP std-only.
+- **Biblioteca-padrão nascente** — arrays e mapas por valor, strings/matemática/mapas (`contains split join trim abs min max sqrt pow …`), `sort`, JSON (`json_parse`/`json_stringify`), datas (`now`/`sleep`/`date_str`), `fs_*`/`argv`/`env`/`exit`, `import` com resolução DFS + `export` opt-in e `import { } from` seletivo.
 - **Ferramentas próprias** — formatador canônico (`rhp fmt`), diagnósticos com códigos estáveis (`E0001`–`E3011`), verificação sem execução (`rhp check [--json]`), gramática para VSCode.
 - **Zero dependências externas, sem `unsafe`** — só workspace + biblioteca padrão do Rust.
 
@@ -176,7 +176,7 @@ help: toda instrucao termina com `;`
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 133 testes, 0 falhas
+cargo test --workspace          # 195 testes, 0 falhas
 cargo build --workspace
 ./target/debug/rhp run examples/fib.rhp          # 55
 ./target/debug/rhp fmt --check hello.rhp examples/*.rhp
@@ -209,12 +209,12 @@ rhp-lexer -> rhp-parser -> rhp-bytecode -> rhp-vm -> rhp-cli (+rhp-fmt, +rhp-dia
 
 ## Segurança
 
-Garantido e testado: sem `unsafe`; bytecode validado antes de executar; aritmética inteira checada; profundidade sintática limitada (128); imports confinados à árvore do programa com teto de 8 MiB/arquivo; `http_get` só `http://`, timeouts de 5 s, teto de corpo de 1 MiB; `VmLimits` opt-in. Explicitamente **não** garantido: isolamento de SO, HTTPS/redirects, heap sem teto medido, DNS com timeout próprio. Detalhes e reporte em [`SECURITY.md`](SECURITY.md).
+Garantido e testado: sem `unsafe`; bytecode validado antes de executar; aritmética inteira checada; profundidade sintática limitada (128); imports confinados à árvore do programa com teto de 8 MiB/arquivo; `http_get` só `http://`, timeouts de 5 s, teto de corpo de 1 MiB (estrito, sem redirects); `http_fetch` segue redirects (teto 10), com headers e timeout configuráveis. `VmLimits` opt-in. Explicitamente **não** garantido: isolamento de SO, HTTPS/TLS, heap sem teto medido, DNS com timeout próprio. Detalhes e reporte em [`SECURITY.md`](SECURITY.md).
 
 ## Roadmap
 
-- **Concluído:** fundação, núcleo imperativo, stdlib (arrays/mapas/builtins), módulos, ferramentas (`fmt`, CI), rede mínima, diagnósticos, memória documentada, verificador de fluxo, `rhp check`, gramática VSCode.
-- **Planejado (requer aprovação + RFC onde indicado):** tipagem estática, exports/gerenciador de pacotes, PostgreSQL/Redis com servidores reais, async/concorrência, classes/generics, LSP completo, debugger, otimizações com protocolo antes/depois.
+- **Concluído:** fundação, núcleo imperativo (+ `for`, `try`/`catch`/`finally`), stdlib (strings/matemática/mapas, `sort`, JSON, datas/horas, `fs_*`/`argv`/`env`/`exit`), módulos v2 (`export` + `import` seletivo), ferramentas (`fmt`, `test`, `doctor`, `check`, CI), rede (`http_get` + `http_fetch` com redirects), diagnósticos, memória documentada, verificador de fluxo, gramática VSCode.
+- **Planejado (requer aprovação + RFC onde indicado):** tipagem estática, gerenciador de pacotes, PostgreSQL/SQLite com servidores reais, servidor HTTP, async/concorrência, classes/generics, LSP completo, debugger, TLS, otimizações com protocolo antes/depois.
 
 Ver [`ROADMAP.md`](ROADMAP.md) (estado) e [`CHANGELOG.md`](CHANGELOG.md) (releases).
 
