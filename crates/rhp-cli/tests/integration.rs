@@ -419,7 +419,7 @@ fn vscode_grammar_covers_language() {
     assert!(text.contains("\"scopeName\": \"source.rhp\""));
     for keyword in [
         "echo", "let", "const", "if", "else", "while", "for", "try", "catch", "finally", "throw",
-        "break", "continue", "fn", "return", "import", "true", "false", "null",
+        "export", "break", "continue", "fn", "return", "import", "true", "false", "null",
     ] {
         assert!(
             text.contains(keyword),

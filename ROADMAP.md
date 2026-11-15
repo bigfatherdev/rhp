@@ -68,7 +68,8 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 
 - [x] A1: RFC 0001 — exceções (`RFCs/0001-excecoes.md`, aceita e implementada).
 - [x] A2: exceções implementadas (lexer/parser/bytecode/VM/fmt/CLI/specs).
-- [ ] A3–A5: namespaces/exports (ADR 0009), datas/horas, rede v2.
+- [x] A3: namespaces/exports (ADR 0009 implementada: `export` + seletivo).
+- [ ] A4–A5: datas/horas, rede v2.
 - [ ] Fase B: persistência (ADR SQLite, driver, PostgreSQL com servidor
   real).
 - [ ] Fase C: servidor HTTP (RFC concorrência, router, middleware,

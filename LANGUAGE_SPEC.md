@@ -12,15 +12,26 @@ Block   := "{" Stmt* "}"
 
 - Arquivo fonte: texto UTF-8. Comentarios de linha `//` ate o fim da linha.
 - Programa vazio e valido (sem saida).
-- **Modulos (Fase 4):** `import "caminho.rhp";` (caminho relativo ao arquivo
-  que importa). Resolucao em profundidade: cada modulo executa uma vez, antes
-  do importador; mesmo arquivo importado N vezes entra uma vez; ciclo
-  (`a -> b -> a`) e arquivo ausente sao erros. Namespace global unico:
-  redefinir no mesmo escopo (inclusive entre modulos) e erro em runtime.
+- **Modulos (Fases 4 e A3):** `import "caminho.rhp";` (caminho relativo
+  ao arquivo que importa). Resolucao em profundidade: cada modulo executa
+  uma vez, antes do importador; mesmo arquivo importado N vezes entra uma
+  vez; ciclo (`a -> b -> a`) e arquivo ausente sao erros.
+  - `export fn f` / `export let x` / `export const N` (opt-in, nivel
+    superior): o nome e publico; sem `export` = privado ao modulo.
+  - `import { a, b as c } from "m.rhp";` importa SO nomes exportados
+    (outros = erro "`x` nao e exportado"); `b as c` vincula com alias.
+    `from`/`as` sao contextuais (identificadores comuns fora do `import`).
+  - `import "m.rhp"` (bare) mantem a semantica legada: vincula todos os
+    nomes de topo (publicos e privados).
+  - Colisao: so entre nomes visiveis vinculados (erro alto, como antes).
+    Modulos distintos nao colidem entre si (isolamento por renomeacao
+    interna; programas legados sem colisao comportam-se igual).
 
 ```rhp
 import "mat.rhp";
 echo dobro(21); // 42
+import { dobro as d } from "mat.rhp";
+echo d(1); // 2 (privados de mat.rhp seguem invisiveis)
 ```
 
 Regras de modulos: caminhos relativos ao arquivo que importa, **confinados

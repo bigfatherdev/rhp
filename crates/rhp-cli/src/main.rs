@@ -2,12 +2,13 @@
 //!
 //! Uso: `rhp run <arquivo.rhp>` | `rhp fmt [--check] <arquivo.rhp>`
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rhp_parser::{Program, Stmt};
+use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt};
 
 const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> [args] | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor";
 
@@ -493,6 +494,23 @@ fn run_source(source: &str, origin: &str, output: &mut dyn Write) -> Result<(), 
 /// Teto de tamanho de fonte por arquivo (protecao contra OOM no loader).
 pub const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Modulo coletado (fase 1 do loader); a fase 2 (`link_modules`) renomeia
+/// e funde em um programa so.
+struct ModuleFile {
+    canonical: PathBuf,
+    shown: String,
+    statements: Vec<Stmt>,
+    /// Imports na ordem do fonte, ja com caminho resolvido.
+    imports: Vec<ResolvedImport>,
+}
+
+/// `import` (bare ou seletivo) com caminho canonico resolvido.
+struct ResolvedImport {
+    canonical: PathBuf,
+    shown: String,
+    names: Option<Vec<ImportName>>,
+}
+
 /// Carrega o programa de entrada com `import`s resolvidos.
 ///
 /// Semantica: busca em profundidade a partir do arquivo de entrada; cada
@@ -501,6 +519,10 @@ pub const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 /// arquivo de entrada; importar o mesmo arquivo varias vezes o inclui uma
 /// unica vez; ciclo, arquivo fora da arvore, arquivo grande demais e
 /// `import` fora do nivel superior sao erros.
+///
+/// Privacidade (ADR 0009): `export` opt-in por definicao; sem `export` =
+/// privado. `import "x"` (bare) mantem a semantica legada (todos os nomes
+/// visiveis); `import { a as b } from "x"` so vincula nomes exportados.
 fn load_program(entry: &str) -> Result<Program, LoadError> {
     let entry_path = Path::new(entry);
     let canonical_entry = std::fs::canonicalize(entry_path)
@@ -509,25 +531,26 @@ fn load_program(entry: &str) -> Result<Program, LoadError> {
         .parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
     let mut visiting: Vec<PathBuf> = Vec::new();
-    let mut visited: HashSet<PathBuf> = HashSet::new();
-    let mut statements: Vec<Stmt> = Vec::new();
-    load_file(
+    let mut by_canonical: HashMap<PathBuf, usize> = HashMap::new();
+    let mut modules: Vec<ModuleFile> = Vec::new();
+    collect_module(
         entry_path,
         &root,
         &mut visiting,
-        &mut visited,
-        &mut statements,
+        &mut by_canonical,
+        &mut modules,
     )?;
+    let statements = link_modules(&modules).map_err(LoadError::Plain)?;
     Ok(Program { statements })
 }
 
-fn load_file(
+fn collect_module(
     path: &Path,
     root: &Path,
     visiting: &mut Vec<PathBuf>,
-    visited: &mut HashSet<PathBuf>,
-    out: &mut Vec<Stmt>,
-) -> Result<(), LoadError> {
+    by_canonical: &mut HashMap<PathBuf, usize>,
+    modules: &mut Vec<ModuleFile>,
+) -> Result<usize, LoadError> {
     let shown = path.display().to_string();
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| LoadError::Plain(format!("modulo nao encontrado `{shown}`: {e}")))?;
@@ -537,8 +560,8 @@ fn load_file(
             root.display()
         )));
     }
-    if visited.contains(&canonical) {
-        return Ok(());
+    if let Some(&idx) = by_canonical.get(&canonical) {
+        return Ok(idx);
     }
     if visiting.contains(&canonical) {
         let mut chain: Vec<String> = visiting.iter().map(|p| p.display().to_string()).collect();
@@ -564,38 +587,470 @@ fn load_file(
     let base_dir: PathBuf = canonical
         .parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
+    // Imports do nivel superior (bare + seletivos); aninhados = erro.
+    let mut imports = Vec::new();
     for import in collect_imports(&program.statements)? {
-        load_file(&base_dir.join(import), root, visiting, visited, out)?;
+        let (raw, names) = import;
+        let dep = base_dir.join(&raw);
+        let dep_shown = dep.display().to_string();
+        let dep_canonical = std::fs::canonicalize(&dep)
+            .map_err(|e| LoadError::Plain(format!("modulo nao encontrado `{dep_shown}`: {e}")))?;
+        if !dep_canonical.starts_with(root) {
+            return Err(LoadError::Plain(format!(
+                "import fora da arvore do programa: `{dep_shown}` (permitido apenas sob `{}`)",
+                root.display()
+            )));
+        }
+        collect_module(&dep, root, visiting, by_canonical, modules)?;
+        imports.push(ResolvedImport {
+            canonical: dep_canonical,
+            shown: dep_shown,
+            names,
+        });
     }
-    out.extend(
-        program
-            .statements
-            .into_iter()
-            .filter(|stmt| !matches!(stmt, Stmt::Import(_))),
-    );
     visiting.pop();
-    visited.insert(canonical);
-    Ok(())
+    let idx = modules.len();
+    by_canonical.insert(canonical.clone(), idx);
+    modules.push(ModuleFile {
+        canonical,
+        shown,
+        statements: program.statements,
+        imports,
+    });
+    Ok(idx)
 }
 
-/// Coleta os `import`s do nivel superior; `import` aninhado e erro.
-fn collect_imports(statements: &[Stmt]) -> Result<Vec<String>, LoadError> {
+/// Liga os modulos coletados em um programa so (fase 2, ADR 0009).
+///
+/// - Ordem de execucao = pos-ordem DFS (dependencias antes, como antes).
+/// - Modulos importados tem nomes de nivel superior renomeados com prefixo
+///   contendo NUL (irrepresentavel no fonte; sem colisao entre modulos).
+///   O entry mantem nomes simples (globais do programa).
+/// - Cada `import`/`import from` vira `let`s de alias no inicio da secao
+///   do importador (nunca reexecuta o modulo): bare vincula todos os nomes
+///   (legado); seletivo so exportados (privacidade real).
+/// - Repetir o mesmo import nao reemite nada; nomes ja vinculados sao
+///   pulados (colisao real continua erro, como hoje).
+fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
+    let index_of: HashMap<&PathBuf, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (&m.canonical, i))
+        .collect();
+    let mut mangled: Vec<HashMap<String, String>> = vec![HashMap::new(); modules.len()];
+    let mut exports: Vec<HashSet<String>> = vec![HashSet::new(); modules.len()];
+    let mut tops: Vec<Vec<String>> = vec![Vec::new(); modules.len()];
+    // Passo 1: exports + nomes de topo por modulo.
+    for (idx, module) in modules.iter().enumerate() {
+        for stmt in &module.statements {
+            let def_name = match stmt {
+                Stmt::Let { name, .. } | Stmt::Const { name, .. } => Some(name.clone()),
+                Stmt::FnDef { name, .. } => Some(name.clone()),
+                Stmt::Export { def } => match def.as_ref() {
+                    Stmt::FnDef { name, .. }
+                    | Stmt::Let { name, .. }
+                    | Stmt::Const { name, .. } => Some(name.clone()),
+                    _ => {
+                        return Err(format!(
+                            "`export` invalido em `{}` (so `fn`, `let`, `const`)",
+                            module.shown
+                        ));
+                    }
+                },
+                Stmt::Import(_) | Stmt::ImportNames { .. } => None,
+                _ => None,
+            };
+            if let Some(name) = def_name {
+                // Duplicatas passam adiante: o `DeclareName` acusa em
+                // runtime, como no merge legado.
+                tops[idx].push(name);
+            }
+            if let Stmt::Export { def } = stmt {
+                let name = match def.as_ref() {
+                    Stmt::FnDef { name, .. }
+                    | Stmt::Let { name, .. }
+                    | Stmt::Const { name, .. } => name.clone(),
+                    _ => {
+                        return Err(format!(
+                            "`export` invalido em `{}` (so `fn`, `let`, `const`)",
+                            module.shown
+                        ));
+                    }
+                };
+                if !exports[idx].insert(name.clone()) {
+                    return Err(format!("export duplicado `{name}` em `{}`", module.shown));
+                }
+            }
+        }
+    }
+    // Passo 2: prefixos (entry sem prefixo) e fusao em pos-ordem.
+    let mut out: Vec<Stmt> = Vec::new();
+    // (importador, nome visivel) -> (modulo de origem, nome original):
+    // mesma origem = repeticao (pula); origem distinta = colisao (erro).
+    let mut bound: HashMap<(usize, String), (usize, String)> = HashMap::new();
+    for (idx, module) in modules.iter().enumerate() {
+        let is_entry = idx + 1 == modules.len();
+        if !is_entry {
+            let prefix = format!("\0m{idx}#");
+            for name in &tops[idx] {
+                mangled[idx].insert(name.clone(), format!("{prefix}{name}"));
+            }
+        }
+        // Aliases dos imports deste modulo (prefixo da secao do importador;
+        // nunca reexecuta o modulo).
+        for import in &module.imports {
+            let Some(&dep_idx) = index_of.get(&import.canonical) else {
+                return Err(format!(
+                    "modulo nao coletado `{}` (erro interno do linker)",
+                    import.shown
+                ));
+            };
+            let mut emit = |visible: &str,
+                            dep: usize,
+                            origin: &str,
+                            out: &mut Vec<Stmt>|
+             -> Result<(), String> {
+                let key = (idx, visible.to_string());
+                match bound.get(&key) {
+                    Some((same_dep, same_origin)) if *same_dep == dep && *same_origin == origin => {
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "colisao de importacao: `{visible}` ja vinculado (de outro modulo)"
+                        ));
+                    }
+                    None => {
+                        bound.insert(key, (dep, origin.to_string()));
+                        out.push(alias_let(visible, origin));
+                    }
+                }
+                Ok(())
+            };
+            match &import.names {
+                None => {
+                    // Bare (legado): vincula TODOS os nomes de topo.
+                    for original in tops[dep_idx].clone() {
+                        let origin = mangled_name(dep_idx, &original, &mangled);
+                        emit(&original, dep_idx, &origin, &mut out)?;
+                    }
+                }
+                Some(names) => {
+                    for selected in names {
+                        if !exports[dep_idx].contains(&selected.name) {
+                            return Err(format!(
+                                "`{}` nao e exportado por `{}`",
+                                selected.name, import.shown
+                            ));
+                        }
+                        let visible = selected.alias.clone().unwrap_or(selected.name.clone());
+                        let origin = mangled_name(dep_idx, &selected.name, &mangled);
+                        emit(&visible, dep_idx, &origin, &mut out)?;
+                    }
+                }
+            }
+        }
+        // Proprios statements: `export` desembrulha a definicao (que e
+        // renomeada e fundida como as demais); imports/marcas somem.
+        let own: Vec<Stmt> = module
+            .statements
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Import(_) | Stmt::ImportNames { .. } => None,
+                Stmt::Export { def } => Some(def.as_ref().clone()),
+                _ => Some(s.clone()),
+            })
+            .collect();
+        if is_entry {
+            out.extend(own);
+        } else {
+            let top_set: HashSet<String> = tops[idx].iter().cloned().collect();
+            out.extend(rename_module(&own, &top_set, &format!("\0m{idx}#")));
+        }
+    }
+    Ok(out)
+}
+
+/// Nome efetivo no modulo fundido (entry = simples; demais = mangled).
+fn mangled_name(dep_idx: usize, original: &str, mangled: &[HashMap<String, String>]) -> String {
+    mangled[dep_idx]
+        .get(original)
+        .cloned()
+        .unwrap_or_else(|| original.to_string())
+}
+
+/// `let visivel = origem;` (ponte do linker; sem saida nem efeito).
+fn alias_let(visible: &str, origin: &str) -> Stmt {
+    Stmt::Let {
+        name: visible.to_string(),
+        init: Some(rhp_parser::Expr::Var(origin.to_string())),
+    }
+}
+
+/// Renomeia os nomes de nivel superior (`top`) de um modulo com `prefix`
+/// (isolamento; prefixo com NUL e irrepresentavel no fonte).
+///
+/// Espelha as regras de escopo do compilador: referencias que resolvem
+/// para o topo sao renomeadas; sombras lexicas (`let` interno, params,
+/// var de `for`/`catch`) preservam o nome simples.
+fn rename_module(statements: &[Stmt], top: &HashSet<String>, prefix: &str) -> Vec<Stmt> {
+    let mut renamer = Renamer {
+        top,
+        prefix,
+        scopes: vec![HashSet::new()],
+    };
+    statements.iter().map(|s| renamer.stmt(s)).collect()
+}
+
+struct Renamer<'a> {
+    top: &'a HashSet<String>,
+    prefix: &'a str,
+    /// Sombras lexicas por nivel (o nivel 0 e o topo; vinculos do topo
+    /// vivem em `top`, nao aqui).
+    scopes: Vec<HashSet<String>>,
+}
+
+impl Renamer<'_> {
+    fn mangled(&self, name: &str) -> String {
+        format!("{}{}", self.prefix, name)
+    }
+
+    /// Referencia (`Var`, callee, alvo de atribuicao): renomeia se resolve
+    /// ao topo sem sombra intermediaria.
+    fn reference(&self, name: &str) -> String {
+        if self.scopes.iter().any(|s| s.contains(name)) {
+            return name.to_string();
+        }
+        if self.top.contains(name) {
+            return self.mangled(name);
+        }
+        name.to_string()
+    }
+
+    /// Vinculo novo (`let`/`const`/`fn`, parametro, var de laco/catch):
+    /// no topo renomeia (e o proprio vinculo de `top`); dentro, registra
+    /// sombra e mantem simples.
+    fn declare(&mut self, name: &str) -> String {
+        if self.scopes.len() == 1 {
+            if self.top.contains(name) {
+                return self.mangled(name);
+            }
+            return name.to_string();
+        }
+        self.scopes
+            .last_mut()
+            .expect("escopo ativo")
+            .insert(name.to_string());
+        name.to_string()
+    }
+
+    fn stmt(&mut self, stmt: &Stmt) -> Stmt {
+        match stmt {
+            Stmt::Echo { expr } => Stmt::Echo {
+                expr: self.expr(expr),
+            },
+            Stmt::Let { name, init } => {
+                // `init` antes do vinculo (como o compilador avalia).
+                let renamed_init = init.as_ref().map(|e| self.expr(e));
+                let renamed = self.declare(name);
+                Stmt::Let {
+                    name: renamed,
+                    init: renamed_init,
+                }
+            }
+            Stmt::Const { name, init } => {
+                let renamed_init = self.expr(init);
+                let renamed = self.declare(name);
+                Stmt::Const {
+                    name: renamed,
+                    init: renamed_init,
+                }
+            }
+            Stmt::Break => Stmt::Break,
+            Stmt::Continue => Stmt::Continue,
+            Stmt::Assign { target, expr } => {
+                let renamed_target = match target {
+                    AssignTarget::Var(name) => AssignTarget::Var(self.reference(name)),
+                    AssignTarget::Index { name, index } => AssignTarget::Index {
+                        name: self.reference(name),
+                        index: self.expr(index),
+                    },
+                };
+                Stmt::Assign {
+                    target: renamed_target,
+                    expr: self.expr(expr),
+                }
+            }
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let cond = self.expr(cond);
+                self.scopes.push(HashSet::new());
+                let then_branch = then_branch.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                let else_branch = else_branch.as_ref().map(|branch| {
+                    self.scopes.push(HashSet::new());
+                    let renamed: Vec<Stmt> = branch.iter().map(|s| self.stmt(s)).collect();
+                    self.scopes.pop();
+                    renamed
+                });
+                Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                }
+            }
+            Stmt::While { cond, body } => {
+                let cond = self.expr(cond);
+                self.scopes.push(HashSet::new());
+                let body = body.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                Stmt::While { cond, body }
+            }
+            Stmt::For { var, iter, body } => {
+                let iter = self.expr(iter);
+                self.scopes.push(HashSet::new());
+                let renamed_var = self.declare(var);
+                let body = body.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                Stmt::For {
+                    var: renamed_var,
+                    iter,
+                    body,
+                }
+            }
+            Stmt::FnDef { name, params, body } => {
+                let renamed = self.declare(name);
+                self.scopes.push(HashSet::new());
+                for param in params {
+                    self.declare(param);
+                }
+                let body = body.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                Stmt::FnDef {
+                    name: renamed,
+                    params: params.clone(),
+                    body,
+                }
+            }
+            Stmt::Return { expr } => Stmt::Return {
+                expr: expr.as_ref().map(|e| self.expr(e)),
+            },
+            Stmt::Throw { expr } => Stmt::Throw {
+                expr: self.expr(expr),
+            },
+            Stmt::Try {
+                body,
+                catch_var,
+                catch_body,
+                finally_body,
+            } => {
+                self.scopes.push(HashSet::new());
+                let body = body.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                let (renamed_var, renamed_catch) = match catch_body {
+                    None => (None, None),
+                    Some(catch_body) => {
+                        self.scopes.push(HashSet::new());
+                        let renamed_var = catch_var.as_deref().map(|v| self.declare(v));
+                        let renamed_catch = catch_body.iter().map(|s| self.stmt(s)).collect();
+                        self.scopes.pop();
+                        (renamed_var, Some(renamed_catch))
+                    }
+                };
+                let renamed_finally = finally_body.as_ref().map(|fin| {
+                    self.scopes.push(HashSet::new());
+                    let renamed: Vec<Stmt> = fin.iter().map(|s| self.stmt(s)).collect();
+                    self.scopes.pop();
+                    renamed
+                });
+                Stmt::Try {
+                    body,
+                    catch_var: renamed_var,
+                    catch_body: renamed_catch,
+                    finally_body: renamed_finally,
+                }
+            }
+            Stmt::Block(stmts) => {
+                self.scopes.push(HashSet::new());
+                let renamed = stmts.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                Stmt::Block(renamed)
+            }
+            Stmt::ExprStmt { expr } => Stmt::ExprStmt {
+                expr: self.expr(expr),
+            },
+            // O linker remove antes de renomear; defesa em profundidade.
+            Stmt::Import(_) | Stmt::ImportNames { .. } | Stmt::Export { .. } => stmt.clone(),
+        }
+    }
+
+    fn expr(&mut self, expr: &Expr) -> Expr {
+        match expr {
+            Expr::StringLiteral(_) | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {
+                expr.clone()
+            }
+            Expr::Var(name) => Expr::Var(self.reference(name)),
+            Expr::Array(items) => Expr::Array(items.iter().map(|e| self.expr(e)).collect()),
+            Expr::Map(entries) => Expr::Map(
+                entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.expr(v)))
+                    .collect(),
+            ),
+            Expr::Index { base, index } => Expr::Index {
+                base: Box::new(self.expr(base)),
+                index: Box::new(self.expr(index)),
+            },
+            Expr::Unary { op, expr } => Expr::Unary {
+                op: *op,
+                expr: Box::new(self.expr(expr)),
+            },
+            Expr::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => Expr::Ternary {
+                cond: Box::new(self.expr(cond)),
+                then_branch: Box::new(self.expr(then_branch)),
+                else_branch: Box::new(self.expr(else_branch)),
+            },
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op: *op,
+                left: Box::new(self.expr(left)),
+                right: Box::new(self.expr(right)),
+            },
+            Expr::Call { name, args } => Expr::Call {
+                name: self.reference(name),
+                args: args.iter().map(|e| self.expr(e)).collect(),
+            },
+        }
+    }
+}
+/// Imports brutos do nivel superior: (caminho, seletivo ou `None`).
+type RawImports = Vec<(String, Option<Vec<ImportName>>)>;
+
+fn collect_imports(statements: &[Stmt]) -> Result<RawImports, LoadError> {
     let mut imports = Vec::new();
     for stmt in statements {
-        if let Stmt::Import(path) = stmt {
-            imports.push(path.clone());
+        match stmt {
+            Stmt::Import(path) => imports.push((path.clone(), None)),
+            Stmt::ImportNames { path, names } => imports.push((path.clone(), Some(names.clone()))),
+            Stmt::Export { .. } => {}
+            _ => {}
         }
     }
     check_no_nested_imports(statements)?;
     Ok(imports)
 }
 
-/// Rejeita `import` dentro de blocos/funcoes (a semantica seria icar o
-/// modulo para o topo, surpreendente e nao documentada).
+/// Rejeita `import`/`export` dentro de blocos/funcoes (a semantica seria
+/// icar o modulo para o topo, surpreendente e nao documentada).
 fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
     for stmt in statements {
         match stmt {
-            Stmt::Import(_) => {}
+            Stmt::Import(_) | Stmt::ImportNames { .. } | Stmt::Export { .. } => {}
             Stmt::If {
                 then_branch,
                 else_branch,
@@ -634,10 +1089,23 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
 
 fn check_block_imports(body: &[Stmt], context: &str) -> Result<(), LoadError> {
     for stmt in body {
-        if let Stmt::Import(path) = stmt {
-            return Err(LoadError::Plain(format!(
-                "import {context} nao suportado (`{path}`): use `import` apenas no nivel superior do arquivo"
-            )));
+        match stmt {
+            Stmt::Import(path) => {
+                return Err(LoadError::Plain(format!(
+                    "import {context} nao suportado (`{path}`): use `import` apenas no nivel superior do arquivo"
+                )));
+            }
+            Stmt::ImportNames { path, .. } => {
+                return Err(LoadError::Plain(format!(
+                    "import {context} nao suportado (`{path}`): use `import` apenas no nivel superior do arquivo"
+                )));
+            }
+            Stmt::Export { .. } => {
+                return Err(LoadError::Plain(format!(
+                    "export {context} nao suportado: use `export` apenas no nivel superior do arquivo"
+                )));
+            }
+            _ => {}
         }
     }
     check_no_nested_imports(body)
@@ -690,15 +1158,174 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nested_import() {
-        let dir = temp_dir("aninhado");
-        write_temp_module(&dir, "lib.rhp", "let x = 1;\n");
-        let main = write_temp_module(&dir, "main.rhp", "fn f() {\n  import \"lib.rhp\";\n}\n");
+    fn selective_import_respects_privacy() {
+        let dir = temp_dir("privado");
+        write_temp_module(
+            &dir,
+            "mat.rhp",
+            "export fn dobro(x) {\n  return ajuda(x) + ajuda(x);\n}\nfn ajuda(x) {\n  return x;\n}\nlet segredo = 7;\n",
+        );
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "import { dobro } from \"mat.rhp\";\necho dobro(21);\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect("deve passar");
+        assert_eq!(buf, b"42\n");
+        // Privado nao vaza: nem funcao auxiliar, nem `let` sem export.
+        let sneaky = write_temp_module(
+            &dir,
+            "sneaky.rhp",
+            "import { dobro } from \"mat.rhp\";\necho ajuda(1);\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&sneaky.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nao definida"), "obteve: {err}");
+        let sneaky2 = write_temp_module(
+            &dir,
+            "sneaky2.rhp",
+            "import { segredo } from \"mat.rhp\";\necho segredo;\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&sneaky2.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nao e exportado"), "obteve: {err}");
+    }
+
+    #[test]
+    fn selective_import_supports_alias_and_mixed_modes() {
+        let dir = temp_dir("alias");
+        write_temp_module(
+            &dir,
+            "mat.rhp",
+            "export fn dobro(x) {\n  return x + x;\n}\nexport let base = 40;\nlet oculto = 1;\n",
+        );
+        // Alias + execucao unica mesmo com bare + seletivo juntos.
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "import \"mat.rhp\";\nimport { dobro as d, base as b } from \"mat.rhp\";\necho d(1) + b + base;\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect("deve passar");
+        assert_eq!(buf, b"82\n");
+        // Bare repetido nao reexecuta (efeito colateral uma vez so).
+        write_temp_module(&dir, "eco.rhp", "echo \"carregou\";\nexport let v = 1;\n");
+        let main2 = write_temp_module(
+            &dir,
+            "main2.rhp",
+            "import \"eco.rhp\";\nimport \"eco.rhp\";\nimport { v } from \"eco.rhp\";\necho v;\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        run_file_with_args(&main2.to_string_lossy(), &[], &mut buf).expect("deve passar");
+        assert_eq!(buf, b"carregou\n1\n");
+    }
+
+    #[test]
+    fn selective_import_detects_collisions_and_cycles() {
+        let dir = temp_dir("colisao");
+        write_temp_module(&dir, "a.rhp", "export let x = 1;\n");
+        write_temp_module(&dir, "b.rhp", "export let x = 2;\n");
+        // Nomes distintos: sem colisao.
+        let ok = write_temp_module(
+            &dir,
+            "ok.rhp",
+            "import { x as xa } from \"a.rhp\";\nimport { x as xb } from \"b.rhp\";\necho xa + xb;\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        run_file_with_args(&ok.to_string_lossy(), &[], &mut buf).expect("deve passar");
+        assert_eq!(buf, b"3\n");
+        // Mesmo nome visivel: erro alto.
+        let clash = write_temp_module(
+            &dir,
+            "clash.rhp",
+            "import { x } from \"a.rhp\";\nimport { x } from \"b.rhp\";\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&clash.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("colisao de importacao"), "obteve: {err}");
+        // Ciclo via seletivo tambem e erro.
+        write_temp_module(
+            &dir,
+            "c1.rhp",
+            "import { v } from \"c2.rhp\";\nexport let u = 1;\n",
+        );
+        write_temp_module(
+            &dir,
+            "c2.rhp",
+            "import { u } from \"c1.rhp\";\nexport let v = 2;\n",
+        );
+        let cyc = write_temp_module(&dir, "cyc.rhp", "import { u } from \"c1.rhp\";\n");
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&cyc.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("circular"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rejects_nested_and_duplicate_export() {
+        let dir = temp_dir("export");
+        // `export` dentro de funcao: so nivel superior.
+        let main = write_temp_module(&dir, "main.rhp", "fn f() {\n  export let x = 1;\n}\n");
         let mut buf: Vec<u8> = Vec::new();
         let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
             .expect_err("deve falhar")
             .into_message();
         assert!(err.contains("nivel superior"), "obteve: {err}");
+        // Export duplicado: erro claro no link.
+        write_temp_module(&dir, "dup.rhp", "export let x = 1;\nexport fn x() {\n}\n");
+        let main2 = write_temp_module(&dir, "main2.rhp", "import { x } from \"dup.rhp\";\n");
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&main2.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("duplicado"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rename_respects_shadowing() {
+        use std::collections::HashSet as Set;
+        // Sombra interna nao e renomeada; referencia ao topo sim.
+        let stmts = rhp_parser::parse_source("let x = 1;\nfn f(x) {\n  return x;\n}\necho x;\n")
+            .expect("parse deve passar")
+            .statements;
+        let top: Set<String> = ["x".to_string(), "f".to_string()].into_iter().collect();
+        let renamed = rename_module(&stmts, &top, "\0m0#");
+        // `fn f(x)` vira `fn M#f(M#x)`? Nao: param `x` e sombra (simples).
+        match &renamed[1] {
+            Stmt::FnDef { name, params, .. } => {
+                assert_eq!(name, "\0m0#f");
+                assert_eq!(params, &["x".to_string()]);
+            }
+            other => panic!("esperado FnDef, obteve {other:?}"),
+        }
+        // `echo x` no topo vira `echo M#x`.
+        match &renamed[2] {
+            Stmt::Echo { expr } => match expr {
+                rhp_parser::Expr::Var(name) => assert_eq!(name, "\0m0#x"),
+                other => panic!("esperado Var, obteve {other:?}"),
+            },
+            other => panic!("esperado Echo, obteve {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reports_circular_import() {
+        let dir = temp_dir("ciclo");
+        write_temp_module(&dir, "a.rhp", "import \"b.rhp\";\n");
+        let b = write_temp_module(&dir, "b.rhp", "import \"a.rhp\";\n");
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&b.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("importacao circular"));
     }
 
     #[test]
@@ -752,17 +1379,5 @@ mod tests {
         run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect("deve passar");
         // Import duplicado inclui uma vez: sem erro de `ja declarada`.
         assert_eq!(buf, b"42\n");
-    }
-
-    #[test]
-    fn reports_circular_import() {
-        let dir = temp_dir("ciclo");
-        write_temp_module(&dir, "a.rhp", "import \"b.rhp\";\n");
-        let b = write_temp_module(&dir, "b.rhp", "import \"a.rhp\";\n");
-        let mut buf: Vec<u8> = Vec::new();
-        let err = run_file_with_args(&b.to_string_lossy(), &[], &mut buf)
-            .expect_err("deve falhar")
-            .into_message();
-        assert!(err.contains("importacao circular"));
     }
 }

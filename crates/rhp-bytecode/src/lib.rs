@@ -1303,6 +1303,20 @@ impl Compiler {
                 // Resolucao de modulos e papel do carregador (`rhp run`);
                 // a compilacao direta ignora (programa ja deve vir resolvido).
             }
+            Stmt::ImportNames { .. } => {
+                // Como `Import`: so o linker resolve (programa direto com
+                // `import { } from` e erro claro, nao silencioso).
+                return Err(CompileError::new(
+                    "`import { } from` sem resolucao: use o loader (`rhp run`/`rhp check`)"
+                        .to_string(),
+                ));
+            }
+            Stmt::Export { .. } => {
+                // Marcador consumido pelo linker; fora dele e erro.
+                return Err(CompileError::new(
+                    "`export` fora de modulo: use o loader (`rhp run`/`rhp check`)".to_string(),
+                ));
+            }
             Stmt::ExprStmt { expr } => {
                 self.compile_expr(expr)?;
                 self.emit(Op::Pop);

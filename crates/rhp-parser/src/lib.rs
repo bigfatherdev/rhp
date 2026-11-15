@@ -8,7 +8,7 @@
 //! Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt
 //!             | WhileStmt | ForStmt | TryStmt | ThrowStmt | BreakStmt
 //!             | ContinueStmt | FnDef | ReturnStmt | Block | ImportStmt
-//!             | ExprStmt
+//!             | ImportNames | Export | ExprStmt
 //! LetStmt    := "let" Ident ("=" Expr)? ";"
 //! ConstStmt  := "const" Ident "=" Expr ";"
 //! AssignStmt := Target "=" Expr ";"
@@ -25,6 +25,8 @@
 //! FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
 //! ReturnStmt := "return" Expr? ";"
 //! ImportStmt := "import" String ";"
+//!             | "import" "{" Ident ("as" Ident)? ("," ...)* "}" "from" String ";"
+//! ExportStmt := "export" (FnDef | LetStmt | ConstStmt)
 //! ExprStmt   := Expr ";"
 //! Expr       := Ternary
 //! Ternary    := NullCoalesce ("?" Ternary ":" Ternary)?
@@ -118,10 +120,30 @@ pub enum Stmt {
     /// `import "caminho.rhp";` — resolvido pelo carregador de modulos
     /// (a compilacao direta ignora; use o loader da CLI).
     Import(String),
+    /// `import { a, b as c } from "caminho.rhp";` — importa só nomes
+    /// exportados (privacidade real, ADR 0009). `from`/`as` sao
+    /// contextuais (identificadores posicionais, como o `in` do `for`).
+    ImportNames {
+        path: String,
+        names: Vec<ImportName>,
+    },
+    /// `export fn/let/const` (ADR 0009, opt-in; sem `export` = privado).
+    /// O linker extrai o nome e remove o marcador; compilar um `Export`
+    /// direto da erro (defesa em profundidade).
+    Export {
+        def: Box<Stmt>,
+    },
     Block(Vec<Stmt>),
     ExprStmt {
         expr: Expr,
     },
+}
+
+/// Nome selecionado em `import { } from`: original + alias opcional.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportName {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 /// Alvo de atribuicao: variavel ou elemento `nome[indice]` (um nivel).
@@ -368,6 +390,7 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::Fn => parse_fn_def(cursor),
         TokenKind::Return => parse_return(cursor),
         TokenKind::Import => parse_import(cursor),
+        TokenKind::Export => parse_export(cursor),
         TokenKind::LBrace => Ok(Stmt::Block(parse_block(cursor)?)),
         _ => parse_assign_or_expr_stmt(cursor),
     }
@@ -587,6 +610,10 @@ fn parse_return(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 
 fn parse_import(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
+    // Seletivo: `import { a, b as c } from "mod.rhp";`.
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBrace)) {
+        return parse_import_names(cursor);
+    }
     let path = match cursor.next() {
         Some(t) => match &t.kind {
             TokenKind::StringLiteral(s) => s.clone(),
@@ -612,6 +639,126 @@ fn parse_import(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     };
     expect_semicolon(cursor)?;
     Ok(Stmt::Import(path))
+}
+
+fn parse_import_names(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next(); // `{`
+    let mut names = Vec::new();
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RBrace)) {
+        let (line, col) = cursor.end_pos();
+        return Err(ParseError::new(
+            "`import { }` vazio: selecione ao menos um nome",
+            line,
+            col,
+        ));
+    }
+    loop {
+        let name = expect_ident(cursor)?;
+        // Alias opcional: `b as c` (`as` e contextual, como `in`/`from`).
+        let alias = match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::Ident(word)) if word == "as" => {
+                cursor.next();
+                Some(expect_ident(cursor)?)
+            }
+            _ => None,
+        };
+        names.push(ImportName { name, alias });
+        match cursor.next() {
+            Some(t) => match &t.kind {
+                TokenKind::Comma => {}
+                TokenKind::RBrace => break,
+                other => {
+                    return Err(ParseError::new(
+                        format!(
+                            "esperado `,` ou `}}` no `import`, encontrado {}",
+                            describe(other)
+                        ),
+                        t.line,
+                        t.col,
+                    ));
+                }
+            },
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `,` ou `}` no `import`, encontrado fim de arquivo",
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    // `from` contextual (identificador posicional, nao reservado).
+    match cursor.next() {
+        Some(t) => match &t.kind {
+            TokenKind::Ident(word) if word == "from" => {}
+            other => {
+                return Err(ParseError::new(
+                    format!(
+                        "esperado `from` apos lista do `import`, encontrado {}",
+                        describe(other)
+                    ),
+                    t.line,
+                    t.col,
+                ));
+            }
+        },
+        None => {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                "esperado `from` apos lista do `import`, encontrado fim de arquivo",
+                line,
+                col,
+            ));
+        }
+    }
+    let path = match cursor.next() {
+        Some(t) => match &t.kind {
+            TokenKind::StringLiteral(s) => s.clone(),
+            other => {
+                return Err(ParseError::new(
+                    format!(
+                        "esperado caminho de modulo (string), encontrado {}",
+                        describe(other)
+                    ),
+                    t.line,
+                    t.col,
+                ));
+            }
+        },
+        None => {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                "esperado caminho de modulo, encontrado fim de arquivo",
+                line,
+                col,
+            ));
+        }
+    };
+    expect_semicolon(cursor)?;
+    Ok(Stmt::ImportNames { path, names })
+}
+
+fn parse_export(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    let (line, col) = cursor
+        .peek()
+        .map_or_else(|| cursor.end_pos(), |t| (t.line, t.col));
+    cursor.next();
+    // So `fn`/`let`/`const` no nivel em que o `export` aparece (o loader
+    // rejeita fora do nivel superior, como faz com `import`).
+    let def = match cursor.peek().map(|t| &t.kind) {
+        Some(TokenKind::Fn) => parse_fn_def(cursor)?,
+        Some(TokenKind::Let) => parse_let(cursor)?,
+        Some(TokenKind::Const) => parse_const(cursor)?,
+        _ => {
+            return Err(ParseError::new(
+                "`export` so admite `fn`, `let` ou `const`",
+                line,
+                col,
+            ));
+        }
+    };
+    Ok(Stmt::Export { def: Box::new(def) })
 }
 
 fn parse_block(cursor: &mut Cursor<'_>) -> Result<Vec<Stmt>, ParseError> {
@@ -1026,6 +1173,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Catch => "`catch`".to_string(),
         TokenKind::Finally => "`finally`".to_string(),
         TokenKind::Throw => "`throw`".to_string(),
+        TokenKind::Export => "`export`".to_string(),
         TokenKind::Fn => "`fn`".to_string(),
         TokenKind::Const => "`const`".to_string(),
         TokenKind::Break => "`break`".to_string(),
@@ -1418,6 +1566,48 @@ mod tests {
     fn rejects_try_without_catch_nor_finally() {
         let err = lex_and_parse("try { echo 1; }").expect_err("deve falhar");
         assert!(err.message.contains("ao menos"), "obteve: {}", err.message);
+    }
+
+    #[test]
+    fn parses_export_prefix_and_selective_import() {
+        let program = lex_and_parse("export fn dobro(x) { return x; } export let base = 40;")
+            .expect("parse deve passar");
+        assert!(matches!(program.statements[0], Stmt::Export { .. }));
+        let program = lex_and_parse("import { dobro, base as b } from \"mat.rhp\";")
+            .expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::ImportNames {
+                path: "mat.rhp".to_string(),
+                names: vec![
+                    ImportName {
+                        name: "dobro".to_string(),
+                        alias: None,
+                    },
+                    ImportName {
+                        name: "base".to_string(),
+                        alias: Some("b".to_string()),
+                    },
+                ],
+            }]
+        );
+        // `from`/`as` seguem identificadores comuns fora do `import`.
+        let program = lex_and_parse("let from = 1; let a_as_b = 2;").expect("parse deve passar");
+        assert_eq!(program.statements.len(), 2);
+    }
+
+    #[test]
+    fn rejects_bad_export_and_import_forms() {
+        let err = lex_and_parse("export echo 1;").expect_err("deve falhar");
+        assert!(
+            err.message.contains("`fn`, `let` ou `const`"),
+            "obteve: {}",
+            err.message
+        );
+        let err = lex_and_parse("import { a } \"m.rhp\";").expect_err("deve falhar");
+        assert!(err.message.contains("`from`"), "obteve: {}", err.message);
+        let err = lex_and_parse("import { } from \"m.rhp\";").expect_err("deve falhar");
+        assert!(err.message.contains("vazio"), "obteve: {}", err.message);
     }
 
     #[test]

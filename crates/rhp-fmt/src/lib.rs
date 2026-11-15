@@ -167,6 +167,27 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             let _ = writeln!(out, "import {path:?};");
         }
+        Stmt::ImportNames { path, names } => {
+            indent(level, out);
+            let parts: Vec<String> = names
+                .iter()
+                .map(|n| match &n.alias {
+                    Some(alias) => format!("{} as {alias}", n.name),
+                    None => n.name.clone(),
+                })
+                .collect();
+            let _ = writeln!(out, "import {{{}}} from {path:?};", parts.join(", "));
+        }
+        Stmt::Export { def } => {
+            indent(level, out);
+            out.push_str("export ");
+            // `def` e `fn`/`let`/`const`: formata sem indentacao extra e
+            // troca a quebra final por `;`/bloco na mesma linha logica.
+            let mut inner = String::new();
+            fmt_stmt(def, 0, &mut inner);
+            let inner = inner.trim_end();
+            let _ = writeln!(out, "{inner}");
+        }
         Stmt::Block(stmts) => {
             indent(level, out);
             out.push_str("{\n");
@@ -428,6 +449,22 @@ mod tests {
         assert_eq!(fmt("throw 1+2;"), "throw 1 + 2;\n");
         check_idempotent(
             "try {\n  echo 1;\n} catch e {\n  echo e;\n} finally {\n  echo 2;\n}\nthrow \"x\";\n",
+        );
+    }
+
+    #[test]
+    fn formats_export_and_selective_import() {
+        assert_eq!(
+            fmt("export fn dobro(x){return x+x;}"),
+            "export fn dobro(x) {\n  return x + x;\n}\n"
+        );
+        assert_eq!(fmt("export let base=40;"), "export let base = 40;\n");
+        assert_eq!(
+            fmt("import {dobro,base as b} from \"mat.rhp\";"),
+            "import {dobro, base as b} from \"mat.rhp\";\n"
+        );
+        check_idempotent(
+            "export fn dobro(x) {\n  return x + x;\n}\nimport {dobro as d} from \"m.rhp\";\n",
         );
     }
 

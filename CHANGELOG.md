@@ -54,6 +54,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   entre funções, `finally` em todos os caminhos (`exit()` não aciona) e
   erro como valor (`{tipo, mensagem}`).
   Registros: `RFCs/0001-excecoes.md`, `changes/2026-11-15-feat-excecoes.md`.
+- Módulos v2 (ADR 0009): `export fn/let/const` opt-in e
+  `import { a, b as c } from` seletivo (privacidade real, alias, colisão
+  só entre visíveis; bare preserva o legado).
+  Registro: `changes/2026-11-15-feat-modulos-v2.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).
