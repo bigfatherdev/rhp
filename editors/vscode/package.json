@@ -1,0 +1,27 @@
+{
+  "name": "rhp",
+  "displayName": "RHP",
+  "description": "Suporte basico a linguagem RHP (gramatica TextMate gerada a mao, acompanha a sintaxe normativa)",
+  "version": "0.1.0",
+  "publisher": "rhp",
+  "license": "MIT",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "rhp",
+        "aliases": ["RHP", "rhp"],
+        "extensions": [".rhp"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rhp",
+        "scopeName": "source.rhp",
+        "path": "./syntaxes/rhp.tmLanguage.json"
+      }
+    ]
+  }
+}

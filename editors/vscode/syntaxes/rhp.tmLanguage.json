@@ -1,0 +1,71 @@
+{
+  "name": "RHP",
+  "scopeName": "source.rhp",
+  "fileTypes": ["rhp"],
+  "patterns": [{ "include": "#main" }],
+  "repository": {
+    "main": {
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#string" },
+        { "include": "#keyword" },
+        { "include": "#builtin" },
+        { "include": "#number" },
+        { "include": "#boolean" },
+        { "include": "#function-call" },
+        { "include": "#function-def" },
+        { "include": "#operator" }
+      ]
+    },
+    "comment": {
+      "name": "comment.line.double-slash.rhp",
+      "match": "//.*$"
+    },
+    "string": {
+      "name": "string.quoted.double.rhp",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.rhp",
+          "match": "\\\\(\\\\|\"|n|r|t|u\\{[0-9A-Fa-f]{1,6}\\})"
+        }
+      ]
+    },
+    "keyword": {
+      "name": "keyword.control.rhp",
+      "match": "\\b(echo|let|if|else|while|fn|return|import|true|false|null)\\b"
+    },
+    "builtin": {
+      "name": "support.function.builtin.rhp",
+      "match": "\\b(len|push|pop|keys|str|int|float|type|assert|http_get)\\b"
+    },
+    "number": {
+      "name": "constant.numeric.rhp",
+      "match": "\\b\\d+(\\.\\d+)?\\b"
+    },
+    "boolean": {
+      "name": "constant.language.boolean.rhp",
+      "match": "\\b(true|false)\\b"
+    },
+    "function-def": {
+      "name": "meta.function.rhp",
+      "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.control.rhp" },
+        "2": { "name": "entity.name.function.rhp" }
+      }
+    },
+    "function-call": {
+      "name": "meta.function-call.rhp",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.rhp" }
+      }
+    },
+    "operator": {
+      "name": "keyword.operator.rhp",
+      "match": "==|!=|<=|>=|[+\\-*/%=<>!;,.:(){}\\[\\]]"
+    }
+  }
+}

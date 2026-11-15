@@ -177,6 +177,81 @@ fn rhp_run_max_steps_stops_infinite_loop() {
 }
 
 #[test]
+fn rhp_check_reports_ok_and_diagnostics() {
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let ok = run_temp_source("ok.rhp", "echo 1 + 2;\n");
+    // `run_temp_source` usa `run`; check e testado abaixo via binario.
+    assert!(ok.status.success());
+
+    let dir = std::env::temp_dir().join(format!("rhp-test-check-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    let good = dir.join("good.rhp");
+    std::fs::write(&good, "echo 1 + 2;\n").expect("write");
+    let out = Command::new(rhp_bin)
+        .args(["check", &good.to_string_lossy()])
+        .output()
+        .expect("rhp check");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
+
+    let bad = dir.join("bad.rhp");
+    std::fs::write(&bad, "echo \"x\"\n").expect("write");
+    let out = Command::new(rhp_bin)
+        .args(["check", &bad.to_string_lossy()])
+        .output()
+        .expect("rhp check");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Error[E1004]"), "obteve: {err}");
+
+    let out = Command::new(rhp_bin)
+        .args(["check", "--json", &bad.to_string_lossy()])
+        .output()
+        .expect("rhp check --json");
+    assert!(!out.status.success());
+    let js = String::from_utf8_lossy(&out.stdout);
+    assert!(js.contains("\"code\":\"E1004\""), "obteve: {js}");
+    assert!(js.contains("\"ok\":false"), "obteve: {js}");
+
+    let out = Command::new(rhp_bin)
+        .args(["check", "--json", &good.to_string_lossy()])
+        .output()
+        .expect("rhp check --json ok");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"ok\":true"));
+}
+
+#[test]
+fn vscode_grammar_covers_language() {
+    // Consistencia gramatica-vs-linguagem (sem engine TextMate no std):
+    // a gramatica precisa citar todo keyword e builtin implementados.
+    let grammar = workspace_root().join("editors/vscode/syntaxes/rhp.tmLanguage.json");
+    assert!(
+        grammar.is_file(),
+        "gramatica nao encontrada: {}",
+        grammar.display()
+    );
+    let text = std::fs::read_to_string(&grammar).expect("nao foi possivel ler gramatica");
+    assert!(text.contains("\"scopeName\": \"source.rhp\""));
+    for keyword in [
+        "echo", "let", "if", "else", "while", "fn", "return", "import", "true", "false", "null",
+    ] {
+        assert!(
+            text.contains(keyword),
+            "keyword fora da gramatica: {keyword}"
+        );
+    }
+    for builtin in [
+        "len", "push", "pop", "keys", "str", "int", "float", "type", "assert", "http_get",
+    ] {
+        assert!(
+            text.contains(builtin),
+            "builtin fora da gramatica: {builtin}"
+        );
+    }
+}
+
+#[test]
 fn rhp_run_reports_structured_diagnostics() {
     // Erro lexico: codigo E0001 + trecho com caret.
     let lex = run_temp_source("lexerr.rhp", "echo @;\n");

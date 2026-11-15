@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use rhp_parser::{Program, Stmt};
 
-const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> | rhp fmt [--check] <arquivo.rhp>";
+const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> | rhp fmt [--check] <arquivo.rhp> | rhp check [--json] <arquivo.rhp>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -55,8 +55,24 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        [_, cmd, path] if cmd == "check" => match check_file(path, false) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "{message}");
+                ExitCode::from(1)
+            }
+        },
+        [_, cmd, flag, path] if cmd == "check" && flag == "--json" => {
+            match check_file(path, true) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    println!("{message}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         [_, flag] if flag == "--help" || flag == "-h" => {
-            println!("RHP (Fase 5: ferramentas)\n\n{USAGE}");
+            println!("RHP (linguagem experimental)\n\n{USAGE}");
             ExitCode::SUCCESS
         }
         [_, flag] if flag == "--version" || flag == "-V" => {
@@ -98,6 +114,132 @@ fn fmt_file(path: &str, check: bool) -> Result<(), String> {
     }
 }
 
+/// Erro de carregamento: diagnostico estruturado (lex/parse) ou texto.
+/// `Box` no `Rich` para nao estourar o limite de tamanho do `Err`.
+enum LoadError {
+    Rich(Box<RichError>),
+    Plain(String),
+}
+
+struct RichError {
+    human: String,
+    diag: rhp_diagnostic::Diagnostic,
+}
+
+impl LoadError {
+    fn rich(human: String, diag: rhp_diagnostic::Diagnostic) -> Self {
+        Self::Rich(Box::new(RichError { human, diag }))
+    }
+
+    fn human(&self) -> String {
+        match self {
+            Self::Rich(error) => error.human.clone(),
+            Self::Plain(message) => message.clone(),
+        }
+    }
+
+    fn json(&self, path: &str) -> String {
+        match self {
+            Self::Rich(error) => diagnostic_json(path, false, Some(&error.diag)),
+            Self::Plain(message) => {
+                let (code, help) = rhp_diagnostic::runtime_code(message);
+                let diag = rhp_diagnostic::Diagnostic::new(code, path, span_1_1(), message.clone());
+                let diag = match help {
+                    Some(help) => diag.with_help(help),
+                    None => diag,
+                };
+                diagnostic_json(path, false, Some(&diag))
+            }
+        }
+    }
+}
+
+fn span_1_1() -> rhp_diagnostic::Span {
+    rhp_diagnostic::Span {
+        line: 1,
+        col: 1,
+        len: 0,
+    }
+}
+
+/// Escapa string para JSON (sem dependencias).
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn diagnostic_json(path: &str, ok: bool, diag: Option<&rhp_diagnostic::Diagnostic>) -> String {
+    match diag {
+        Some(diag) => {
+            let help_json = diag
+                .help
+                .as_deref()
+                .map_or_else(|| "null".to_string(), json_string);
+            format!(
+                "{{\"ok\":{ok},\"file\":{path},\"diagnostics\":[{{\"code\":{code},\"line\":{line},\"col\":{col},\"len\":{len},\"message\":{message},\"help\":{help_json}}}]}}",
+                path = json_string(path),
+                code = json_string(diag.code),
+                line = diag.span.line,
+                col = diag.span.col,
+                len = diag.span.len,
+                message = json_string(&diag.message),
+            )
+        }
+        None => format!(
+            "{{\"ok\":{ok},\"file\":{},\"diagnostics\":[]}}",
+            json_string(path)
+        ),
+    }
+}
+
+/// Checa um programa (lex + imports + compilacao), sem executar.
+///
+/// `json = true` imprime o relatorio em JSON (para ferramentas/LSP).
+fn check_file(path: &str, json: bool) -> Result<(), String> {
+    match load_program(path) {
+        Ok(program) => match rhp_bytecode::compile(&program) {
+            Ok(_) => {
+                if json {
+                    println!("{}", diagnostic_json(path, true, None));
+                } else {
+                    println!("{path}: ok");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
+                let diag = rhp_diagnostic::code_diagnostic(
+                    code,
+                    help,
+                    path,
+                    &format!("erro de compilacao: {e}"),
+                );
+                Err(if json {
+                    diagnostic_json(path, false, Some(&diag))
+                } else {
+                    rhp_diagnostic::render(&diag, None)
+                })
+            }
+        },
+        Err(err) => Err(if json { err.json(path) } else { err.human() }),
+    }
+}
+
 /// Executa um arquivo `.rhp` com imports resolvidos.
 fn run_file(path: &str, output: &mut dyn Write) -> Result<(), String> {
     run_file_limited(path, output, None)
@@ -109,8 +251,16 @@ fn run_file_limited(
     output: &mut dyn Write,
     max_steps: Option<u64>,
 ) -> Result<(), String> {
-    let program = load_program(path)?;
-    run_program(&program, path, output, rhp_vm::VmLimits { max_steps })
+    let program = load_program(path).map_err(|e| e.human())?;
+    run_program(
+        &program,
+        path,
+        output,
+        rhp_vm::VmLimits {
+            max_steps,
+            ..Default::default()
+        },
+    )
 }
 
 /// Pipeline programa -> bytecode -> VM (erros com codigo estavel).
@@ -141,12 +291,14 @@ fn with_code(code: &str, help: Option<&str>, message: &str) -> String {
 }
 
 /// Lex + parse com diagnosticos estruturados (snippet da fonte).
-fn parse_with_diagnostics(origin: &str, source: &str) -> Result<Program, String> {
+fn parse_with_diagnostics(origin: &str, source: &str) -> Result<Program, LoadError> {
     let tokens = rhp_lexer::lex(source).map_err(|e| {
-        rhp_diagnostic::render(&rhp_diagnostic::lex_diagnostic(origin, &e), Some(source))
+        let diag = rhp_diagnostic::lex_diagnostic(origin, &e);
+        LoadError::rich(rhp_diagnostic::render(&diag, Some(source)), diag)
     })?;
     rhp_parser::parse(&tokens).map_err(|e| {
-        rhp_diagnostic::render(&rhp_diagnostic::parse_diagnostic(origin, &e), Some(source))
+        let diag = rhp_diagnostic::parse_diagnostic(origin, &e);
+        LoadError::rich(rhp_diagnostic::render(&diag, Some(source)), diag)
     })
 }
 
@@ -170,10 +322,10 @@ pub const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 /// arquivo de entrada; importar o mesmo arquivo varias vezes o inclui uma
 /// unica vez; ciclo, arquivo fora da arvore, arquivo grande demais e
 /// `import` fora do nivel superior sao erros.
-fn load_program(entry: &str) -> Result<Program, String> {
+fn load_program(entry: &str) -> Result<Program, LoadError> {
     let entry_path = Path::new(entry);
     let canonical_entry = std::fs::canonicalize(entry_path)
-        .map_err(|e| format!("modulo nao encontrado `{entry}`: {e}"))?;
+        .map_err(|e| LoadError::Plain(format!("modulo nao encontrado `{entry}`: {e}")))?;
     let root: PathBuf = canonical_entry
         .parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
@@ -196,15 +348,15 @@ fn load_file(
     visiting: &mut Vec<PathBuf>,
     visited: &mut HashSet<PathBuf>,
     out: &mut Vec<Stmt>,
-) -> Result<(), String> {
+) -> Result<(), LoadError> {
     let shown = path.display().to_string();
-    let canonical =
-        std::fs::canonicalize(path).map_err(|e| format!("modulo nao encontrado `{shown}`: {e}"))?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| LoadError::Plain(format!("modulo nao encontrado `{shown}`: {e}")))?;
     if !canonical.starts_with(root) {
-        return Err(format!(
+        return Err(LoadError::Plain(format!(
             "import fora da arvore do programa: `{shown}` (permitido apenas sob `{}`)",
             root.display()
-        ));
+        )));
     }
     if visited.contains(&canonical) {
         return Ok(());
@@ -212,19 +364,22 @@ fn load_file(
     if visiting.contains(&canonical) {
         let mut chain: Vec<String> = visiting.iter().map(|p| p.display().to_string()).collect();
         chain.push(canonical.display().to_string());
-        return Err(format!("importacao circular: {}", chain.join(" -> ")));
+        return Err(LoadError::Plain(format!(
+            "importacao circular: {}",
+            chain.join(" -> ")
+        )));
     }
     let size = std::fs::metadata(&canonical)
-        .map_err(|e| format!("nao foi possivel ler `{shown}`: {e}"))?
+        .map_err(|e| LoadError::Plain(format!("nao foi possivel ler `{shown}`: {e}")))?
         .len();
     if size > MAX_SOURCE_BYTES {
-        return Err(format!(
+        return Err(LoadError::Plain(format!(
             "arquivo muito grande `{shown}` ({size} bytes, limite {MAX_SOURCE_BYTES})"
-        ));
+        )));
     }
     visiting.push(canonical.clone());
     let source = std::fs::read_to_string(&canonical)
-        .map_err(|e| format!("nao foi possivel ler `{shown}`: {e}"))?;
+        .map_err(|e| LoadError::Plain(format!("nao foi possivel ler `{shown}`: {e}")))?;
     let origin = canonical.display().to_string();
     let program = parse_with_diagnostics(&origin, &source)?;
     let base_dir: PathBuf = canonical
@@ -245,7 +400,7 @@ fn load_file(
 }
 
 /// Coleta os `import`s do nivel superior; `import` aninhado e erro.
-fn collect_imports(statements: &[Stmt]) -> Result<Vec<String>, String> {
+fn collect_imports(statements: &[Stmt]) -> Result<Vec<String>, LoadError> {
     let mut imports = Vec::new();
     for stmt in statements {
         if let Stmt::Import(path) = stmt {
@@ -258,7 +413,7 @@ fn collect_imports(statements: &[Stmt]) -> Result<Vec<String>, String> {
 
 /// Rejeita `import` dentro de blocos/funcoes (a semantica seria icar o
 /// modulo para o topo, surpreendente e nao documentada).
-fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), String> {
+fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
     for stmt in statements {
         match stmt {
             Stmt::Import(_) => {}
@@ -283,12 +438,12 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), String> {
     Ok(())
 }
 
-fn check_block_imports(body: &[Stmt], context: &str) -> Result<(), String> {
+fn check_block_imports(body: &[Stmt], context: &str) -> Result<(), LoadError> {
     for stmt in body {
         if let Stmt::Import(path) = stmt {
-            return Err(format!(
+            return Err(LoadError::Plain(format!(
                 "import {context} nao suportado (`{path}`): use `import` apenas no nivel superior do arquivo"
-            ));
+            )));
         }
     }
     check_no_nested_imports(body)

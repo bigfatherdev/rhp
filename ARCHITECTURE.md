@@ -13,7 +13,8 @@ funcionalidade futura como pronta. Desenho: `ADRs/0001-marco-2.md` (nucleo),
 | `rhp-bytecode` | `Value` (+`Array`/`Map`), `Builtin` (10, ids 0–9), `CallBuiltin` etc., `compile()`, `validate()` recursivo | `rhp-parser` |
 | `rhp-vm` | Frames (limite 512), escopos + globais, builtins (+`http_get` std-only) | `rhp-bytecode` (+`rhp-parser` so em dev/testes) |
 | `rhp-fmt` | Formatador canonico idempotente (`format`, `format_source`) | `rhp-parser`, `rhp-lexer` |
-| `rhp-cli` | `rhp run` (com loader de modulos), `rhp fmt [--check]`, integracao | todos |
+| `rhp-cli` | `rhp run` (com loader de modulos), `rhp fmt [--check]`, `rhp check [--json]` (sem executar), integracao | todos |
+| `rhp-diagnostic` | `Diagnostic` + codigos `E0xxx`–`E3xxx` + `render()` (dado separado de apresentacao; base p/ LSP) | `rhp-lexer`, `rhp-parser` |
 
 Toolchain: Rust stable, edicao 2021.
 Dependencias externas: zero (auditoria: workspace + std; `cargo tree` sem
