@@ -357,10 +357,18 @@ pub(super) fn call_builtin(
         Builtin::DateStr => super::time::date_string(&args[0]),
         Builtin::DbOpen => match &args[0] {
             Value::Str(path) => {
-                let conn = super::sqlite::Connection::open(path).map_err(VmError::new)?;
+                let conn = if let Some(conninfo) = path.strip_prefix("pg:") {
+                    super::pg::Connection::connect(conninfo)
+                        .map(DbConn::Postgres)
+                        .map_err(VmError::new)?
+                } else {
+                    super::sqlite::Connection::open(path)
+                        .map(DbConn::Sqlite)
+                        .map_err(VmError::new)?
+                };
                 let handle = db.next;
                 db.next += 1;
-                db.conns.insert(handle, DbConn::Sqlite(conn));
+                db.conns.insert(handle, conn);
                 Ok(Value::Int(handle))
             }
             other => Err(VmError::new(format!(
@@ -378,6 +386,12 @@ pub(super) fn call_builtin(
                     .exec(&sql, &params)
                     .map(Value::Int)
                     .map_err(VmError::new),
+                DbConn::Postgres(conn) => {
+                    let pg_params = pg_params(&params)?;
+                    conn.exec(&sql, &pg_params)
+                        .map(Value::Int)
+                        .map_err(VmError::new)
+                }
             }
         }
         Builtin::DbQuery => {
@@ -416,12 +430,48 @@ pub(super) fn call_builtin(
                         )
                     })
                     .map_err(VmError::new),
+                DbConn::Postgres(conn) => {
+                    let pg_params = pg_params(&params)?;
+                    conn.query(&sql, &pg_params)
+                        .map(|rows| {
+                            Value::Array(
+                                rows.into_iter()
+                                    .map(|row| {
+                                        Value::Map(
+                                            row.into_iter()
+                                                .map(|(k, v)| {
+                                                    let value = match v {
+                                                        super::pg::PgValue::Int(n) => Value::Int(n),
+                                                        super::pg::PgValue::Float(n) => {
+                                                            Value::Float(n)
+                                                        }
+                                                        super::pg::PgValue::Bool(b) => {
+                                                            Value::Bool(b)
+                                                        }
+                                                        super::pg::PgValue::Text(s) => {
+                                                            Value::Str(s)
+                                                        }
+                                                        super::pg::PgValue::Null => Value::Null,
+                                                    };
+                                                    (k, value)
+                                                })
+                                                .collect(),
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .map_err(VmError::new)
+                }
             }
         }
         Builtin::DbClose => {
             let handle = db_handle(&args[0])?;
             match db.conns.remove(&handle) {
-                Some(_) => Ok(Value::Null),
+                Some(DbConn::Sqlite(_)) => Ok(Value::Null),
+                Some(DbConn::Postgres(conn)) => {
+                    conn.close().map(|()| Value::Null).map_err(VmError::new)
+                }
                 None => Err(VmError::new(format!(
                     "`db_close`: handle {handle} invalido ou ja fechado"
                 ))),
@@ -923,10 +973,24 @@ fn db_params(value: &Value) -> Result<Vec<super::sqlite::SqlValue>, VmError> {
 }
 
 /// Conexao aberta pelo handle (fechado/inexistente = erro).
-fn db_conn(db: &DbHandles, handle: i64) -> Result<&DbConn, VmError> {
+fn db_conn(db: &mut DbHandles, handle: i64) -> Result<&mut DbConn, VmError> {
     db.conns
-        .get(&handle)
+        .get_mut(&handle)
         .ok_or_else(|| VmError::new(format!("`db`: handle {handle} invalido ou ja fechado")))
+}
+
+/// Converte params RHP para parametros PG (texto; `?` nao existe no PG,
+/// use `$1`, `$2`... no SQL).
+fn pg_params(params: &[super::sqlite::SqlValue]) -> Result<Vec<super::pg::PgParam>, VmError> {
+    params
+        .iter()
+        .map(|p| match p {
+            super::sqlite::SqlValue::Int(n) => Ok(super::pg::PgParam::Text(n.to_string())),
+            super::sqlite::SqlValue::Float(n) => Ok(super::pg::PgParam::Text(n.to_string())),
+            super::sqlite::SqlValue::Text(s) => Ok(super::pg::PgParam::Text(s.clone())),
+            super::sqlite::SqlValue::Null => Ok(super::pg::PgParam::Null),
+        })
+        .collect()
 }
 
 /// Cliente HTTP minimo (somente `http://`), sem dependencias externas.

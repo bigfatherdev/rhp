@@ -192,6 +192,41 @@ fn rhp_run_sqlite_end_to_end() {
 }
 
 #[test]
+fn rhp_run_postgres_end_to_end() {
+    // Exige o servidor de teste: `docker run -d --name rhp-pg-test
+    // -e POSTGRES_USER=rhp -e POSTGRES_PASSWORD=rhp -e POSTGRES_DB=rhp
+    // -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:55432:5432
+    // postgres:16-alpine` (ver ADR 0011; sem mock, so servidor real).
+    let pg = "pg:host=127.0.0.1 port=55432 user=rhp dbname=rhp";
+    let output = run_temp_source(
+        "pg.rhp",
+        &format!(
+            "let h = db_open(\"{pg}\");\necho db_exec(h, \"DROP TABLE IF EXISTS t\", []);\necho db_exec(h, \"CREATE TABLE t (id integer, nome text, ativo boolean, preco double precision)\", []);\necho db_exec(h, \"INSERT INTO t VALUES ($1, $2, $3, $4)\", [1, \"ana\", true, 2.5]);\necho db_query(h, \"SELECT id, nome, ativo, preco FROM t WHERE id = $1\", [1]);\necho db_close(h);\n"
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "postgres falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"0\n0\n1\n[{ativo: true, id: 1, nome: ana, preco: 2.5}]\nnull\n"
+    );
+    // SQL invalido: erro do servidor com codigo.
+    let output = run_temp_source(
+        "pg_ruim.rhp",
+        &format!("let h = db_open(\"{pg}\");\necho db_exec(h, \"SELEC 1\", []);\n"),
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("[42601]"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn rhp_run_time_builtins() {
     let output = run_temp_source(
         "hora.rhp",

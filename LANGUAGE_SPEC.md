@@ -215,9 +215,9 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `json_stringify(valor)` | Valor => texto JSON canonico (chaves ordenadas, sem espacos; `2.0` para floats inteiros). `NaN`/infinito e `Func` = erro. Teto de 128 niveis. |
 | `http_get(url)` | (Fase 6) GET `http://host[:porta]/caminho` com timeouts de 5s (conexao/leitura; DNS usa o resolvedor do sistema, sem timeout proprio), teto de corpo de 1 MiB, so 2xx e corpo UTF-8; resto = erro. Somente esquema `http://`. Sem redirects (use `http_fetch`). |
 | `http_fetch(url, opts)` | (Fase A5) GET com `opts` (tudo opcional): `seguir` (bool, padrao sim), `max_redirecionamentos` (0-10, padrao 5), `timeout` (segundos 0-60, padrao 5), `headers` (mapa `Str`->`Str`), `metodo` (so `GET`). Devolve mapa `{status: Int, cabecalhos: Mapa (chaves minusculas), corpo: Str}` — status final mesmo fora de 2xx. Redirects 301/302/303/307/308 com `Location` (absoluta, raiz ou relativa); `https` = erro (sem TLS nesta fase). Erro em transporte, timeout, teto 1 MiB, limite de redirects, opcao invalida. |
-| `db_open(caminho)` | (Fase B) Abre/cria SQLite; devolve handle `Int`. Caminhos relativos resolvem no diretorio atual; roda com as permissoes do usuario. |
-| `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); `?` posicionais (`params` array; `[]` sem params); devolve linhas afetadas (`Int`). Linhas de SELECT sao descartadas (use `db_query`). |
-| `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna => valor (`Int`/`Float`/`Str`/`null`; BLOB = erro, RHP nao tem bytes). |
+| `db_open(caminho)` | (Fase B) Abre/cria SQLite; devolve handle `Int`. Caminhos relativos resolvem no diretorio atual; roda com as permissoes do usuario. `db_open("pg:host=.. port=.. user=.. dbname=..")` conecta no PostgreSQL (auth `trust`; padroes host 127.0.0.1/porta 5432/user `postgres`/dbname = user). |
+| `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); placeholders `?` (SQLite) ou `$1` (PG), `params` array (`[]` sem params); devolve linhas afetadas (`Int`). Linhas de SELECT sao descartadas (use `db_query`). |
+| `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna => valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB = erro no SQLite; tipos PG mapeados por OID, resto vira `Str`). |
 | `db_close(h)` | Fecha o handle (reuso = erro); devolve `null`. Fim do programa fecha o resto. |
 
 Exemplo:

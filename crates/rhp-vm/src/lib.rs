@@ -15,6 +15,7 @@ use builtins::call_builtin;
 pub use builtins::MAX_HTTP_BODY;
 
 mod json;
+mod pg;
 mod sqlite;
 mod time;
 
@@ -128,6 +129,7 @@ struct DbHandles {
 #[derive(Debug)]
 enum DbConn {
     Sqlite(sqlite::Connection),
+    Postgres(pg::Connection),
 }
 
 impl Vm {
@@ -1620,6 +1622,19 @@ mod tests {
         let start = Instant::now();
         assert_eq!(run_src("echo sleep(0);").expect("ok"), "null\n");
         assert!(start.elapsed().as_secs() < 5, "sleep(0) demorou demais");
+    }
+
+    #[test]
+    fn rejects_bad_pg_conninfo() {
+        // Sem servidor: formato invalido, porta invalida, recusa rapida.
+        for bad in [
+            "echo db_open(\"pg:no-equals\");",
+            "echo db_open(\"pg:port=abc\");",
+            "echo db_open(\"pg:host=127.0.0.1 port=1 user=rhp dbname=rhp\");",
+        ] {
+            let err = run_err(bad);
+            assert!(err.contains("`db`"), "obteve: {err} em {bad}");
+        }
     }
 
     #[test]
