@@ -373,6 +373,20 @@ impl std::error::Error for CompileError {}
 struct Compiler {
     chunk: Chunk,
     in_function: bool,
+    names: std::collections::HashMap<String, u32>,
+    constants: std::collections::HashMap<ConstKey, u32>,
+}
+
+/// Chave de deduplicacao de constantes (somente escalares; `Float` por bits
+/// para `NaN`s distintos nao colidirem). `Array`/`Map`/`Func` nao entram
+/// (custo de comparacao profunda sem beneficio tipico).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ConstKey {
+    Int(i64),
+    Float(u64),
+    Str(String),
+    Bool(bool),
+    Null,
 }
 
 impl Compiler {
@@ -380,26 +394,52 @@ impl Compiler {
         Self {
             chunk: Chunk::new(),
             in_function,
+            names: std::collections::HashMap::new(),
+            constants: std::collections::HashMap::new(),
+        }
+    }
+
+    fn const_key(value: &Value) -> Option<ConstKey> {
+        match value {
+            Value::Int(v) => Some(ConstKey::Int(*v)),
+            Value::Float(v) => Some(ConstKey::Float(v.to_bits())),
+            Value::Str(s) => Some(ConstKey::Str(s.clone())),
+            Value::Bool(b) => Some(ConstKey::Bool(*b)),
+            Value::Null => Some(ConstKey::Null),
+            // Compostos e funcoes: sem dedup (comparacao profunda cara,
+            // beneficio atipico).
+            Value::Array(_) | Value::Map(_) | Value::Func(_) => None,
         }
     }
 
     fn add_constant(&mut self, value: Value) -> Result<u32, CompileError> {
+        if let Some(key) = Self::const_key(&value) {
+            if let Some(&idx) = self.constants.get(&key) {
+                return Ok(idx);
+            }
+        }
         if self.chunk.constants.len() >= u32::MAX as usize {
             return Err(CompileError::new("limite de constantes excedido"));
         }
-        self.chunk.constants.push(value);
-        Ok((self.chunk.constants.len() - 1) as u32)
+        self.chunk.constants.push(value.clone());
+        let idx = (self.chunk.constants.len() - 1) as u32;
+        if let Some(key) = Self::const_key(&value) {
+            self.constants.insert(key, idx);
+        }
+        Ok(idx)
     }
 
     fn intern_name(&mut self, name: &str) -> Result<u32, CompileError> {
-        if let Some(idx) = self.chunk.names.iter().position(|n| n == name) {
-            return Ok(idx as u32);
+        if let Some(&idx) = self.names.get(name) {
+            return Ok(idx);
         }
         if self.chunk.names.len() >= u32::MAX as usize {
             return Err(CompileError::new("limite de nomes excedido"));
         }
         self.chunk.names.push(name.to_string());
-        Ok((self.chunk.names.len() - 1) as u32)
+        let idx = (self.chunk.names.len() - 1) as u32;
+        self.names.insert(name.to_string(), idx);
+        Ok(idx)
     }
 
     fn emit(&mut self, op: Op) -> usize {
@@ -831,6 +871,14 @@ mod tests {
         };
         let err = chunk.validate().expect_err("deve falhar");
         assert!(err.message.contains("salto"));
+    }
+
+    #[test]
+    fn deduplicates_repeated_constants() {
+        let program = parse_source(&"echo 1;\n".repeat(2000)).expect("parse deve passar");
+        let chunk = compile(&program).expect("compile deve passar");
+        assert_eq!(chunk.constants, vec![Value::Int(1)]);
+        assert_eq!(chunk.names.len(), 0);
     }
 
     #[test]

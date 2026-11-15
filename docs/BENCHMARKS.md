@@ -29,6 +29,14 @@ Maquina: AMD EPYC (6 vCPU, ambiente compartilhado), Linux,
 | run `while` 200k iteracoes | 3 | 1112,751 ms | 370,917 ms |
 | run `push` 20k em loop | 3 | 31397,513 ms | 10465,838 ms |
 
+> Nota CP3 (2026-11-14): apos dedup de constantes no `compile`, nova medicao
+> do mesmo harness: `compile 5000 stmts` ~13,5 ms (antes ~10,2 ms) em CPU
+> compartilhada com alta variancia entre runs (ex.: `lex` 1,0→4,3 ms).
+> O pool do fixture caiu de 15003 para 5 entradas (deterministico).
+> Decisao: manter o dedup (chunk menor e previsivel; custo de hash pequeno
+> e constante) e nao otimizar alem disso sem novo protocolo — ver
+> `reports/MEMORY_MODEL.md`.
+
 ## Leitura dos gargalos (analise, sem mudanca de codigo)
 
 1. **`push` em loop e O(n²) por construcao**: cada `push` clona o array

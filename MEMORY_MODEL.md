@@ -1,18 +1,37 @@
-# MEMORY_MODEL.md — Modelo de memoria (Fase 1)
+# MEMORY_MODEL.md — Modelo de memoria do RHP
 
-Estrutura reservada. Decisao sobre ownership, GC/contagem de referencias e
-limites fica para ADR na Fase 2 (conforme prompt §4 e governanca §10).
+Estado real (revisado na missao Next Generation; antes era o stub da Fase 1).
+Decisao arquitetural e alternativas em `reports/MEMORY_MODEL.md` (+ ADR 0002).
 
-## A definir
+## Modelo vigente: valores por copia, sem compartilhamento
 
-- Ownership e aliasing de valores.
-- Referencias e ciclos.
-- Finalizacao/destrutores (se existirem).
-- Coleta (GC) ou contagem de referencias.
+- `Value::{Null, Bool, Int, Float, Str, Array(Vec<Value>),
+  Map(HashMap<String, Value>), Func(Rc<FuncDef>)}`; tudo `Clone`.
+- **Semantica por valor**: atribuicao, passagem de argumentos, retorno e
+  `push` copiam integralmente o valor. Nao ha aliasing observavel:
+  mutar via uma variavel nunca afeta outra (inclui `a[i] = v`, atomico).
+- **Sem coleta**: nao ha GC nem contagem de referencias sobre valores
+  (o unico `Rc` interno e para definicoes de funcao, imutaveis e
+  compartilhadas por leitura). Sem ciclos possiveis, sem finalizadores.
+- **Onde vivem os valores**: pool de constantes do chunk (deduplicado para
+  escalares no `compile`), pilha de operandos por frame, escopos lexicos
+  (`HashMap` por bloco) e mapa de globais. Frames sao descartados no
+  `return`/`Halt`, liberando seus valores (sem `Drop` customizado).
+- **Custos assumidos**: copias O(n) por `push`/atribuicao de compostos
+  (documentado; mudar isso e mudanca semantica e exige RFC). `VmLimits`
+  (`max_steps`) e tetos de HTTP/fonte/profundidade limitam crescimento
+  patologico; sem teto geral de heap (ver `SECURITY.md`).
+
+## Fora do modelo (nao prometido)
+
+Ownership estatico, borrow checker da linguagem, threads/async, limites de
+memoria medidos em bytes, compactacao, weak refs. Ver "A definir" abaixo
+para o que ainda exige RFC.
+
+## A definir (requer RFC antes de implementar)
+
+- Compartilhamento interno (CoW/`Rc`) ou arena para ativacoes.
+- Internacao de strings em runtime.
 - Concorrencia e excecoes/unwinding.
-- Limites de heap/stack.
-- Compatibilidade entre versoes.
-
-Estado da Fase 1 (sem modelo definitivo): valores `Clone` em `Vec`
-(pool + pilha), sem compartilhamento nem coleta; apenas `Str` alocado.
-Nenhum comportamento de memoria alem disso e prometido.
+- Limites de heap/stack medidos.
+- Compatibilidade de bytecode persistido (hoje nao serializado).
