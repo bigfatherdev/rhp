@@ -33,6 +33,15 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   Registro: `changes/2026-11-14-bench-baseline.md`.
 - Documentação: README reestruturado, `docs/`, `CONTRIBUTING.md`, `SECURITY.md`.
   Registro: `changes/2026-11-14-docs-checkpoint2.md`.
+- Stdlib lote 2: 19 builtins (strings, matemática, mapas; ids 10–29).
+  Registro: `changes/2026-11-15-feat-stdlib-lote2.md`.
+- I/O e ambiente: `fs_read/fs_write/fs_append/fs_exists`, `argv()`, `env()`;
+  `rhp run` repassa args extras.
+  Registro: `changes/2026-11-15-feat-io-env.md`.
+- `rhp test` (descoberta `*_test.rhp`) e `rhp doctor` (versão + autoteste).
+  Registro: `changes/2026-11-15-feat-cli-test-doctor.md`.
+- Sintaxe lote 2: bitwise, ternário, `??`, `break`/`continue`, `const`.
+  Registro: `changes/2026-11-15-feat-sintaxe-lote2.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).
