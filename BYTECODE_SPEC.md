@@ -46,7 +46,11 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 | `Index` | `pop` indice e base; empilha `base[indice]` (regras §3). |
 | `StoreIndex(n)` | `pop` valor e indice; grava em `names[n][indice]`. |
 | `IterList` | `pop` iteravel; empilha lista de iteracao (`Array` = copia; `Mapa` = chaves `Str` ordenadas; resto = erro). |
-| `CallBuiltin(id)` | Executa builtin de id 0–39 com aridade fixa (tabela §4). |
+| `TryBegin(t)` | Registra handler (`t` = `catch` ou `finally`+`Rethrow`). |
+| `TryEnd` | Remove o handler (caminho normal). Sem handler = erro. |
+| `Throw` | Desempilha valor e inicia unwinding (frame atual para a base). |
+| `Rethrow` | Relanca o erro em propagacao (fim de `finally` sem `catch`). |
+| `CallBuiltin(id)` | Executa builtin de id 0–43 com aridade fixa (tabela §4). |
 
 ## 3. Compilacao (Marco 2 + Fases 3–4)
 
@@ -68,8 +72,14 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
   incremento + `Jump->rotulo` + saidas. `break` fecha corpo + laco e salta
   a saida (que fecha o escopo do laco); `continue` salta ao incremento.
   Nomes ocultos contem NUL (irrepresentaveis no fonte; sem colisao).
+- `try B (catch V? C)? (finally F)?` = `TryBegin->alvo` + escopo + `B` +
+  `ExitScope` + `TryEnd` + `F` (normal) + `Jump->fim`; alvo: `catch`
+  (escopo + vinculo de `V`/descarte + `C` + `F`) ou, sem `catch`,
+  `F` + `Rethrow`. `finally` duplicado por caminho (neutro na pilha).
 - `break`/`continue` = desenrolha escopos ate a base do laco + `Jump`
   (saida/inicio ou incremento); fora de laco = erro de compilacao. `return` fora de funcao = erro.
+  Cruzando `try` com `finally`, `break`/`continue`/`return` emitem antes
+  `TryEnd` + copia do `finally` (do mais interno para fora).
 - Ternario = cond + `JumpIfFalse->else` + ramo + `Jump->fim` + ramo-senão.
 - `a ?? b` = `a` + `Dup` + `JumpIfNotNull->fim` + `Pop` + `b` (avalia uma vez).
 - `fn` = corpo compilado em `Compiler` aninhado + epilogo
@@ -85,7 +95,8 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 15 Trim 16 Upper 17 Lower 18 Replace 19 Abs 20 Min 21 Max 22 Sqrt
 23 Pow 24 Floor 25 Ceil 26 Values 27 Entries 28 Merge 29 Has
 30 FsRead 31 FsWrite 32 FsAppend 33 FsExists 34 Argv 35 Env
-36 Sort 37 Exit 38 JsonParse 39 JsonStringify`
+36 Sort 37 Exit 38 JsonParse 39 JsonStringify
+40 Now 41 Sleep 42 DateStr 43 HttpFetch`
 (aridades na tabela §6 de `LANGUAGE_SPEC.md`). Ids desconhecidos invalidam
 o chunk; `BuiltinId` tem teste anti-deriva.
 
@@ -93,11 +104,13 @@ o chunk; `BuiltinId` tem teste anti-deriva.
 
 `Chunk::validate()`: codigo nao vazio, ultimo op `Halt`, `Constant`/
 `LoadName`/`StoreName`/`DeclareName`/`StoreIndex` dentro dos pools,
-`DefineFunc` existente, `Jump`/`JumpIfFalse`/`JumpIfNotNull` com alvo
-`< code.len()`, `CallBuiltin` com id conhecido, constantes dentro da profundidade maxima e,
+`DefineFunc` existente, `Jump`/`JumpIfFalse`/`JumpIfNotNull`/`TryBegin`
+com alvo `< code.len()`, `CallBuiltin` com id conhecido, constantes dentro da profundidade maxima e,
 por fim, **analise estatica de altura de pilha**: cada posicao alcancavel
 tem altura deterministica; underflow estatico e juncao com alturas
-divergentes sao erro. Codigo inalancavel apos `Return`/`Jump` e ignorado
+divergentes sao erro. Alvo de `TryBegin` entra com altura do ponto + 1
+(so o valor do erro); `Throw`/`Rethrow` terminam o caminho. Codigo
+inalancavel apos `Return`/`Jump`/`Throw`/`Rethrow` e ignorado
 pelo fluxo (mas segue sujeito as checagens estruturais). Recursao nos corpos
 de `fn` (contexto nomeado na mensagem). A VM nunca executa chunk invalido,
 nem parcialmente.

@@ -34,11 +34,11 @@
     },
     "keyword": {
       "name": "keyword.control.rhp",
-      "match": "\\b(echo|let|const|if|else|while|for|break|continue|fn|return|import|true|false|null)\\b"
+      "match": "\\b(echo|let|const|if|else|while|for|try|catch|finally|throw|export|break|continue|fn|return|import|true|false|null)\\b"
     },
     "builtin": {
       "name": "support.function.builtin.rhp",
-      "match": "\\b(len|push|pop|keys|str|int|float|type|assert|http_get|contains|starts_with|ends_with|split|join|trim|upper|lower|replace|abs|min|max|sqrt|pow|floor|ceil|values|entries|merge|has|fs_read|fs_write|fs_append|fs_exists|argv|env|sort|exit|json_parse|json_stringify)\\b"
+      "match": "\\b(len|push|pop|keys|str|int|float|type|assert|http_get|http_fetch|contains|starts_with|ends_with|split|join|trim|upper|lower|replace|abs|min|max|sqrt|pow|floor|ceil|values|entries|merge|has|fs_read|fs_write|fs_append|fs_exists|argv|env|sort|exit|json_parse|json_stringify|now|sleep|date_str)\\b"
     },
     "number": {
       "name": "constant.numeric.rhp",

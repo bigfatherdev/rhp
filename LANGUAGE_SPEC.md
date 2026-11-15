@@ -12,15 +12,26 @@ Block   := "{" Stmt* "}"
 
 - Arquivo fonte: texto UTF-8. Comentarios de linha `//` ate o fim da linha.
 - Programa vazio e valido (sem saida).
-- **Modulos (Fase 4):** `import "caminho.rhp";` (caminho relativo ao arquivo
-  que importa). Resolucao em profundidade: cada modulo executa uma vez, antes
-  do importador; mesmo arquivo importado N vezes entra uma vez; ciclo
-  (`a -> b -> a`) e arquivo ausente sao erros. Namespace global unico:
-  redefinir no mesmo escopo (inclusive entre modulos) e erro em runtime.
+- **Modulos (Fases 4 e A3):** `import "caminho.rhp";` (caminho relativo
+  ao arquivo que importa). Resolucao em profundidade: cada modulo executa
+  uma vez, antes do importador; mesmo arquivo importado N vezes entra uma
+  vez; ciclo (`a -> b -> a`) e arquivo ausente sao erros.
+  - `export fn f` / `export let x` / `export const N` (opt-in, nivel
+    superior): o nome e publico; sem `export` = privado ao modulo.
+  - `import { a, b as c } from "m.rhp";` importa SO nomes exportados
+    (outros = erro "`x` nao e exportado"); `b as c` vincula com alias.
+    `from`/`as` sao contextuais (identificadores comuns fora do `import`).
+  - `import "m.rhp"` (bare) mantem a semantica legada: vincula todos os
+    nomes de topo (publicos e privados).
+  - Colisao: so entre nomes visiveis vinculados (erro alto, como antes).
+    Modulos distintos nao colidem entre si (isolamento por renomeacao
+    interna; programas legados sem colisao comportam-se igual).
 
 ```rhp
 import "mat.rhp";
 echo dobro(21); // 42
+import { dobro as d } from "mat.rhp";
+echo d(1); // 2 (privados de mat.rhp seguem invisiveis)
 ```
 
 Regras de modulos: caminhos relativos ao arquivo que importa, **confinados
@@ -39,8 +50,8 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 
 ```text
 Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt
-           | ForStmt | BreakStmt | ContinueStmt | FnDef | ReturnStmt | Block
-           | ImportStmt | ExprStmt
+           | ForStmt | TryStmt | ThrowStmt | BreakStmt | ContinueStmt | FnDef
+           | ReturnStmt | Block | ImportStmt | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
 ConstStmt  := "const" Ident "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
@@ -49,6 +60,9 @@ EchoStmt   := "echo" Expr ";"
 IfStmt     := "if" Expr Block ("else" Block)?
 WhileStmt  := "while" Expr Block
 ForStmt    := "for" Ident "in" Expr Block
+TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
+           // ao menos um de `catch`/`finally` e obrigatorio
+ThrowStmt  := "throw" Expr ";"
 BreakStmt  := "break" ";"
 ContinueStmt := "continue" ";"
 FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
@@ -74,6 +88,15 @@ ExprStmt   := Expr ";"
   elemento. `in` e contextual (identificador comum fora do `for`), mas
   `for` e palavra reservada. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
+- `try B (catch V? C)? (finally F)?` (ao menos um dos dois): erro em `B`
+  (incluindo `throw`, `assert` falho, builtin com erro) procura o `catch`
+  mais interno na mesma funcao; sem handler, desenrola chamadas (rodando
+  `finally`s) e falha como hoje. `V` recebe o erro: mapa
+  `{tipo: "runtime", mensagem: "..."}` para erros internos, ou o valor de
+  `throw`. `F` roda sempre (normal, `catch`, erro propagado, `return`/
+  `break`/`continue` que cruzem o `try`); `return`/`throw` em `F`
+  substituem o fluxo. `exit()` nao aciona `finally`. `try` sem `catch`
+  nem `finally` e erro de parse.
 - `const NOME = expr;` declara como `let`, mas imutavel: atribuir depois
   (inclusive `NOME[i] = v`) e erro de compilacao.
 - `fn nome(params) { ... }` declara funcao no escopo atual. Chamada
@@ -185,9 +208,13 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `env(nome)` | Valor da variavel de ambiente ou `null` se ausente. |
 | `sort(arr)` | Copia ordenada (estavel): numeros (`Int`/`Float`, mistos comparam exato quando possivel), `Str` (ordem lexicografica de bytes UTF-8) ou `Bool` (`false` < `true`); vazio => vazio. Mistura com outros tipos ou nao-array = erro. Nao muta o original (`a = sort(a);`). |
 | `exit(codigo)` | Encerra o programa com codigo 0-255 (fora disso ou nao-`Int` = erro). Desenrola chamadas; em `rhp test`, conta como falha do arquivo. |
+| `now()` | Segundos desde 1970-01-01T00:00:00Z (`Int`; relogio do sistema). |
+| `sleep(s)` | Bloqueia `s` segundos (`Int`/`Float`; fracao = sub-segundo). Negativo, nao-finito ou > 3600 = erro. Devolve `null`. VM single-thread: tudo para junto. |
+| `date_str(ts)` | Epoch `Int` => `"AAAA-MM-DDTHH:MM:SSZ"` (UTC, sempre; sem timezones). |
 | `json_parse(texto)` | Texto JSON => valor (`null`/`Bool`/`Int` se inteiro em `i64` senao `Float`/`Str`/`Array`/`Mapa`). Gramatica estrita; erro com posicao (byte). Objetos: primeira chave vence (regra dos literais). Teto de 128 niveis. |
 | `json_stringify(valor)` | Valor => texto JSON canonico (chaves ordenadas, sem espacos; `2.0` para floats inteiros). `NaN`/infinito e `Func` = erro. Teto de 128 niveis. |
-| `http_get(url)` | (Fase 6) GET `http://host[:porta]/caminho` com timeouts de 5s (conexao/leitura; DNS usa o resolvedor do sistema, sem timeout proprio), teto de corpo de 1 MiB, so 2xx e corpo UTF-8; resto = erro. Somente esquema `http://`. |
+| `http_get(url)` | (Fase 6) GET `http://host[:porta]/caminho` com timeouts de 5s (conexao/leitura; DNS usa o resolvedor do sistema, sem timeout proprio), teto de corpo de 1 MiB, so 2xx e corpo UTF-8; resto = erro. Somente esquema `http://`. Sem redirects (use `http_fetch`). |
+| `http_fetch(url, opts)` | (Fase A5) GET com `opts` (tudo opcional): `seguir` (bool, padrao sim), `max_redirecionamentos` (0-10, padrao 5), `timeout` (segundos 0-60, padrao 5), `headers` (mapa `Str`->`Str`), `metodo` (so `GET`). Devolve mapa `{status: Int, cabecalhos: Mapa (chaves minusculas), corpo: Str}` — status final mesmo fora de 2xx. Redirects 301/302/303/307/308 com `Location` (absoluta, raiz ou relativa); `https` = erro (sem TLS nesta fase). Erro em transporte, timeout, teto 1 MiB, limite de redirects, opcao invalida. |
 
 Exemplo:
 
@@ -196,6 +223,13 @@ let a = [1, 2];
 a = push(a, 3);
 echo len(a);      // 3
 echo keys({b: 1, a: 2}); // [a, b]
+try {
+  echo json_parse("{oops}");
+} catch e {
+  echo e["mensagem"];   // detalhe do erro, sem abortar
+} finally {
+  echo "fim";
+}
 ```
 
 ## 7. Erros (lex com linha:coluna base 1; runtime com mensagem)
@@ -214,6 +248,8 @@ Exemplos invalidos:
 - `if 1 { }` (runtime: condicao deve ser bool).
 - `echo [1][5];` (runtime: indice fora do intervalo).
 - `echo {}["x"];` (runtime: chave inexistente).
+- `try { echo 1; }` sem `catch`/`finally` (parse: "`try` exige ao menos").
+- `throw "boom";` sem `try` (runtime: `excecao nao capturada: boom`).
 - `import "a.rhp"; import "a.rhp";` com `a.rhp` importando de volta
   (erro: importacao circular).
 

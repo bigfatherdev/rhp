@@ -142,6 +142,223 @@ fn rhp_run_json_roundtrip() {
 }
 
 #[test]
+fn rhp_run_try_catch_finally() {
+    let output = run_temp_source(
+        "try.rhp",
+        "try {\n  throw \"boom\";\n} catch e {\n  echo e;\n} finally {\n  echo \"fim\";\n}\ntry {\n  echo json_parse(\"{oops}\");\n} catch e {\n  echo e[\"tipo\"];\n}\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"boom\nfim\nruntime\n");
+    // Sem handler: exit 1 com a mensagem original.
+    let uncaught = run_temp_source("try_ruim.rhp", "throw \"x\";\n");
+    assert!(!uncaught.status.success());
+    assert!(
+        String::from_utf8_lossy(&uncaught.stderr).contains("excecao nao capturada: x"),
+        "stderr={}",
+        String::from_utf8_lossy(&uncaught.stderr)
+    );
+    // `exit` dentro de `try` pula `finally` e sai com o codigo.
+    let said = run_temp_source(
+        "try_sai.rhp",
+        "try {\n  echo \"antes\";\n  exit(3);\n} finally {\n  echo \"fim\";\n}\n",
+    );
+    assert_eq!(said.status.code(), Some(3));
+    assert_eq!(said.stdout, b"antes\n");
+}
+
+#[test]
+fn rhp_run_time_builtins() {
+    let output = run_temp_source(
+        "hora.rhp",
+        "echo date_str(0);\necho type(now());\necho sleep(0);\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1970-01-01T00:00:00Z\nint\nnull\n");
+}
+
+#[test]
+fn rhp_run_http_fetch_follows_redirects() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local deve passar");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        // 3 requisicoes sequenciais: /inicio -> /meio -> URL absoluta /fim.
+        for (path, target, status) in [
+            ("/inicio", "/meio", "302 Found"),
+            (
+                "/meio",
+                &format!("http://127.0.0.1:{port}/fim"),
+                "302 Found",
+            ),
+            ("/fim", "", "200 OK"),
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept deve passar");
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request);
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(
+                request_text.contains(&format!("GET {path} ")),
+                "pedido inesperado: {request_text}"
+            );
+            let (extra, body): (String, &str) = if target.is_empty() {
+                ("X-Test: ok\r\n".to_string(), "chegou")
+            } else {
+                (format!("Location: {target}\r\n"), "")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        }
+    });
+    let output = run_temp_source(
+        "fetch.rhp",
+        &format!(
+            "let r = http_fetch(\"http://127.0.0.1:{port}/inicio\", {{}});\necho r[\"status\"];\necho r[\"corpo\"];\necho r[\"cabecalhos\"][\"x-test\"];\n"
+        ),
+    );
+    server.join().expect("servidor deve terminar");
+    assert!(
+        output.status.success(),
+        "fetch falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"200\nchegou\nok\n");
+}
+
+#[test]
+fn rhp_run_http_fetch_sends_headers_and_stops() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // Ecoa o cabecalho X-Eco no corpo (prova que o custom header chegou).
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local deve passar");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept deve passar");
+        let mut request = vec![0u8; 4096];
+        let n = stream.read(&mut request).expect("read deve passar");
+        let request_text = String::from_utf8_lossy(&request[..n]).into_owned();
+        let echo = request_text
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("x-eco:"))
+            .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+            .unwrap_or_default();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{echo}",
+            echo.len()
+        );
+        stream.write_all(response.as_bytes()).expect("write");
+    });
+    let output = run_temp_source(
+        "fetch_h.rhp",
+        &format!(
+            "let r = http_fetch(\"http://127.0.0.1:{port}/x\", {{\"headers\": {{\"X-Eco\": \"ping\"}}}});\necho r[\"corpo\"];\necho r[\"status\"];\n"
+        ),
+    );
+    server.join().expect("servidor deve terminar");
+    assert!(
+        output.status.success(),
+        "fetch falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ping\n200\n");
+
+    // `seguir: false` devolve o 302 sem seguir.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local deve passar");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept deve passar");
+        let mut request = vec![0u8; 1024];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.1 302 Found\r\nLocation: /alvo\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("write");
+    });
+    let output = run_temp_source(
+        "fetch_nf.rhp",
+        &format!(
+            "let r = http_fetch(\"http://127.0.0.1:{port}/a\", {{\"seguir\": false}});\necho r[\"status\"];\necho r[\"cabecalhos\"][\"location\"];\n"
+        ),
+    );
+    server.join().expect("servidor deve terminar");
+    assert!(
+        output.status.success(),
+        "fetch falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"302\n/alvo\n");
+}
+
+#[test]
+fn rhp_run_http_fetch_enforces_limits() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // Loop de redirects: cliente desiste apos `max_redirecionamentos`.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local deve passar");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        for target in ["/b", "/a", "/b"] {
+            let (mut stream, _) = listener.accept().expect("accept deve passar");
+            let mut request = vec![0u8; 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        }
+    });
+    let output = run_temp_source(
+        "fetch_loop.rhp",
+        &format!(
+            "echo http_fetch(\"http://127.0.0.1:{port}/a\", {{\"max_redirecionamentos\": 2}});\n"
+        ),
+    );
+    server.join().expect("servidor deve terminar");
+    assert!(!output.status.success(), "loop deveria falhar");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("redirecionamentos excedidos"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Timeout por requisicao: servidor lento, teto curto.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local deve passar");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept deve passar");
+        let mut request = vec![0u8; 1024];
+        let _ = stream.read(&mut request);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    });
+    let output = run_temp_source(
+        "fetch_tempo.rhp",
+        &format!("echo http_fetch(\"http://127.0.0.1:{port}/lento\", {{\"timeout\": 1}});\n"),
+    );
+    server.join().expect("servidor deve terminar");
+    assert!(!output.status.success(), "timeout deveria falhar");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("falhou"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn rhp_run_exit_codes() {
     // `exit(3)`: stdout anterior preservado + codigo 3, sem mensagem de erro.
     let output = run_temp_source("sai3.rhp", "echo \"antes\";\nexit(3);\necho \"depois\";\n");
@@ -389,8 +606,8 @@ fn vscode_grammar_covers_language() {
     let text = std::fs::read_to_string(&grammar).expect("nao foi possivel ler gramatica");
     assert!(text.contains("\"scopeName\": \"source.rhp\""));
     for keyword in [
-        "echo", "let", "const", "if", "else", "while", "for", "break", "continue", "fn", "return",
-        "import", "true", "false", "null",
+        "echo", "let", "const", "if", "else", "while", "for", "try", "catch", "finally", "throw",
+        "export", "break", "continue", "fn", "return", "import", "true", "false", "null",
     ] {
         assert!(
             text.contains(keyword),
@@ -408,6 +625,7 @@ fn vscode_grammar_covers_language() {
         "type",
         "assert",
         "http_get",
+        "http_fetch",
         "contains",
         "starts_with",
         "ends_with",
@@ -438,6 +656,9 @@ fn vscode_grammar_covers_language() {
         "exit",
         "json_parse",
         "json_stringify",
+        "now",
+        "sleep",
+        "date_str",
     ] {
         assert!(
             text.contains(builtin),

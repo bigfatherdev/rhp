@@ -35,8 +35,12 @@
   CLI: `rhp run --max-steps N`. Runtime separado em
   `rhp-vm/src/builtins.rs` (builtins e I/O) do nucleo de execucao
   (`Vm::step`, pilha e frames).
-- `VmError { message }`: sem panics para entradas nao confiaveis; sem
-  `unwrap`/`expect` em producao. Mensagens em portugues, ex.:
+- `VmError { message }` (+ `exit_code()` interno para `exit()`): sem
+  panics para entradas nao confiaveis; sem `unwrap`/`expect` em producao.
+  Erro capturavel por `try` vira valor: internos viram mapa
+  `{tipo: "runtime", mensagem: "..."}`; `throw v` entrega `v`. Sem handler,
+  a mensagem e a de hoje (interno) ou `excecao nao capturada: v`.
+  `exit()` nunca e capturado. Mensagens em portugues, ex.:
   `variavel nao definida: x`, `variavel ja declarada: x`,
   `condicao deve ser bool, encontrado int`,
   `tipos incompativeis para \`+\`: int e bool`, `divisao por zero`,

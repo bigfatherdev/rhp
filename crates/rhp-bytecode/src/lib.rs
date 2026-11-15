@@ -117,6 +117,14 @@ pub enum Builtin {
     JsonParse,
     /// `json_stringify(valor)` — valor => texto JSON.
     JsonStringify,
+    /// `now()` — segundos desde 1970-01-01T00:00:00Z (`Int`).
+    Now,
+    /// `sleep(segundos)` — bloqueia a thread (`Int`/`Float`, teto 1h).
+    Sleep,
+    /// `date_str(ts)` — `Int` (epoch) => `"AAAA-MM-DDTHH:MM:SSZ"` (UTC).
+    DateStr,
+    /// `http_fetch(url, opts)` — GET com redirects/headers/timeout (Fase A5).
+    HttpFetch,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -163,6 +171,10 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "exit" => Some(Builtin::Exit),
         "json_parse" => Some(Builtin::JsonParse),
         "json_stringify" => Some(Builtin::JsonStringify),
+        "now" => Some(Builtin::Now),
+        "sleep" => Some(Builtin::Sleep),
+        "date_str" => Some(Builtin::DateStr),
+        "http_fetch" => Some(Builtin::HttpFetch),
         _ => None,
     }
 }
@@ -170,7 +182,7 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
 #[must_use]
 pub const fn builtin_arity(builtin: Builtin) -> usize {
     match builtin {
-        Builtin::Argv => 0,
+        Builtin::Argv | Builtin::Now => 0,
         Builtin::Len
         | Builtin::Pop
         | Builtin::Keys
@@ -195,7 +207,9 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Sort
         | Builtin::Exit
         | Builtin::JsonParse
-        | Builtin::JsonStringify => 1,
+        | Builtin::JsonStringify
+        | Builtin::Sleep
+        | Builtin::DateStr => 1,
         Builtin::Push
         | Builtin::Contains
         | Builtin::StartsWith
@@ -208,7 +222,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Merge
         | Builtin::Has
         | Builtin::FsWrite
-        | Builtin::FsAppend => 2,
+        | Builtin::FsAppend
+        | Builtin::HttpFetch => 2,
         Builtin::Replace => 3,
     }
 }
@@ -281,6 +296,15 @@ pub enum Op {
     /// Desempilha iteravel e empilha lista de iteracao: array vira copia;
     /// mapa vira array de chaves `Str` ordenadas; outro tipo e erro.
     IterList,
+    /// Registra handler de `try` (alvo do `catch`/`finally`); metadados
+    /// fora da pilha de operandos (altura inalterada).
+    TryBegin(u32),
+    /// Remove o handler do `try` (caminho normal).
+    TryEnd,
+    /// Desempilha valor e o lanca como erro (unwinding).
+    Throw,
+    /// Relanca o erro em propagacao (fim de `finally` sem `catch`).
+    Rethrow,
     /// Chama o builtin `id` (`n` = aridade fixa do builtin).
     CallBuiltin(BuiltinId),
 }
@@ -333,6 +357,10 @@ impl BuiltinId {
             37 => Ok(Builtin::Exit),
             38 => Ok(Builtin::JsonParse),
             39 => Ok(Builtin::JsonStringify),
+            40 => Ok(Builtin::Now),
+            41 => Ok(Builtin::Sleep),
+            42 => Ok(Builtin::DateStr),
+            43 => Ok(Builtin::HttpFetch),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -381,6 +409,10 @@ impl From<Builtin> for BuiltinId {
             Builtin::Exit => 37,
             Builtin::JsonParse => 38,
             Builtin::JsonStringify => 39,
+            Builtin::Now => 40,
+            Builtin::Sleep => 41,
+            Builtin::DateStr => 42,
+            Builtin::HttpFetch => 43,
         };
         Self(id)
     }
@@ -469,7 +501,10 @@ impl Chunk {
                         "chunk invalido em `{context}`: funcao {idx} inexistente"
                     )));
                 }
-                Op::JumpIfFalse(target) | Op::Jump(target) | Op::JumpIfNotNull(target)
+                Op::JumpIfFalse(target)
+                | Op::Jump(target)
+                | Op::JumpIfNotNull(target)
+                | Op::TryBegin(target)
                     if (target as usize) >= len =>
                 {
                     return Err(CompileError::new(format!(
@@ -574,6 +609,12 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
                 check_depth(height, 1, op, context)?;
                 (height - 1, Some(vec![target as usize, ip + 1]))
             }
+            Op::TryBegin(_) => (height, Some(vec![ip + 1])),
+            Op::TryEnd => (height, Some(vec![ip + 1])),
+            Op::Throw | Op::Rethrow => {
+                check_depth(height, 1, op, context)?;
+                (height, None)
+            }
             Op::Jump(target) => (height, Some(vec![target as usize])),
             Op::DefineFunc(_) | Op::EnterScope | Op::ExitScope => (height, Some(vec![ip + 1])),
             Op::Halt | Op::Return => (height, None),
@@ -611,6 +652,25 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
                     Some(previous) if previous != after => {
                         return Err(CompileError::new(format!(
                             "chunk invalido em `{context}`: altura de pilha inconsistente em {target} ({previous} vs {after})"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        // Alvo do handler: caminho de erro entra com altura +1 (o valor).
+        if let Op::TryBegin(target) = op {
+            let target = target as usize;
+            if target != code.len() {
+                match entry[target] {
+                    None => {
+                        entry[target] = Some(height + 1);
+                        worklist.push(target);
+                    }
+                    Some(previous) if previous != height + 1 => {
+                        return Err(CompileError::new(format!(
+                            "chunk invalido em `{context}`: altura de pilha inconsistente em {target} ({previous} vs {})",
+                            height + 1
                         )));
                     }
                     Some(_) => {}
@@ -668,8 +728,29 @@ struct Compiler {
     /// desenrolamento correto e para proibir atribuicao a constantes.
     scopes: Vec<std::collections::HashSet<String>>,
     loops: Vec<LoopCtx>,
+    /// Pilha de `try`s com `finally` em compilacao (o mais interno por
+    /// ultimo); usada para fechar handlers e duplicar `finally` em
+    /// `break`/`continue`/`return` que cruzam o `try`.
+    pending_trys: Vec<PendingTry>,
+    /// Reentrancia na emissao de copias de `finally`: dentro da copia,
+    /// desvios nao disparam nova duplicacao (substituem o fluxo em curso).
+    emitting_finally: u32,
     /// Contador de lacos `for` (nomes ocultos unicos por laco).
     for_counter: u32,
+}
+
+/// Contexto de um `try` em compilacao (para `break`/`continue`/`return`
+/// que o cruzam: fechar handler e rodar `finally` antes do desvio).
+struct PendingTry {
+    /// Corpo do `finally` (clonado) para duplicar nas saidas.
+    finally_body: Option<Vec<Stmt>>,
+    /// `true` enquanto o corpo protegido compila (handler ativo no
+    /// runtime); `false` nas regioes de `catch`/`finally` (handler ja
+    /// consumido pelo unwinding ou pelo `TryEnd` do caminho normal).
+    handler_live: bool,
+    /// `loops.len()` ao abrir o `try`: desvios miram o laco do topo, logo
+    /// so cruzam `try`s abertos dentro dele.
+    loop_depth: usize,
 }
 
 /// Contexto de compilacao de um laco (para `break`/`continue`).
@@ -710,6 +791,8 @@ impl Compiler {
             constants: std::collections::HashMap::new(),
             scopes: vec![std::collections::HashSet::new()],
             loops: Vec::new(),
+            pending_trys: Vec::new(),
+            emitting_finally: 0,
             for_counter: 0,
         }
     }
@@ -795,6 +878,7 @@ impl Compiler {
             Op::JumpIfFalse(_) => self.chunk.code[pos] = Op::JumpIfFalse(target),
             Op::JumpIfNotNull(_) => self.chunk.code[pos] = Op::JumpIfNotNull(target),
             Op::Jump(_) => self.chunk.code[pos] = Op::Jump(target),
+            Op::TryBegin(_) => self.chunk.code[pos] = Op::TryBegin(target),
             _ => debug_assert!(false, "patch_jump em posicao sem salto"),
         }
     }
@@ -893,6 +977,128 @@ impl Compiler {
         Ok(())
     }
 
+    /// Emite copia do `finally` em escopo proprio (codigo de saida de
+    /// `try`: caminho normal ou desvio abrupto). Codigo de corpo e neutro
+    /// na pilha de operandos; `break`/`continue`/`return` dentro da copia
+    /// nao disparam nova duplicacao (substituem o fluxo em curso).
+    fn emit_finally_copy(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
+        self.emit_scope_open();
+        self.emitting_finally += 1;
+        let saved = self.scopes.clone();
+        self.compile_stmts(body)?;
+        self.scopes = saved;
+        self.emitting_finally -= 1;
+        self.emit_scope_close()?;
+        Ok(())
+    }
+
+    /// Fecha handlers e roda `finally`s de `try`s cruzados por um desvio
+    /// abrupto (`break`/`continue`/`return`), do mais interno para fora.
+    /// `TryEnd` so e emitido para `try`s com handler ativo (no caminho de
+    /// `catch`, o unwinding ja o consumiu); copias de `finally` sempre
+    /// (exceto dentro de copia, onde o desvio substitui o fluxo).
+    /// `crossing_loop`: filtra `try`s abertos dentro do laco-alvo
+    /// (`break`/`continue`); `return` cruza todos (`None` = sem filtro).
+    fn emit_abrupt_exits(&mut self, crossing_loop: Option<usize>) -> Result<(), CompileError> {
+        let guarded = self.emitting_finally > 0;
+        // Do mais interno para fora. `TryEnd` marca o handler como
+        // consumido NESTE caminho: copias de `finally` emitidas a seguir
+        // (que podem conter novos desvios) nao o repetem.
+        let mut copies: Vec<Vec<Stmt>> = Vec::new();
+        let mut i = self.pending_trys.len();
+        while i > 0 {
+            i -= 1;
+            let apply = match crossing_loop {
+                Some(depth) => self.pending_trys[i].loop_depth == depth,
+                None => true,
+            };
+            if !apply {
+                continue;
+            }
+            if self.pending_trys[i].handler_live {
+                self.emit(Op::TryEnd);
+                self.pending_trys[i].handler_live = false;
+            }
+            if !guarded {
+                if let Some(body) = self.pending_trys[i].finally_body.clone() {
+                    copies.push(body);
+                }
+            }
+        }
+        for body in copies {
+            self.emit_finally_copy(&body)?;
+        }
+        Ok(())
+    }
+
+    /// Compila `try B (catch V? C)? (finally F)?` (RFC 0001).
+    ///
+    /// Desenho: `TryBegin->alvo` + escopo + corpo; `TryEnd` + `finally`
+    /// (caminho normal); `catch`: vinculo do erro + corpo + `finally`;
+    /// sem `catch`: `finally` + `Rethrow`. `finally` e duplicado por
+    /// caminho (codigo neutro na pilha; validador aprova cada copia).
+    /// `break`/`continue`/`return` dentro do corpo fecham handler e rodam
+    /// `finally` via `emit_abrupt_exits` (braco respectivo).
+    fn compile_try(
+        &mut self,
+        body: &[Stmt],
+        catch_var: &Option<String>,
+        catch_body: &Option<Vec<Stmt>>,
+        finally_body: &Option<Vec<Stmt>>,
+    ) -> Result<(), CompileError> {
+        let handler_jump = self.emit(Op::TryBegin(u32::MAX));
+        self.emit_scope_open();
+        self.pending_trys.push(PendingTry {
+            finally_body: finally_body.clone(),
+            handler_live: true,
+            loop_depth: self.loops.len(),
+        });
+        let saved = self.scopes.clone();
+        self.compile_stmts(body)?;
+        self.scopes = saved;
+        self.emit_scope_close()?;
+        self.emit(Op::TryEnd);
+        if let Some(top) = self.pending_trys.last_mut() {
+            top.handler_live = false;
+        }
+        if let Some(fin) = finally_body {
+            self.emit_finally_copy(fin)?;
+        }
+        let end_jump = self.emit(Op::Jump(u32::MAX));
+        let handler_target = self.chunk.code.len() as u32;
+        self.patch_jump(handler_jump, handler_target);
+        if let Some(cbody) = catch_body {
+            self.emit_scope_open();
+            match catch_var {
+                Some(name) => {
+                    let name_idx = self.intern_name(name)?;
+                    self.emit(Op::DeclareName(name_idx));
+                }
+                None => {
+                    self.emit(Op::Pop);
+                }
+            }
+            let saved_catch = self.scopes.clone();
+            self.compile_stmts(cbody)?;
+            self.scopes = saved_catch;
+            if let Some(fin) = finally_body {
+                self.emit_finally_copy(fin)?;
+            }
+            self.emit_scope_close()?;
+        } else {
+            // Sem `catch`: `finally` roda e o erro segue propagando.
+            // A pilha aqui tem exatamente o valor do erro (altura 1).
+            if let Some(fin) = finally_body {
+                self.emit_finally_copy(fin)?;
+            }
+            self.emit(Op::Rethrow);
+        }
+        let end_target = self.chunk.code.len() as u32;
+        self.patch_jump(end_jump, end_target);
+        self.pending_trys.pop();
+        Ok(())
+    }
+
     fn compile_if(
         &mut self,
         cond: &Expr,
@@ -956,6 +1162,9 @@ impl Compiler {
                     return Err(CompileError::new("`break` fora de laco".to_string()));
                 };
                 let break_depth = loop_ctx.break_depth;
+                let loop_level = self.loops.len();
+                // Fecha `try`s cruzados (handler + `finally`) antes de sair.
+                self.emit_abrupt_exits(Some(loop_level))?;
                 while self.scopes.len() > break_depth {
                     self.emit_scope_close()?;
                 }
@@ -969,6 +1178,8 @@ impl Compiler {
                     Some(loop_ctx) => (loop_ctx.continue_depth, loop_ctx.start),
                     None => return Err(CompileError::new("`continue` fora de laco".to_string())),
                 };
+                let loop_level = self.loops.len();
+                self.emit_abrupt_exits(Some(loop_level))?;
                 while self.scopes.len() > continue_depth {
                     self.emit_scope_close()?;
                 }
@@ -1083,6 +1294,8 @@ impl Compiler {
                 if !self.in_function {
                     return Err(CompileError::new("`return` fora de funcao"));
                 }
+                // `return` cruza todos os `try`s do frame (handler + `finally`).
+                self.emit_abrupt_exits(None)?;
                 match expr {
                     Some(expr) => self.compile_expr(expr)?,
                     None => {
@@ -1092,6 +1305,16 @@ impl Compiler {
                 }
                 self.emit(Op::Return);
             }
+            Stmt::Throw { expr } => {
+                self.compile_expr(expr)?;
+                self.emit(Op::Throw);
+            }
+            Stmt::Try {
+                body,
+                catch_var,
+                catch_body,
+                finally_body,
+            } => self.compile_try(body, catch_var, catch_body, finally_body)?,
             Stmt::Block(stmts) => {
                 self.emit_scope_open();
                 self.compile_stmts(stmts)?;
@@ -1102,6 +1325,20 @@ impl Compiler {
             Stmt::Import(_) => {
                 // Resolucao de modulos e papel do carregador (`rhp run`);
                 // a compilacao direta ignora (programa ja deve vir resolvido).
+            }
+            Stmt::ImportNames { .. } => {
+                // Como `Import`: so o linker resolve (programa direto com
+                // `import { } from` e erro claro, nao silencioso).
+                return Err(CompileError::new(
+                    "`import { } from` sem resolucao: use o loader (`rhp run`/`rhp check`)"
+                        .to_string(),
+                ));
+            }
+            Stmt::Export { .. } => {
+                // Marcador consumido pelo linker; fora dele e erro.
+                return Err(CompileError::new(
+                    "`export` fora de modulo: use o loader (`rhp run`/`rhp check`)".to_string(),
+                ));
             }
             Stmt::ExprStmt { expr } => {
                 self.compile_expr(expr)?;
@@ -1461,6 +1698,33 @@ mod tests {
     }
 
     #[test]
+    fn compiles_try_catch_finally_variants() {
+        for src in [
+            "try { echo 1; } catch e { echo e; }",
+            "try { echo 1; } catch { echo 2; }",
+            "try { echo 1; } finally { echo 2; }",
+            "try { echo 1; } catch e { echo e; } finally { echo 2; }",
+            "throw \"boom\";",
+            "fn f() { try { return 1; } finally { echo 2; } }",
+            "while true { try { break; } finally { echo 1; } }",
+            "for x in [1] { try { continue; } catch { } }",
+            "try { try { throw 1; } catch e { throw e; } } catch e { echo e; }",
+        ] {
+            let chunk = compile_src(src);
+            chunk.validate().expect("try deve validar");
+        }
+        // `throw` gera `Throw`; `try/finally` sem `catch` gera `Rethrow`;
+        // `try/catch` nao gera `Rethrow` (erro consumido).
+        let chunk = compile_src("throw 1;");
+        assert!(chunk.code.contains(&Op::Throw));
+        let chunk = compile_src("try { echo 1; } finally { echo 2; }");
+        assert!(chunk.code.contains(&Op::Rethrow));
+        let chunk = compile_src("try { echo 1; } catch e { echo e; }");
+        assert!(!chunk.code.contains(&Op::Rethrow));
+        assert!(chunk.code.iter().any(|op| matches!(op, Op::TryBegin(_))));
+    }
+
+    #[test]
     fn compiles_bitwise_ops() {
         let chunk = compile_src("echo 6 & 3 | 1 ^ 2; echo ~5; echo 1 << 4;");
         assert!(chunk.code.contains(&Op::BitAnd));
@@ -1603,6 +1867,10 @@ mod tests {
             Builtin::Exit,
             Builtin::JsonParse,
             Builtin::JsonStringify,
+            Builtin::Now,
+            Builtin::Sleep,
+            Builtin::DateStr,
+            Builtin::HttpFetch,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

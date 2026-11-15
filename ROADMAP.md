@@ -57,12 +57,27 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
   `changes/2026-11-15-fix-laco-escopo-break.md`). 168 testes verdes.
 - [x] JSON std-only: `json_parse`/`json_stringify` sem dependencias, com
   teto de 128 niveis e erros com posicao
-  (`changes/2026-11-15-feat-json.md`).
+  (  `changes/2026-11-15-feat-json.md`).
 - [ ] Pendente (ordem tecnica): datas/horas, `switch`,
   `sort`/`filter` com callback (exige primeira-classe), args
   default/variadicos, destructuring; depois excecoes, closures,
   namespaces/exports, pacotes, rede v2, tipos, OO, async/DBs/servidor
   (todos exigem RFC/ADR e gates, cf. auditoria §21).
+
+## Fases A–D — RHP para sites/sistemas (plano aprovado, em andamento)
+
+- [x] A1: RFC 0001 — exceções (`RFCs/0001-excecoes.md`, aceita e implementada).
+- [x] A2: exceções implementadas (lexer/parser/bytecode/VM/fmt/CLI/specs).
+- [x] A3: namespaces/exports (ADR 0009 implementada: `export` + seletivo).
+- [x] A4: datas/horas std-only (`now`, `sleep`, `date_str`).
+- [x] A5: rede v2 (`http_fetch`: redirects, headers, timeout).
+  **Fase A concluída** (fundação do runtime de sistemas).
+- [ ] Fase B: persistência (ADR SQLite, driver, PostgreSQL com servidor
+  real).
+- [ ] Fase C: servidor HTTP (RFC concorrência, router, middleware,
+  sessões).
+- [ ] Fase D: produção (TLS via ADR, pacotes v0, `rhp build`, auth,
+  limites, release `0.y.0`).
 
 ## Fase 1 — Fundacao (concluida em 2026-11-14)
 

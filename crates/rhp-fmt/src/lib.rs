@@ -108,6 +108,38 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str("}\n");
         }
+        Stmt::Try {
+            body,
+            catch_var,
+            catch_body,
+            finally_body,
+        } => {
+            indent(level, out);
+            out.push_str("try {\n");
+            fmt_block(body, level + 1, out);
+            indent(level, out);
+            if let Some(catch_body) = catch_body {
+                match catch_var {
+                    Some(var) => out.push_str(&format!("}} catch {var} {{\n")),
+                    None => out.push_str("} catch {\n"),
+                }
+                fmt_block(catch_body, level + 1, out);
+                indent(level, out);
+            }
+            match finally_body {
+                Some(finally_body) => {
+                    out.push_str("} finally {\n");
+                    fmt_block(finally_body, level + 1, out);
+                    indent(level, out);
+                    out.push_str("}\n");
+                }
+                None => out.push_str("}\n"),
+            }
+        }
+        Stmt::Throw { expr } => {
+            indent(level, out);
+            let _ = writeln!(out, "throw {};", fmt_expr(expr, 0));
+        }
         Stmt::For { var, iter, body } => {
             indent(level, out);
             let _ = writeln!(out, "for {var} in {} {{", fmt_expr(iter, 0));
@@ -134,6 +166,27 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
         Stmt::Import(path) => {
             indent(level, out);
             let _ = writeln!(out, "import {path:?};");
+        }
+        Stmt::ImportNames { path, names } => {
+            indent(level, out);
+            let parts: Vec<String> = names
+                .iter()
+                .map(|n| match &n.alias {
+                    Some(alias) => format!("{} as {alias}", n.name),
+                    None => n.name.clone(),
+                })
+                .collect();
+            let _ = writeln!(out, "import {{{}}} from {path:?};", parts.join(", "));
+        }
+        Stmt::Export { def } => {
+            indent(level, out);
+            out.push_str("export ");
+            // `def` e `fn`/`let`/`const`: formata sem indentacao extra e
+            // troca a quebra final por `;`/bloco na mesma linha logica.
+            let mut inner = String::new();
+            fmt_stmt(def, 0, &mut inner);
+            let inner = inner.trim_end();
+            let _ = writeln!(out, "{inner}");
         }
         Stmt::Block(stmts) => {
             indent(level, out);
@@ -381,6 +434,38 @@ mod tests {
         );
         // `in` continua identificador comum fora do `for`.
         check_idempotent("let in = 1;\necho in;\n");
+    }
+
+    #[test]
+    fn formats_try_catch_finally_and_throw() {
+        assert_eq!(
+            fmt("try{echo 1;}catch e{echo e;}finally{echo 2;}"),
+            "try {\n  echo 1;\n} catch e {\n  echo e;\n} finally {\n  echo 2;\n}\n"
+        );
+        assert_eq!(
+            fmt("try{echo 1;}catch{echo 2;}"),
+            "try {\n  echo 1;\n} catch {\n  echo 2;\n}\n"
+        );
+        assert_eq!(fmt("throw 1+2;"), "throw 1 + 2;\n");
+        check_idempotent(
+            "try {\n  echo 1;\n} catch e {\n  echo e;\n} finally {\n  echo 2;\n}\nthrow \"x\";\n",
+        );
+    }
+
+    #[test]
+    fn formats_export_and_selective_import() {
+        assert_eq!(
+            fmt("export fn dobro(x){return x+x;}"),
+            "export fn dobro(x) {\n  return x + x;\n}\n"
+        );
+        assert_eq!(fmt("export let base=40;"), "export let base = 40;\n");
+        assert_eq!(
+            fmt("import {dobro,base as b} from \"mat.rhp\";"),
+            "import {dobro, base as b} from \"mat.rhp\";\n"
+        );
+        check_idempotent(
+            "export fn dobro(x) {\n  return x + x;\n}\nimport {dobro as d} from \"m.rhp\";\n",
+        );
     }
 
     #[test]

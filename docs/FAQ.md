@@ -25,11 +25,14 @@ Nao — e erro (`chave inexistente`). Faca `keys(m)` para inspecionar.
 
 **Posso importar qualquer arquivo?**
 So dentro da arvore do programa (`..` para fora e erro), no nivel superior
-do arquivo, sem ciclos. Teto de 8 MiB por arquivo.
+do arquivo, sem ciclos. Teto de 8 MiB por arquivo. Nomes sao privados por
+padrao: `export fn/let/const` publica; `import { a as b } from "m.rhp"`
+vincula so exportados (`import "m.rhp"` mantem o legado: vincula tudo).
 
 **`http_get` faz HTTPS?**
 Nao — so `http://`, sem redirects, teto de 1 MiB, timeouts de 5s (DNS sem
-timeout proprio). Para o resto, aguarde evolucao com RFC.
+timeout proprio). Para redirects/headers/timeout configuravel use
+`http_fetch(url, opts)` (HTTPS continua sem suporte: exige TLS via ADR).
 
 **Como limito um programa possivelmente infinito?**
 `rhp run --max-steps N <arquivo>` (ou `VmLimits` via API interna).

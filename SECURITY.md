@@ -27,7 +27,8 @@
 
 - Isolamento/sandbox de SO: programas RHP rodam com seus privilegios.
 - `import` le arquivos locais (confinado a arvore do programa; sem rede).
-- Sem HTTPS, redirects, limite de taxa ou autenticacao no `http_get`.
+- Sem HTTPS/TLS, limite de taxa ou autenticacao (nem em `http_get` nem em
+  `http_fetch`); redirects so via `http_fetch` (teto de 10, `http://`).
 - `VmLimits` e opt-in (padrao ilimitado); heap sem teto medido em bytes.
 - Sem auditoria externa, fuzz continuo ou testes em Windows.
 

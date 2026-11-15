@@ -15,6 +15,7 @@ use builtins::call_builtin;
 pub use builtins::MAX_HTTP_BODY;
 
 mod json;
+mod time;
 
 /// Profundidade maxima da pilha de chamadas (protecao contra estouro).
 pub const MAX_CALL_DEPTH: usize = 512;
@@ -85,6 +86,17 @@ struct Frame {
     /// Pilha de escopos locais; `scopes[0]` e o escopo da ativacao
     /// (parametros no caso de funcao).
     scopes: Vec<HashMap<String, Value>>,
+    /// Pilha de handlers de `try` (RFC 0001); o mais interno por ultimo.
+    handlers: Vec<Handler>,
+}
+
+/// Handler de `try`: para onde saltar e com que escopos/pilha.
+#[derive(Debug, Clone, Copy)]
+struct Handler {
+    /// Instrucao do `catch` ou do bloco `finally`+`Rethrow`.
+    target: usize,
+    /// `scopes.len()` ao registrar (restaura no unwinding).
+    scope_len: usize,
 }
 
 enum Step {
@@ -150,6 +162,7 @@ impl Vm {
             ip: 0,
             stack: Vec::new(),
             scopes: vec![HashMap::new()],
+            handlers: Vec::new(),
         });
 
         while !self.frames.is_empty() {
@@ -174,7 +187,25 @@ impl Vm {
         String::from_utf8(buf).map_err(|e| VmError::new(format!("saida nao e UTF-8 valido: {e}")))
     }
 
+    /// Executa uma instrucao com interceptacao de erros (RFC 0001).
+    ///
+    /// Erro sem `exit_code` tenta unwinding ate o `try` mais interno (do
+    /// topo para a base); sem handler, o erro original propaga intacto.
+    /// `exit()` nunca e capturado.
     fn step(&mut self, idx: usize, output: &mut dyn Write) -> Result<Step, VmError> {
+        match self.step_inner(idx, output) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                if error.exit_code().is_some() {
+                    return Err(error);
+                }
+                let value = Self::internal_error_value(&error.message);
+                self.unwind(value, error)
+            }
+        }
+    }
+
+    fn step_inner(&mut self, idx: usize, output: &mut dyn Write) -> Result<Step, VmError> {
         self.steps += 1;
         if let Some(max) = self.limits.max_steps {
             if self.steps > max {
@@ -435,6 +466,31 @@ impl Vm {
                 }
                 self.frames[idx].ip += 1;
             }
+            Op::TryBegin(target) => {
+                let scope_len = self.frames[idx].scopes.len();
+                self.frames[idx].handlers.push(Handler {
+                    target: target as usize,
+                    scope_len,
+                });
+                self.frames[idx].ip += 1;
+            }
+            Op::TryEnd => {
+                self.frames[idx]
+                    .handlers
+                    .pop()
+                    .ok_or_else(|| VmError::new("desequilibrio interno de handlers".to_string()))?;
+                self.frames[idx].ip += 1;
+            }
+            Op::Throw => {
+                let value = self.pop(idx, "`throw`")?;
+                let original = VmError::new(format!("excecao nao capturada: {value}"));
+                return self.unwind(value, original);
+            }
+            Op::Rethrow => {
+                let value = self.pop(idx, "repropagacao")?;
+                let original = VmError::new(Self::uncaught_message(&value));
+                return self.unwind(value, original);
+            }
             Op::IterList => {
                 let value = self.pop(idx, "iteracao")?;
                 let list = match value {
@@ -631,8 +687,64 @@ impl Vm {
             ip: 0,
             stack: Vec::new(),
             scopes: vec![scope],
+            handlers: Vec::new(),
         });
         Ok(())
+    }
+
+    /// Desenrola frames ate o handler de `try` mais interno.
+    ///
+    /// Trunca frames, escopos e operandos; empilha o valor do erro e salta
+    /// ao alvo. Cada frame desenrolado conta em `max_steps` (sem loop
+    /// infinito: frames sao finitos). Sem handler, devolve o erro original
+    /// (comportamento idêntico ao de antes das excecoes).
+    fn unwind(&mut self, value: Value, original: VmError) -> Result<Step, VmError> {
+        for depth in (0..self.frames.len()).rev() {
+            self.steps += 1;
+            if let Some(max) = self.limits.max_steps {
+                if self.steps > max {
+                    return Err(VmError::new(format!(
+                        "limite de instrucoes excedido ({max} passos)"
+                    )));
+                }
+            }
+            if let Some(handler) = self.frames[depth].handlers.pop() {
+                self.frames.truncate(depth + 1);
+                {
+                    let frame = &mut self.frames[depth];
+                    frame.scopes.truncate(handler.scope_len);
+                    frame.stack.clear();
+                }
+                // `push_checked` aplica `max_collection_len` ao erro.
+                self.push_checked(depth, value)?;
+                self.frames[depth].ip = handler.target;
+                return Ok(Step::Continue);
+            }
+        }
+        Err(original)
+    }
+
+    /// Mensagem de erro nao capturado a partir do valor propagado: erro
+    /// interno preserva a mensagem original (via mapa `{tipo, mensagem}`);
+    /// valor lancado a mao usa `excecao nao capturada: ...`.
+    fn uncaught_message(value: &Value) -> String {
+        match value {
+            Value::Map(entries) if matches!(entries.get("tipo"), Some(Value::Str(t)) if t == "runtime") => {
+                match entries.get("mensagem") {
+                    Some(Value::Str(message)) => message.clone(),
+                    _ => format!("{value}"),
+                }
+            }
+            other => format!("excecao nao capturada: {other}"),
+        }
+    }
+
+    /// Valor do erro interno para `catch`: mapa `{tipo, mensagem}`.
+    fn internal_error_value(message: &str) -> Value {
+        let mut entries = HashMap::with_capacity(2);
+        entries.insert("tipo".to_string(), Value::Str("runtime".to_string()));
+        entries.insert("mensagem".to_string(), Value::Str(message.to_string()));
+        Value::Map(entries)
     }
 }
 
@@ -1445,12 +1557,200 @@ mod tests {
     }
 
     #[test]
+    fn runs_time_builtins() {
+        // `now()` = epoch Int nao-negativo e nao-decrescente.
+        let t1 = run_src("echo type(now());").expect("ok");
+        assert_eq!(t1, "int\n");
+        // `date_str` com vetores conhecidos (UTC, bissextos, negativos).
+        assert_eq!(
+            run_src("echo date_str(0);").expect("ok"),
+            "1970-01-01T00:00:00Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(-1);").expect("ok"),
+            "1969-12-31T23:59:59Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(951782400);").expect("ok"),
+            "2000-02-29T00:00:00Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(1763123303);").expect("ok"),
+            "2025-11-14T12:28:23Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(253402300799);").expect("ok"),
+            "9999-12-31T23:59:59Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(-2208988800);").expect("ok"),
+            "1900-01-01T00:00:00Z\n"
+        );
+        // Tipos errados.
+        let err = run_err("echo date_str(\"x\");");
+        assert!(err.contains("epoch"), "obteve: {err}");
+        let err = run_err("echo sleep(\"x\");");
+        assert!(err.contains("segundos"), "obteve: {err}");
+        let err = run_err("echo sleep(-1);");
+        assert!(err.contains(">= 0"), "obteve: {err}");
+        let err = run_err("echo sleep(3601);");
+        assert!(err.contains("teto"), "obteve: {err}");
+    }
+
+    #[test]
+    fn sleep_zero_returns_quickly() {
+        use std::time::Instant;
+        let start = Instant::now();
+        assert_eq!(run_src("echo sleep(0);").expect("ok"), "null\n");
+        assert!(start.elapsed().as_secs() < 5, "sleep(0) demorou demais");
+    }
+
+    #[test]
+    fn rejects_bad_fetch_opts() {
+        // Nao-map, chave desconhecida, tipos errados, limites.
+        for bad in [
+            "echo http_fetch(\"http://x/\", 42);",
+            "echo http_fetch(\"http://x/\", {x: 1});",
+            "echo http_fetch(\"http://x/\", {seguir: 1});",
+            "echo http_fetch(\"http://x/\", {max_redirecionamentos: 99});",
+            "echo http_fetch(\"http://x/\", {max_redirecionamentos: -1});",
+            "echo http_fetch(\"http://x/\", {timeout: 0});",
+            "echo http_fetch(\"http://x/\", {timeout: 61});",
+            "echo http_fetch(\"http://x/\", {timeout: \"x\"});",
+            "echo http_fetch(\"http://x/\", {headers: [1]});",
+            "echo http_fetch(\"http://x/\", {headers: {\"X\": 1}});",
+            "echo http_fetch(\"http://x/\", {metodo: \"POST\"});",
+            "echo http_fetch(42, {});",
+        ] {
+            let err = run_err(bad);
+            assert!(err.contains("http_fetch"), "obteve: {err} em {bad}");
+        }
+        // `https://` rejeitado (sem TLS nesta fase).
+        let err = run_err("echo http_fetch(\"https://x/\", {});");
+        assert!(err.contains("http://"), "obteve: {err}");
+        // `http_get` estrito nao mudou (redirect = erro `retornou status`).
+    }
+
+    #[test]
     fn while_body_scope_does_not_leak_on_break() {
         // Regressao: `let` no corpo do `while` + `break` vazava para fora.
         let err = run_err("while true { let vazou = 1; break; } echo vazou;");
         assert!(err.contains("nao definida"), "obteve: {err}");
         // E o caminho normal continua fechando o escopo a cada iteracao.
         let err = run_err("let i = 0; while i < 2 { let tmp = i; i = i + 1; } echo tmp;");
+        assert!(err.contains("nao definida"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_throw_catch_in_same_function() {
+        assert_eq!(
+            run_src("try { throw \"boom\"; echo \"nunca\"; } catch e { echo e; }").expect("ok"),
+            "boom\n"
+        );
+        // `catch` sem variavel descarta; corpo vazio consome o erro.
+        assert_eq!(
+            run_src("try { throw 1; } catch { echo \"pegou\"; }").expect("ok"),
+            "pegou\n"
+        );
+        assert_eq!(
+            run_src("try { throw 1; } catch e { } echo \"seguiu\";").expect("ok"),
+            "seguiu\n"
+        );
+        // Erro interno vira mapa `{tipo, mensagem}`.
+        assert_eq!(
+            run_src("try { echo 1 / 0; } catch e { echo e[\"mensagem\"]; echo e[\"tipo\"]; }")
+                .expect("ok"),
+            "divisao por zero\nruntime\n"
+        );
+        // Erro de builtin e capturavel.
+        assert_eq!(
+            run_src("try { echo json_parse(\"{oops}\"); } catch e { echo \"json falhou\"; }")
+                .expect("ok"),
+            "json falhou\n"
+        );
+    }
+
+    #[test]
+    fn runs_exception_across_frames() {
+        // Propaga por 2 frames ate o handler.
+        assert_eq!(
+            run_src("fn dentro() { throw \"fundo\"; } fn meio() { dentro(); } try { meio(); } catch e { echo e; }").expect("ok"),
+            "fundo\n"
+        );
+        // `throw` dentro de `catch` propaga ao handler externo.
+        assert_eq!(
+            run_src("try { try { throw \"a\"; } catch e { throw \"b\"; } } catch e { echo e; }")
+                .expect("ok"),
+            "b\n"
+        );
+        // Sem handler em nenhum frame: falha como antes (mensagem intacta).
+        let err = run_err("echo 1 / 0;");
+        assert!(err.contains("divisao por zero"), "obteve: {err}");
+        let err = run_err("fn f() { echo 1 / 0; } f();");
+        assert!(err.contains("divisao por zero"), "obteve: {err}");
+        let err = run_err("throw \"boom\";");
+        assert!(err.contains("excecao nao capturada: boom"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_finally_on_all_paths() {
+        // Caminho normal.
+        assert_eq!(
+            run_src("try { echo \"corpo\"; } finally { echo \"fim\"; }").expect("ok"),
+            "corpo\nfim\n"
+        );
+        // Caminho do `catch`.
+        assert_eq!(
+            run_src("try { throw 1; } catch e { echo \"pegou\"; } finally { echo \"fim\"; }")
+                .expect("ok"),
+            "pegou\nfim\n"
+        );
+        // Propagacao: `finally` roda e o erro segue.
+        let err = run_err("try { echo 1 / 0; } finally { echo \"fim\"; }");
+        assert!(err.contains("divisao por zero"), "obteve: {err}");
+        // `return` dentro de `try` roda `finally` antes de sair.
+        assert_eq!(
+            run_src("fn f() { try { return 7; } finally { echo \"fim\"; } } echo f();")
+                .expect("ok"),
+            "fim\n7\n"
+        );
+        // `return` dentro de `finally` substitui o fluxo (valor e erro).
+        assert_eq!(
+            run_src("fn f() { try { return 1; } finally { return 2; } } echo f();").expect("ok"),
+            "2\n"
+        );
+        // `break`/`continue` cruzando o `try` rodam `finally`.
+        assert_eq!(
+            run_src("while true { try { break; } finally { echo \"fim\"; } } echo \"fora\";")
+                .expect("ok"),
+            "fim\nfora\n"
+        );
+        assert_eq!(
+            run_src(
+                "let i = 0; while i < 2 { i = i + 1; try { continue; } finally { echo \"fim\"; } }"
+            )
+            .expect("ok"),
+            "fim\nfim\n"
+        );
+    }
+
+    #[test]
+    fn exit_skips_finally() {
+        // `exit` e abrupto: `finally` nao roda; stdout anterior preservado.
+        let chunk = compile_src("try { echo \"antes\"; exit(3); } finally { echo \"fim\"; }");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&chunk, &mut out).expect_err("exit deve interromper");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(out, b"antes\n");
+    }
+
+    #[test]
+    fn try_scopes_do_not_leak() {
+        // `let` no corpo/catch nao vaza; erro no `try` nao deixa sujeira.
+        let err = run_err("try { let x = 1; throw 2; } catch e { } echo x;");
+        assert!(err.contains("nao definida"), "obteve: {err}");
+        let err = run_err("try { throw 1; } catch y { } echo y;");
         assert!(err.contains("nao definida"), "obteve: {err}");
     }
 

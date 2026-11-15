@@ -1,14 +1,15 @@
-//! Lexer escrito a mao para o RHP (Fase 2 / Marco 2).
+//! Lexer escrito a mao para o RHP (Fase A: + `export`).
 //!
 //! Reconhece o subconjunto implementado: palavras-chave (`echo`, `let`,
-//! `const`, `if`, `else`, `while`, `for`, `break`, `continue`, `fn`,
-//! `return`, `import`, `true`, `false`, `null`), identificadores, literais
-//! (string, inteiro, float), operadores e pontuacao. Comentarios de linha
-//! `//` sao ignorados. Erros carregam linha/coluna.
+//! `const`, `if`, `else`, `while`, `for`, `break`, `continue`, `try`,
+//! `catch`, `finally`, `throw`, `export`, `fn`, `return`, `import`,
+//! `true`, `false`, `null`), identificadores, literais (string, inteiro,
+//! float), operadores e pontuacao. Comentarios de linha `//` sao ignorados.
+//! Erros carregam linha/coluna.
 //!
-//! Nota: `in` (do `for x in ...`) NAO e palavra-chave: e lido como
-//! identificador comum e reconhecido posicionalmente pelo parser, para
-//! nao quebrar programas que usam `in` como nome de variavel.
+//! Notas: `in` (do `for x in ...`), `from`/`as` (do `import { } from`)
+//! NAO sao palavras-chave: lidos como identificadores e reconhecidos
+//! posicionalmente pelo parser.
 
 use std::fmt;
 
@@ -25,6 +26,11 @@ pub enum TokenKind {
     For,
     Break,
     Continue,
+    Try,
+    Catch,
+    Finally,
+    Throw,
+    Export,
     Fn,
     Return,
     Import,
@@ -562,6 +568,11 @@ fn lex_ident_or_keyword(
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
         "for" => TokenKind::For,
+        "try" => TokenKind::Try,
+        "catch" => TokenKind::Catch,
+        "finally" => TokenKind::Finally,
+        "throw" => TokenKind::Throw,
+        "export" => TokenKind::Export,
         "fn" => TokenKind::Fn,
         "return" => TokenKind::Return,
         "import" => TokenKind::Import,
@@ -674,6 +685,17 @@ mod tests {
                 TokenKind::Return,
                 TokenKind::Import,
                 TokenKind::Echo,
+            ]
+        );
+        // `try`/`catch`/`finally`/`throw`/`export` (Fase A).
+        assert_eq!(
+            kinds("try catch finally throw export"),
+            vec![
+                TokenKind::Try,
+                TokenKind::Catch,
+                TokenKind::Finally,
+                TokenKind::Throw,
+                TokenKind::Export,
             ]
         );
         // `in` e contextual (do `for x in ...`): continua identificador.

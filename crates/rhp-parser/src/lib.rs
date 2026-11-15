@@ -6,8 +6,9 @@
 //! Program    := Stmt*
 //! Block      := "{" Stmt* "}"
 //! Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt
-//!             | WhileStmt | ForStmt | BreakStmt | ContinueStmt | FnDef
-//!             | ReturnStmt | Block | ImportStmt | ExprStmt
+//!             | WhileStmt | ForStmt | TryStmt | ThrowStmt | BreakStmt
+//!             | ContinueStmt | FnDef | ReturnStmt | Block | ImportStmt
+//!             | ImportNames | Export | ExprStmt
 //! LetStmt    := "let" Ident ("=" Expr)? ";"
 //! ConstStmt  := "const" Ident "=" Expr ";"
 //! AssignStmt := Target "=" Expr ";"
@@ -16,11 +17,16 @@
 //! IfStmt     := "if" Expr Block ("else" Block)?
 //! WhileStmt  := "while" Expr Block
 //! ForStmt    := "for" Ident "in" Expr Block
+//! TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
+//!             // ao menos um de `catch`/`finally` e obrigatorio
+//! ThrowStmt  := "throw" Expr ";"
 //! BreakStmt  := "break" ";"
 //! ContinueStmt := "continue" ";"
 //! FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
 //! ReturnStmt := "return" Expr? ";"
 //! ImportStmt := "import" String ";"
+//!             | "import" "{" Ident ("as" Ident)? ("," ...)* "}" "from" String ";"
+//! ExportStmt := "export" (FnDef | LetStmt | ConstStmt)
 //! ExprStmt   := Expr ";"
 //! Expr       := Ternary
 //! Ternary    := NullCoalesce ("?" Ternary ":" Ternary)?
@@ -90,6 +96,19 @@ pub enum Stmt {
         iter: Expr,
         body: Vec<Stmt>,
     },
+    /// `try BLOCO (catch VAR? BLOCO)? (finally BLOCO)?` (RFC 0001).
+    /// Ao menos um de `catch`/`finally` e obrigatorio (checado no parse).
+    /// `catch` presente com corpo vazio (`catch e { }`) consome o erro.
+    Try {
+        body: Vec<Stmt>,
+        catch_var: Option<String>,
+        catch_body: Option<Vec<Stmt>>,
+        finally_body: Option<Vec<Stmt>>,
+    },
+    /// `throw EXPR;` — lanca o valor como erro (RFC 0001).
+    Throw {
+        expr: Expr,
+    },
     FnDef {
         name: String,
         params: Vec<String>,
@@ -101,10 +120,30 @@ pub enum Stmt {
     /// `import "caminho.rhp";` — resolvido pelo carregador de modulos
     /// (a compilacao direta ignora; use o loader da CLI).
     Import(String),
+    /// `import { a, b as c } from "caminho.rhp";` — importa só nomes
+    /// exportados (privacidade real, ADR 0009). `from`/`as` sao
+    /// contextuais (identificadores posicionais, como o `in` do `for`).
+    ImportNames {
+        path: String,
+        names: Vec<ImportName>,
+    },
+    /// `export fn/let/const` (ADR 0009, opt-in; sem `export` = privado).
+    /// O linker extrai o nome e remove o marcador; compilar um `Export`
+    /// direto da erro (defesa em profundidade).
+    Export {
+        def: Box<Stmt>,
+    },
     Block(Vec<Stmt>),
     ExprStmt {
         expr: Expr,
     },
+}
+
+/// Nome selecionado em `import { } from`: original + alias opcional.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportName {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 /// Alvo de atribuicao: variavel ou elemento `nome[indice]` (um nivel).
@@ -278,6 +317,10 @@ fn token_width(token: &Token) -> usize {
         | TokenKind::Else
         | TokenKind::While
         | TokenKind::For
+        | TokenKind::Try
+        | TokenKind::Catch
+        | TokenKind::Finally
+        | TokenKind::Throw
         | TokenKind::Fn
         | TokenKind::Import
         | TokenKind::Null
@@ -342,9 +385,12 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::If => parse_if(cursor),
         TokenKind::While => parse_while(cursor),
         TokenKind::For => parse_for(cursor),
+        TokenKind::Try => parse_try(cursor),
+        TokenKind::Throw => parse_throw(cursor),
         TokenKind::Fn => parse_fn_def(cursor),
         TokenKind::Return => parse_return(cursor),
         TokenKind::Import => parse_import(cursor),
+        TokenKind::Export => parse_export(cursor),
         TokenKind::LBrace => Ok(Stmt::Block(parse_block(cursor)?)),
         _ => parse_assign_or_expr_stmt(cursor),
     }
@@ -485,6 +531,48 @@ fn parse_for(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     Ok(Stmt::For { var, iter, body })
 }
 
+fn parse_throw(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let expr = parse_expr(cursor)?;
+    expect_semicolon(cursor)?;
+    Ok(Stmt::Throw { expr })
+}
+
+fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let body = parse_block(cursor)?;
+    let mut catch_var = None;
+    let mut catch_body: Option<Vec<Stmt>> = None;
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Catch)) {
+        cursor.next();
+        // `catch` com ou sem variavel: `catch e { }` ou `catch { }`.
+        if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBrace)) {
+            catch_var = Some(expect_ident(cursor)?);
+        }
+        catch_body = Some(parse_block(cursor)?);
+    }
+    let mut finally_body = None;
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Finally)) {
+        cursor.next();
+        finally_body = Some(parse_block(cursor)?);
+    }
+    if catch_body.is_none() && finally_body.is_none() {
+        let (line, col) = cursor.end_pos();
+        return Err(ParseError::new(
+            "`try` exige ao menos `catch` ou `finally`",
+            line,
+            col,
+        ));
+    }
+    // `catch` vazio (`catch e { }`) e valido: consome o erro e segue.
+    Ok(Stmt::Try {
+        body,
+        catch_var,
+        catch_body,
+        finally_body,
+    })
+}
+
 fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
     let name = expect_ident(cursor)?;
@@ -522,6 +610,10 @@ fn parse_return(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 
 fn parse_import(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
+    // Seletivo: `import { a, b as c } from "mod.rhp";`.
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBrace)) {
+        return parse_import_names(cursor);
+    }
     let path = match cursor.next() {
         Some(t) => match &t.kind {
             TokenKind::StringLiteral(s) => s.clone(),
@@ -547,6 +639,126 @@ fn parse_import(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     };
     expect_semicolon(cursor)?;
     Ok(Stmt::Import(path))
+}
+
+fn parse_import_names(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next(); // `{`
+    let mut names = Vec::new();
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RBrace)) {
+        let (line, col) = cursor.end_pos();
+        return Err(ParseError::new(
+            "`import { }` vazio: selecione ao menos um nome",
+            line,
+            col,
+        ));
+    }
+    loop {
+        let name = expect_ident(cursor)?;
+        // Alias opcional: `b as c` (`as` e contextual, como `in`/`from`).
+        let alias = match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::Ident(word)) if word == "as" => {
+                cursor.next();
+                Some(expect_ident(cursor)?)
+            }
+            _ => None,
+        };
+        names.push(ImportName { name, alias });
+        match cursor.next() {
+            Some(t) => match &t.kind {
+                TokenKind::Comma => {}
+                TokenKind::RBrace => break,
+                other => {
+                    return Err(ParseError::new(
+                        format!(
+                            "esperado `,` ou `}}` no `import`, encontrado {}",
+                            describe(other)
+                        ),
+                        t.line,
+                        t.col,
+                    ));
+                }
+            },
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `,` ou `}` no `import`, encontrado fim de arquivo",
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    // `from` contextual (identificador posicional, nao reservado).
+    match cursor.next() {
+        Some(t) => match &t.kind {
+            TokenKind::Ident(word) if word == "from" => {}
+            other => {
+                return Err(ParseError::new(
+                    format!(
+                        "esperado `from` apos lista do `import`, encontrado {}",
+                        describe(other)
+                    ),
+                    t.line,
+                    t.col,
+                ));
+            }
+        },
+        None => {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                "esperado `from` apos lista do `import`, encontrado fim de arquivo",
+                line,
+                col,
+            ));
+        }
+    }
+    let path = match cursor.next() {
+        Some(t) => match &t.kind {
+            TokenKind::StringLiteral(s) => s.clone(),
+            other => {
+                return Err(ParseError::new(
+                    format!(
+                        "esperado caminho de modulo (string), encontrado {}",
+                        describe(other)
+                    ),
+                    t.line,
+                    t.col,
+                ));
+            }
+        },
+        None => {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                "esperado caminho de modulo, encontrado fim de arquivo",
+                line,
+                col,
+            ));
+        }
+    };
+    expect_semicolon(cursor)?;
+    Ok(Stmt::ImportNames { path, names })
+}
+
+fn parse_export(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    let (line, col) = cursor
+        .peek()
+        .map_or_else(|| cursor.end_pos(), |t| (t.line, t.col));
+    cursor.next();
+    // So `fn`/`let`/`const` no nivel em que o `export` aparece (o loader
+    // rejeita fora do nivel superior, como faz com `import`).
+    let def = match cursor.peek().map(|t| &t.kind) {
+        Some(TokenKind::Fn) => parse_fn_def(cursor)?,
+        Some(TokenKind::Let) => parse_let(cursor)?,
+        Some(TokenKind::Const) => parse_const(cursor)?,
+        _ => {
+            return Err(ParseError::new(
+                "`export` so admite `fn`, `let` ou `const`",
+                line,
+                col,
+            ));
+        }
+    };
+    Ok(Stmt::Export { def: Box::new(def) })
 }
 
 fn parse_block(cursor: &mut Cursor<'_>) -> Result<Vec<Stmt>, ParseError> {
@@ -957,6 +1169,11 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Else => "`else`".to_string(),
         TokenKind::While => "`while`".to_string(),
         TokenKind::For => "`for`".to_string(),
+        TokenKind::Try => "`try`".to_string(),
+        TokenKind::Catch => "`catch`".to_string(),
+        TokenKind::Finally => "`finally`".to_string(),
+        TokenKind::Throw => "`throw`".to_string(),
+        TokenKind::Export => "`export`".to_string(),
         TokenKind::Fn => "`fn`".to_string(),
         TokenKind::Const => "`const`".to_string(),
         TokenKind::Break => "`break`".to_string(),
@@ -1302,9 +1519,95 @@ mod tests {
     }
 
     #[test]
-    fn rejects_import_without_string() {
-        let err = lex_and_parse("import 42;").expect_err("deve falhar");
-        assert!(err.message.contains("caminho de modulo"));
+    fn parses_try_catch_finally_and_throw() {
+        let program =
+            lex_and_parse("try { echo 1; } catch e { echo e; } finally { echo 2; } throw \"x\";")
+                .expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![
+                Stmt::Try {
+                    body: vec![Stmt::Echo { expr: Expr::Int(1) }],
+                    catch_var: Some("e".to_string()),
+                    catch_body: Some(vec![Stmt::Echo {
+                        expr: Expr::Var("e".to_string()),
+                    }]),
+                    finally_body: Some(vec![Stmt::Echo { expr: Expr::Int(2) }]),
+                },
+                Stmt::Throw {
+                    expr: Expr::StringLiteral("x".to_string()),
+                },
+            ]
+        );
+        // `catch` sem variavel e `try` so com `finally` sao validos.
+        let program =
+            lex_and_parse("try { echo 1; } catch { echo 2; }").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Try {
+                catch_var: None,
+                finally_body: None,
+                ..
+            }
+        ));
+        let program =
+            lex_and_parse("try { echo 1; } finally { echo 2; }").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Try {
+                catch_var: None,
+                finally_body: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_try_without_catch_nor_finally() {
+        let err = lex_and_parse("try { echo 1; }").expect_err("deve falhar");
+        assert!(err.message.contains("ao menos"), "obteve: {}", err.message);
+    }
+
+    #[test]
+    fn parses_export_prefix_and_selective_import() {
+        let program = lex_and_parse("export fn dobro(x) { return x; } export let base = 40;")
+            .expect("parse deve passar");
+        assert!(matches!(program.statements[0], Stmt::Export { .. }));
+        let program = lex_and_parse("import { dobro, base as b } from \"mat.rhp\";")
+            .expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::ImportNames {
+                path: "mat.rhp".to_string(),
+                names: vec![
+                    ImportName {
+                        name: "dobro".to_string(),
+                        alias: None,
+                    },
+                    ImportName {
+                        name: "base".to_string(),
+                        alias: Some("b".to_string()),
+                    },
+                ],
+            }]
+        );
+        // `from`/`as` seguem identificadores comuns fora do `import`.
+        let program = lex_and_parse("let from = 1; let a_as_b = 2;").expect("parse deve passar");
+        assert_eq!(program.statements.len(), 2);
+    }
+
+    #[test]
+    fn rejects_bad_export_and_import_forms() {
+        let err = lex_and_parse("export echo 1;").expect_err("deve falhar");
+        assert!(
+            err.message.contains("`fn`, `let` ou `const`"),
+            "obteve: {}",
+            err.message
+        );
+        let err = lex_and_parse("import { a } \"m.rhp\";").expect_err("deve falhar");
+        assert!(err.message.contains("`from`"), "obteve: {}", err.message);
+        let err = lex_and_parse("import { } from \"m.rhp\";").expect_err("deve falhar");
+        assert!(err.message.contains("vazio"), "obteve: {}", err.message);
     }
 
     #[test]
