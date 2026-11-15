@@ -18,7 +18,8 @@
 - [x] CP9 Documentacao: specs/ADRs/README/CHANGELOG consistentes.
 - [ ] Pendente (requer aprovacao): RFC de tipos, exports/gerenciador de
   pacotes, PG/Redis com servidores reais, async (runtime), classes/generics,
-  LSP, otimizacoes com protocolo antes/depois.
+  LSP, `rhp fmt` preservando comentarios e linhas em branco, otimizacoes com
+  protocolo antes/depois.
 
 - [x] CHECKPOINT 1: `reports/AUDIT_MASTER.md` (1 P0, 5 P1, 13 P2, 10 P3, 7 P4).
 - [x] CHECKPOINT 3: P0/P1 corrigidos (teto de profundidade 128, fmt roundtrip,

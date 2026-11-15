@@ -1,0 +1,29 @@
+// Mini banco EM MEMORIA (simulacao com arrays e mapas).
+// O RHP ainda nao tem drivers de PostgreSQL/Redis (ver ROADMAP.md);
+// este exemplo mostra o padrao tabela = lista de registros.
+let usuarios = [];
+
+fn inserir(tabela, nome, idade) {
+  return push(tabela, {nome: nome, idade: idade});
+}
+
+fn selecionar_por_nome(tabela, nome) {
+  let i = 0;
+  while i < len(tabela) {
+    if tabela[i]["nome"] == nome {
+      return tabela[i];
+    }
+    i = i + 1;
+  }
+  return null;
+}
+
+fn contar(tabela) {
+  return len(tabela);
+}
+
+usuarios = inserir(usuarios, "Ada", 36);
+usuarios = inserir(usuarios, "Linus", 55);
+echo contar(usuarios);
+echo selecionar_por_nome(usuarios, "Ada");
+echo selecionar_por_nome(usuarios, "Inexistente");

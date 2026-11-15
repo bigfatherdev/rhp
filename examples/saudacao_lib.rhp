@@ -1,0 +1,4 @@
+// Biblioteca de exemplo para `import` (usada por saudacao.rhp).
+fn saudacao(nome) {
+  return "ola, " + nome + "!";
+}

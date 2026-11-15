@@ -1,0 +1,4 @@
+// Demonstra `import`: carrega saudacao_lib.rhp do mesmo diretorio.
+import "saudacao_lib.rhp";
+
+echo saudacao("mundo");

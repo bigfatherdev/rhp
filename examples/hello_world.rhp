@@ -1,0 +1,3 @@
+// Ola, mundo em RHP: o primeiro programa.
+echo "Hello, world!";
+echo "Hello from RHP!";

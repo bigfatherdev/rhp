@@ -1,0 +1,22 @@
+// Agenda simples: contatos como mapas dentro de um array, com busca.
+let contatos = [
+  {nome: "Ada", fone: "1111"},
+  {nome: "Linus", fone: "2222"},
+  {nome: "Grace", fone: "3333"}
+];
+
+fn buscar(lista, nome) {
+  let i = 0;
+  while i < len(lista) {
+    if lista[i]["nome"] == nome {
+      return lista[i]["fone"];
+    }
+    i = i + 1;
+  }
+  return null;
+}
+
+echo len(contatos);
+echo buscar(contatos, "Linus");
+echo buscar(contatos, "Ninguem");
+echo keys(contatos[0]);

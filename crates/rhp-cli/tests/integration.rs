@@ -432,6 +432,12 @@ fn rhp_run_all_examples_succeed() {
         if path.file_name().and_then(|n| n.to_str()) == Some("fib.rhp") {
             assert_eq!(output.stdout, b"55\n");
         }
+        if path.file_name().and_then(|n| n.to_str()) == Some("fatorial.rhp") {
+            assert_eq!(output.stdout, b"720\n");
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("hello_world.rhp") {
+            assert_eq!(output.stdout, b"Hello, world!\nHello from RHP!\n");
+        }
     }
     assert!(count >= 1, "nenhum exemplo encontrado em examples/");
 }

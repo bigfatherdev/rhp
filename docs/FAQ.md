@@ -34,6 +34,12 @@ timeout proprio). Para o resto, aguarde evolucao com RFC.
 **Como limito um programa possivelmente infinito?**
 `rhp run --max-steps N <arquivo>` (ou `VmLimits` via API interna).
 
+**Como conecto em banco de dados (PostgreSQL/Redis)?**
+Ainda nao ha drivers nem bibliotecas de rede para bancos — estao planejados
+(ver `ROADMAP.md`) e exigem servidores reais para validar. Para modelar dados
+em memoria, use arrays de mapas (ver `examples/mini_db.rhp` e
+`examples/agenda.rhp`).
+
 **Onde esta a especificacao de verdade?**
 `LANGUAGE_SPEC.md` (linguagem), `BYTECODE_SPEC.md`, `VM_SPEC.md`,
 `MEMORY_MODEL.md`. Este `docs/` e guia; em divergencia, valem as specs e,
