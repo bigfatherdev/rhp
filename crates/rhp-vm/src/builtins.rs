@@ -420,6 +420,27 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+        Builtin::HttpFetch => {
+            let url = match &args[0] {
+                Value::Str(url) => url.clone(),
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_fetch` exige string (url), encontrado {}",
+                        type_name(other)
+                    )));
+                }
+            };
+            let opts = match &args[1] {
+                Value::Map(opts) => parse_fetch_opts(opts)?,
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_fetch` exige mapa de opcoes, encontrado {}",
+                        type_name(other)
+                    )));
+                }
+            };
+            http_fetch_body(&url, &opts)
+        }
     }
 }
 
@@ -472,18 +493,149 @@ fn compare_int_float(i: i64, f: f64) -> std::cmp::Ordering {
     }
 }
 
-/// Cliente HTTP minimo (somente `http://`), sem dependencias externas.
-///
-/// Timeouts de 5s para conexao e leitura; aceita apenas status 2xx e
-/// corpo UTF-8 de ate [`MAX_HTTP_BODY`] bytes. A resolucao DNS usa o
-/// resolvedor do sistema e nao tem timeout proprio (limitacao documentada).
-/// Erros sao `VmError` com mensagem (sem panics).
-pub(super) fn http_get_body(url: &str) -> Result<String, VmError> {
+/// Opcoes de `http_fetch` (tudo opcional; padroes = comportamento util).
+struct FetchOpts {
+    /// Seguir redirects 301/302/303/307/308 (padrao: sim).
+    follow: bool,
+    /// Teto de redirects seguidos (0–10; padrao: 5).
+    max_redirects: u32,
+    /// Timeout de conexao e leitura por requisicao (padrao: 5 s).
+    timeout: std::time::Duration,
+    /// Cabecalhos extras (`Nome: valor`).
+    headers: Vec<(String, String)>,
+}
+
+/// Teto de redirects aceito em `max_redirecionamentos`.
+const MAX_REDIRECT_OPT: u32 = 10;
+
+/// Timeout maximo aceito em `timeout` (segundos).
+const MAX_TIMEOUT_SECS: f64 = 60.0;
+
+fn parse_fetch_opts(opts: &std::collections::HashMap<String, Value>) -> Result<FetchOpts, VmError> {
+    let mut follow = true;
+    let mut max_redirects = 5u32;
+    let mut timeout = std::time::Duration::from_secs(5);
+    let mut headers = Vec::new();
+    for (key, value) in opts {
+        match key.as_str() {
+            "seguir" => match value {
+                Value::Bool(b) => follow = *b,
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_fetch`: `seguir` exige bool, encontrado {}",
+                        type_name(other)
+                    )));
+                }
+            },
+            "max_redirecionamentos" => match value {
+                Value::Int(n) if (0..=i64::from(MAX_REDIRECT_OPT)).contains(n) => {
+                    max_redirects = *n as u32;
+                }
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_fetch`: `max_redirecionamentos` exige 0–{MAX_REDIRECT_OPT}, encontrado {}",
+                        value_desc(other)
+                    )));
+                }
+            },
+            "timeout" => {
+                let secs = match value {
+                    Value::Int(n) => *n as f64,
+                    Value::Float(n) => *n,
+                    other => {
+                        return Err(VmError::new(format!(
+                            "`http_fetch`: `timeout` exige segundos (numero), encontrado {}",
+                            type_name(other)
+                        )));
+                    }
+                };
+                if !secs.is_finite() || secs <= 0.0 || secs > MAX_TIMEOUT_SECS {
+                    return Err(VmError::new(format!(
+                        "`http_fetch`: `timeout` exige 0–{MAX_TIMEOUT_SECS}s, encontrado {secs}"
+                    )));
+                }
+                timeout = std::time::Duration::from_secs_f64(secs);
+            }
+            "headers" => match value {
+                Value::Map(entries) => {
+                    for (name, item) in entries {
+                        let item = match item {
+                            Value::Str(item) => item.clone(),
+                            other => {
+                                return Err(VmError::new(format!(
+                                    "`http_fetch`: cabecalho `{name}` exige string, encontrado {}",
+                                    type_name(other)
+                                )));
+                            }
+                        };
+                        check_header_field(name, &item)?;
+                        headers.push((name.clone(), item));
+                    }
+                }
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_fetch`: `headers` exige mapa, encontrado {}",
+                        type_name(other)
+                    )));
+                }
+            },
+            "metodo" => match value {
+                Value::Str(method) if method == "GET" => {}
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_fetch`: `metodo` nao suportado (so GET), encontrado {}",
+                        value_desc(other)
+                    )));
+                }
+            },
+            unknown => {
+                return Err(VmError::new(format!(
+                    "`http_fetch`: opcao desconhecida `{unknown}` (use `seguir`, `max_redirecionamentos`, `timeout`, `headers`)"
+                )));
+            }
+        }
+    }
+    Ok(FetchOpts {
+        follow,
+        max_redirects,
+        timeout,
+        headers,
+    })
+}
+
+/// Descricao curta de valor para erros de opcao (sem vazar conteudo longo).
+fn value_desc(value: &Value) -> String {
+    match value {
+        Value::Str(s) if s.len() > 40 => format!("string ({} bytes)", s.len()),
+        other => type_name(other).to_string(),
+    }
+}
+
+/// Rejeita quebra de linha em nome/valor de cabecalho (injection).
+fn check_header_field(name: &str, value: &str) -> Result<(), VmError> {
+    if name.is_empty()
+        || name.bytes().any(|b| b <= b' ' || b == b':' || b == 0x7f)
+        || value.bytes().any(|b| b == b'\r' || b == b'\n')
+    {
+        return Err(VmError::new(format!(
+            "`http_fetch`: cabecalho invalido `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Resposta HTTP crua (status + cabecalhos em minusculas + corpo).
+struct HttpResponse {
+    status: u16,
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// Faz UMA requisicao GET (sem seguir redirects).
+fn do_request(url: &str, opts: &FetchOpts) -> Result<HttpResponse, VmError> {
     use std::io::{Read, Write as _};
     use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
 
-    const TIMEOUT: Duration = Duration::from_secs(5);
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| VmError::new("`http_get` suporta apenas urls `http://`".to_string()))?;
@@ -508,15 +660,19 @@ pub(super) fn http_get_body(url: &str) -> Result<String, VmError> {
         .map_err(|e| VmError::new(format!("`http_get` falhou ao resolver {host}: {e}")))?
         .next()
         .ok_or_else(|| VmError::new(format!("`http_get` sem endereco para {host}")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT).map_err(|e| {
+    let mut stream = TcpStream::connect_timeout(&addr, opts.timeout).map_err(|e| {
         VmError::new(format!(
             "`http_get` falhou ao conectar em {host}:{port}: {e}"
         ))
     })?;
     stream
-        .set_read_timeout(Some(TIMEOUT))
+        .set_read_timeout(Some(opts.timeout))
         .map_err(|e| VmError::new(format!("`http_get` falhou ao configurar timeout: {e}")))?;
-    let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let mut request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n");
+    for (name, item) in &opts.headers {
+        request.push_str(&format!("{name}: {item}\r\n"));
+    }
+    request.push_str("Connection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(|e| VmError::new(format!("`http_get` falhou ao enviar requisicao: {e}")))?;
@@ -546,15 +702,127 @@ pub(super) fn http_get_body(url: &str) -> Result<String, VmError> {
         .position(|window| window == b"\r\n\r\n")
         .ok_or_else(|| VmError::new("`http_get` com resposta sem cabecalhos".to_string()))?;
     let header = String::from_utf8_lossy(&raw[..header_end]);
-    let status_line = header.lines().next().unwrap_or("");
+    let mut lines = header.lines();
+    let status_line = lines.next().unwrap_or("");
     let code = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| VmError::new(format!("`http_get` com status invalido: {status_line:?}")))?;
-    if !(200..300).contains(&code) {
-        return Err(VmError::new(format!("`http_get` retornou status {code}")));
+    let mut headers = std::collections::HashMap::new();
+    for line in lines {
+        if let Some((name, item)) = line.split_once(':') {
+            let entry = headers
+                .entry(name.trim().to_lowercase())
+                .or_insert_with(String::new);
+            if !entry.is_empty() {
+                entry.push_str(", ");
+            }
+            entry.push_str(item.trim());
+        }
     }
-    String::from_utf8(raw[header_end + 4..].to_vec())
+    let body = raw[header_end + 4..].to_vec();
+    Ok(HttpResponse {
+        status: code,
+        headers,
+        body,
+    })
+}
+
+/// Resolve `Location` contra a URL base (absoluto, raiz ou relativo).
+fn resolve_location(base: &str, location: &str) -> Result<String, VmError> {
+    let location = location.trim();
+    if location.starts_with("http://") {
+        return Ok(location.to_string());
+    }
+    if location.starts_with("https://") {
+        return Err(VmError::new(
+            "`http_fetch`: redirect para `https://` nao suportado (sem TLS)".to_string(),
+        ));
+    }
+    let after_scheme = base.strip_prefix("http://").unwrap_or(base);
+    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    if location.starts_with('/') {
+        return Ok(format!("http://{authority}{location}"));
+    }
+    if location.is_empty() {
+        return Err(VmError::new(
+            "`http_fetch`: redirect sem `Location` utilizavel".to_string(),
+        ));
+    }
+    let base_path = &after_scheme[authority_end..];
+    let base_dir = match base_path.rfind('/') {
+        Some(pos) => &base_path[..=pos],
+        None => "/",
+    };
+    Ok(format!("http://{authority}{base_dir}{location}"))
+}
+
+/// `http_fetch(url, opts)`: GET com redirects/headers/timeout; devolve
+/// mapa `{status, cabecalhos, corpo}` (status final, mesmo fora de 2xx).
+fn http_fetch_body(url: &str, opts: &FetchOpts) -> Result<Value, VmError> {
+    let mut current = url.to_string();
+    let mut hops = 0u32;
+    loop {
+        let response = do_request(&current, opts)?;
+        let redirect = matches!(response.status, 301 | 302 | 303 | 307 | 308)
+            && response.headers.contains_key("location");
+        if opts.follow && redirect {
+            if hops >= opts.max_redirects {
+                return Err(VmError::new(format!(
+                    "`http_fetch`: redirecionamentos excedidos (limite {})",
+                    opts.max_redirects
+                )));
+            }
+            let location = response
+                .headers
+                .get("location")
+                .expect("location existe")
+                .clone();
+            current = resolve_location(&current, &location)?;
+            hops += 1;
+            continue;
+        }
+        let body = String::from_utf8(response.body)
+            .map_err(|e| VmError::new(format!("`http_fetch` com corpo nao UTF-8: {e}")))?;
+        let mut entries = std::collections::HashMap::with_capacity(3);
+        entries.insert("status".to_string(), Value::Int(i64::from(response.status)));
+        entries.insert(
+            "cabecalhos".to_string(),
+            Value::Map(
+                response
+                    .headers
+                    .into_iter()
+                    .map(|(k, v)| (k, Value::Str(v)))
+                    .collect(),
+            ),
+        );
+        entries.insert("corpo".to_string(), Value::Str(body));
+        return Ok(Value::Map(entries));
+    }
+}
+/// Cliente HTTP minimo (somente `http://`), sem dependencias externas.
+///
+/// Timeouts de 5s para conexao e leitura; aceita apenas status 2xx e
+/// corpo UTF-8 de ate [`MAX_HTTP_BODY`] bytes. A resolucao DNS usa o
+/// resolvedor do sistema e nao tem timeout proprio (limitacao documentada).
+/// Erros sao `VmError` com mensagem (sem panics). Comportamento identico
+/// ao da Fase 6 (congelado; evolucao vai em `http_fetch`).
+pub(super) fn http_get_body(url: &str) -> Result<String, VmError> {
+    let opts = FetchOpts {
+        follow: false,
+        max_redirects: 0,
+        timeout: std::time::Duration::from_secs(5),
+        headers: Vec::new(),
+    };
+    let response = do_request(url, &opts)?;
+    if !(200..300).contains(&response.status) {
+        return Err(VmError::new(format!(
+            "`http_get` retornou status {}",
+            response.status
+        )));
+    }
+    String::from_utf8(response.body)
         .map_err(|e| VmError::new(format!("`http_get` com corpo nao UTF-8: {e}")))
 }

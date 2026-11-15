@@ -61,6 +61,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - Datas/horas std-only: `now()` (epoch), `sleep(s)` (teto 1h) e
   `date_str(ts)` (ISO UTC).
   Registro: `changes/2026-11-15-feat-datas-horas.md`.
+- Rede v2: `http_fetch(url, opts)` (redirects, headers, timeout;
+  `http_get` preservado). Fase A concluída.
+  Registro: `changes/2026-11-15-feat-rede-v2.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).

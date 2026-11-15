@@ -70,7 +70,8 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 - [x] A2: exceções implementadas (lexer/parser/bytecode/VM/fmt/CLI/specs).
 - [x] A3: namespaces/exports (ADR 0009 implementada: `export` + seletivo).
 - [x] A4: datas/horas std-only (`now`, `sleep`, `date_str`).
-- [ ] A5: rede v2 (redirects/headers/timeouts).
+- [x] A5: rede v2 (`http_fetch`: redirects, headers, timeout).
+  **Fase A concluída** (fundação do runtime de sistemas).
 - [ ] Fase B: persistência (ADR SQLite, driver, PostgreSQL com servidor
   real).
 - [ ] Fase C: servidor HTTP (RFC concorrência, router, middleware,

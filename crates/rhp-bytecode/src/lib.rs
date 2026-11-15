@@ -123,6 +123,8 @@ pub enum Builtin {
     Sleep,
     /// `date_str(ts)` — `Int` (epoch) => `"AAAA-MM-DDTHH:MM:SSZ"` (UTC).
     DateStr,
+    /// `http_fetch(url, opts)` — GET com redirects/headers/timeout (Fase A5).
+    HttpFetch,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -172,6 +174,7 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "now" => Some(Builtin::Now),
         "sleep" => Some(Builtin::Sleep),
         "date_str" => Some(Builtin::DateStr),
+        "http_fetch" => Some(Builtin::HttpFetch),
         _ => None,
     }
 }
@@ -219,7 +222,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Merge
         | Builtin::Has
         | Builtin::FsWrite
-        | Builtin::FsAppend => 2,
+        | Builtin::FsAppend
+        | Builtin::HttpFetch => 2,
         Builtin::Replace => 3,
     }
 }
@@ -356,6 +360,7 @@ impl BuiltinId {
             40 => Ok(Builtin::Now),
             41 => Ok(Builtin::Sleep),
             42 => Ok(Builtin::DateStr),
+            43 => Ok(Builtin::HttpFetch),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -407,6 +412,7 @@ impl From<Builtin> for BuiltinId {
             Builtin::Now => 40,
             Builtin::Sleep => 41,
             Builtin::DateStr => 42,
+            Builtin::HttpFetch => 43,
         };
         Self(id)
     }
@@ -1864,6 +1870,7 @@ mod tests {
             Builtin::Now,
             Builtin::Sleep,
             Builtin::DateStr,
+            Builtin::HttpFetch,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

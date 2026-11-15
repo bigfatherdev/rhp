@@ -1606,6 +1606,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bad_fetch_opts() {
+        // Nao-map, chave desconhecida, tipos errados, limites.
+        for bad in [
+            "echo http_fetch(\"http://x/\", 42);",
+            "echo http_fetch(\"http://x/\", {x: 1});",
+            "echo http_fetch(\"http://x/\", {seguir: 1});",
+            "echo http_fetch(\"http://x/\", {max_redirecionamentos: 99});",
+            "echo http_fetch(\"http://x/\", {max_redirecionamentos: -1});",
+            "echo http_fetch(\"http://x/\", {timeout: 0});",
+            "echo http_fetch(\"http://x/\", {timeout: 61});",
+            "echo http_fetch(\"http://x/\", {timeout: \"x\"});",
+            "echo http_fetch(\"http://x/\", {headers: [1]});",
+            "echo http_fetch(\"http://x/\", {headers: {\"X\": 1}});",
+            "echo http_fetch(\"http://x/\", {metodo: \"POST\"});",
+            "echo http_fetch(42, {});",
+        ] {
+            let err = run_err(bad);
+            assert!(err.contains("http_fetch"), "obteve: {err} em {bad}");
+        }
+        // `https://` rejeitado (sem TLS nesta fase).
+        let err = run_err("echo http_fetch(\"https://x/\", {});");
+        assert!(err.contains("http://"), "obteve: {err}");
+        // `http_get` estrito nao mudou (redirect = erro `retornou status`).
+    }
+
+    #[test]
     fn while_body_scope_does_not_leak_on_break() {
         // Regressao: `let` no corpo do `while` + `break` vazava para fora.
         let err = run_err("while true { let vazou = 1; break; } echo vazou;");

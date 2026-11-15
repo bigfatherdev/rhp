@@ -50,7 +50,7 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 | `TryEnd` | Remove o handler (caminho normal). Sem handler = erro. |
 | `Throw` | Desempilha valor e inicia unwinding (frame atual para a base). |
 | `Rethrow` | Relanca o erro em propagacao (fim de `finally` sem `catch`). |
-| `CallBuiltin(id)` | Executa builtin de id 0–42 com aridade fixa (tabela §4). |
+| `CallBuiltin(id)` | Executa builtin de id 0–43 com aridade fixa (tabela §4). |
 
 ## 3. Compilacao (Marco 2 + Fases 3–4)
 
@@ -96,7 +96,7 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 23 Pow 24 Floor 25 Ceil 26 Values 27 Entries 28 Merge 29 Has
 30 FsRead 31 FsWrite 32 FsAppend 33 FsExists 34 Argv 35 Env
 36 Sort 37 Exit 38 JsonParse 39 JsonStringify
-40 Now 41 Sleep 42 DateStr`
+40 Now 41 Sleep 42 DateStr 43 HttpFetch`
 (aridades na tabela §6 de `LANGUAGE_SPEC.md`). Ids desconhecidos invalidam
 o chunk; `BuiltinId` tem teste anti-deriva.
 
