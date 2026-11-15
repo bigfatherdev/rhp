@@ -9,7 +9,14 @@ use rhp_bytecode::{Builtin, Value};
 /// Corpo maximo aceito por `http_get` (protecao contra exaustao de memoria).
 pub const MAX_HTTP_BODY: usize = 1024 * 1024;
 
-pub(super) fn call_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, VmError> {
+/// Teto de leitura de `fs_read` (protecao contra exaustao de memoria).
+pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+pub(super) fn call_builtin(
+    builtin: Builtin,
+    args: &[Value],
+    argv: &[String],
+) -> Result<Value, VmError> {
     match builtin {
         Builtin::Len => match &args[0] {
             Value::Array(items) => Ok(Value::Int(items.len() as i64)),
@@ -313,6 +320,65 @@ pub(super) fn call_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, Vm
             Value::Bool(false) => Err(VmError::new("falha de assercao".to_string())),
             other => Err(VmError::new(format!(
                 "`assert` exige bool, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::FsRead => match &args[0] {
+            Value::Str(path) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|e| VmError::new(format!("`fs_read` falhou em `{path}`: {e}")))?;
+                if bytes.len() > MAX_FILE_BYTES {
+                    return Err(VmError::new(format!(
+                        "`fs_read` excedeu o limite ({MAX_FILE_BYTES} bytes): {path}"
+                    )));
+                }
+                String::from_utf8(bytes)
+                    .map(Value::Str)
+                    .map_err(|e| VmError::new(format!("`fs_read` com conteudo nao UTF-8: {e}")))
+            }
+            other => Err(VmError::new(format!(
+                "`fs_read` exige caminho (string), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::FsWrite | Builtin::FsAppend => {
+            let append = matches!(builtin, Builtin::FsAppend);
+            let name = if append { "fs_append" } else { "fs_write" };
+            match (&args[0], &args[1]) {
+                (Value::Str(path), Value::Str(content)) => {
+                    use std::io::Write as _;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true)
+                        .create(true)
+                        .truncate(!append)
+                        .append(append);
+                    let mut file = opts
+                        .open(path)
+                        .map_err(|e| VmError::new(format!("`{name}` falhou em `{path}`: {e}")))?;
+                    file.write_all(content.as_bytes())
+                        .map_err(|e| VmError::new(format!("`{name}` falhou em `{path}`: {e}")))?;
+                    Ok(Value::Int(content.len() as i64))
+                }
+                (other, _) => Err(VmError::new(format!(
+                    "`{name}` exige (caminho, texto), encontrado {}",
+                    type_name(other)
+                ))),
+            }
+        }
+        Builtin::FsExists => match &args[0] {
+            Value::Str(path) => Ok(Value::Bool(std::fs::metadata(path).is_ok())),
+            other => Err(VmError::new(format!(
+                "`fs_exists` exige caminho (string), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Argv => Ok(Value::Array(
+            argv.iter().map(|a| Value::Str(a.clone())).collect(),
+        )),
+        Builtin::Env => match &args[0] {
+            Value::Str(name) => Ok(std::env::var(name).map(Value::Str).unwrap_or(Value::Null)),
+            other => Err(VmError::new(format!(
+                "`env` exige nome (string), encontrado {}",
                 type_name(other)
             ))),
         },

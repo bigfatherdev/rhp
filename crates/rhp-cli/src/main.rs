@@ -14,17 +14,12 @@ const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> | rhp fmt [--che
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.as_slice() {
-        [_, cmd, path] if cmd == "run" => match run_file(path, &mut std::io::stdout()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                let _ = writeln!(std::io::stderr(), "rhp: {message}");
-                ExitCode::from(1)
-            }
-        },
-        [_, cmd, flag, value, path] if cmd == "run" && flag == "--max-steps" => {
+        // `--max-steps` antes do `run` generico: senao `--max-steps` seria
+        // interpretado como caminho do programa.
+        [_, cmd, flag, value, path, rest @ ..] if cmd == "run" && flag == "--max-steps" => {
             match value.parse::<u64>() {
                 Ok(max_steps) => {
-                    match run_file_limited(path, &mut std::io::stdout(), Some(max_steps)) {
+                    match run_file_limited(path, rest, &mut std::io::stdout(), Some(max_steps)) {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(message) => {
                             let _ = writeln!(std::io::stderr(), "rhp: {message}");
@@ -38,6 +33,15 @@ fn main() -> ExitCode {
                         "rhp: valor invalido para --max-steps: `{value}`"
                     );
                     ExitCode::from(2)
+                }
+            }
+        }
+        [_, cmd, path, rest @ ..] if cmd == "run" => {
+            match run_file_with_args(path, rest, &mut std::io::stdout()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                    ExitCode::from(1)
                 }
             }
         }
@@ -240,14 +244,15 @@ fn check_file(path: &str, json: bool) -> Result<(), String> {
     }
 }
 
-/// Executa um arquivo `.rhp` com imports resolvidos.
-fn run_file(path: &str, output: &mut dyn Write) -> Result<(), String> {
-    run_file_limited(path, output, None)
+/// Executa um arquivo `.rhp`, repassando argumentos extras para `argv()`.
+fn run_file_with_args(path: &str, args: &[String], output: &mut dyn Write) -> Result<(), String> {
+    run_file_limited(path, args, output, None)
 }
 
 /// Executa um arquivo `.rhp` com teto opcional de instrucoes.
 fn run_file_limited(
     path: &str,
+    args: &[String],
     output: &mut dyn Write,
     max_steps: Option<u64>,
 ) -> Result<(), String> {
@@ -255,6 +260,7 @@ fn run_file_limited(
     run_program(
         &program,
         path,
+        args,
         output,
         rhp_vm::VmLimits {
             max_steps,
@@ -267,6 +273,7 @@ fn run_file_limited(
 fn run_program(
     program: &Program,
     origin: &str,
+    args: &[String],
     output: &mut dyn Write,
     limits: rhp_vm::VmLimits,
 ) -> Result<(), String> {
@@ -276,6 +283,7 @@ fn run_program(
     })?;
     let mut vm = rhp_vm::Vm::new();
     vm.set_limits(limits);
+    vm.set_argv(args.to_vec());
     vm.run(&chunk, output).map_err(|e| {
         let (code, help) = rhp_diagnostic::runtime_code(&e.to_string());
         with_code(code, help, &format!("{origin}: erro de execucao: {e}"))
@@ -308,7 +316,7 @@ fn parse_with_diagnostics(origin: &str, source: &str) -> Result<Program, LoadErr
 #[cfg(test)]
 fn run_source(source: &str, origin: &str, output: &mut dyn Write) -> Result<(), String> {
     let program = rhp_parser::parse_source(source).map_err(|e| format!("{origin}:{e}"))?;
-    run_program(&program, origin, output, rhp_vm::VmLimits::default())
+    run_program(&program, origin, &[], output, rhp_vm::VmLimits::default())
 }
 
 /// Teto de tamanho de fonte por arquivo (protecao contra OOM no loader).
@@ -489,7 +497,8 @@ mod tests {
     #[test]
     fn reports_missing_file() {
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_file("/caminho/que/nao/existe-12345.rhp", &mut buf).expect_err("deve falhar");
+        let err = run_file_with_args("/caminho/que/nao/existe-12345.rhp", &[], &mut buf)
+            .expect_err("deve falhar");
         assert!(err.contains("modulo nao encontrado"));
     }
 
@@ -499,7 +508,8 @@ mod tests {
         write_temp_module(&dir, "lib.rhp", "let x = 1;\n");
         let main = write_temp_module(&dir, "main.rhp", "fn f() {\n  import \"lib.rhp\";\n}\n");
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_file(&main.to_string_lossy(), &mut buf).expect_err("deve falhar");
+        let err =
+            run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect_err("deve falhar");
         assert!(err.contains("nivel superior"), "obteve: {err}");
     }
 
@@ -511,7 +521,8 @@ mod tests {
         write_temp_module(&dir, "fora.rhp", "let smuggled = 1;\n");
         let main = write_temp_module(&sub, "main.rhp", "import \"../fora.rhp\";\n");
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_file(&main.to_string_lossy(), &mut buf).expect_err("deve falhar");
+        let err =
+            run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect_err("deve falhar");
         assert!(err.contains("fora da arvore"), "obteve: {err}");
     }
 
@@ -522,7 +533,8 @@ mod tests {
         let content = "echo 1;\n".repeat(2 * 1024 * 1024);
         std::fs::write(&big, content).expect("nao foi possivel escrever big.rhp");
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_file(&big.to_string_lossy(), &mut buf).expect_err("deve falhar");
+        let err =
+            run_file_with_args(&big.to_string_lossy(), &[], &mut buf).expect_err("deve falhar");
         assert!(err.contains("muito grande"), "obteve: {err}");
     }
 
@@ -531,7 +543,7 @@ mod tests {
         let dir = temp_dir("limite");
         let main = write_temp_module(&dir, "loop.rhp", "while true {\n}\n");
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_file_limited(&main.to_string_lossy(), &mut buf, Some(500))
+        let err = run_file_limited(&main.to_string_lossy(), &[], &mut buf, Some(500))
             .expect_err("deve falhar");
         assert!(err.contains("limite de instrucoes"), "obteve: {err}");
     }
@@ -546,7 +558,7 @@ mod tests {
             "import \"lib.rhp\";\nimport \"lib.rhp\";\necho base + 2;\n",
         );
         let mut buf: Vec<u8> = Vec::new();
-        run_file(&main.to_string_lossy(), &mut buf).expect("deve passar");
+        run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect("deve passar");
         // Import duplicado inclui uma vez: sem erro de `ja declarada`.
         assert_eq!(buf, b"42\n");
     }
@@ -557,7 +569,7 @@ mod tests {
         write_temp_module(&dir, "a.rhp", "import \"b.rhp\";\n");
         let b = write_temp_module(&dir, "b.rhp", "import \"a.rhp\";\n");
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_file(&b.to_string_lossy(), &mut buf).expect_err("deve falhar");
+        let err = run_file_with_args(&b.to_string_lossy(), &[], &mut buf).expect_err("deve falhar");
         assert!(err.contains("importacao circular"));
     }
 }

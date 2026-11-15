@@ -2,9 +2,11 @@
 
 Uso geral: `rhp <comando> [opcoes] <arquivo.rhp>`
 
-## `rhp run [--max-steps N] <arquivo.rhp>`
+## `rhp run [--max-steps N] <arquivo.rhp> [args...]`
 
-Executa o programa (resolve `import`s antes de compilar).
+Executa o programa (resolve `import`s antes de compilar). Argumentos apos
+o arquivo vao para `argv()` (ex.: `rhp run prog.rhp a b` => `argv()` e
+`["a", "b"]`).
 
 | Codigo de saida | Significado |
 |---|---|

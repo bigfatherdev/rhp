@@ -168,6 +168,11 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `entries(m)` | `Array` de pares `[chave, valor]`, chaves ordenadas. |
 | `merge(a, b)` | Uniao; chaves de `b` vencem. |
 | `has(m, chave)` | `true` se a chave existe. |
+| `fs_read(caminho)` | Conteudo do arquivo (`Str` UTF-8); erro de I/O ou > 8 MiB = erro. |
+| `fs_write(caminho, texto)` / `fs_append(caminho, texto)` | Escreve/anexa; retorna bytes escritos. Caminhos relativos resolvem no diretorio atual; roda com as permissoes do usuario. |
+| `fs_exists(caminho)` | `true` se legivel (qualquer falha = `false`). |
+| `argv()` | `Array` de `Str` com os argumentos apos o arquivo (`rhp run prog.rhp a b` => `["a", "b"]`). |
+| `env(nome)` | Valor da variavel de ambiente ou `null` se ausente. |
 | `http_get(url)` | (Fase 6) GET `http://host[:porta]/caminho` com timeouts de 5s (conexao/leitura; DNS usa o resolvedor do sistema, sem timeout proprio), teto de corpo de 1 MiB, so 2xx e corpo UTF-8; resto = erro. Somente esquema `http://`. |
 
 Exemplo:

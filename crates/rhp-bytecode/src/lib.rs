@@ -103,6 +103,12 @@ pub enum Builtin {
     Entries,
     Merge,
     Has,
+    FsRead,
+    FsWrite,
+    FsAppend,
+    FsExists,
+    Argv,
+    Env,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -139,6 +145,12 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "entries" => Some(Builtin::Entries),
         "merge" => Some(Builtin::Merge),
         "has" => Some(Builtin::Has),
+        "fs_read" => Some(Builtin::FsRead),
+        "fs_write" => Some(Builtin::FsWrite),
+        "fs_append" => Some(Builtin::FsAppend),
+        "fs_exists" => Some(Builtin::FsExists),
+        "argv" => Some(Builtin::Argv),
+        "env" => Some(Builtin::Env),
         _ => None,
     }
 }
@@ -146,6 +158,7 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
 #[must_use]
 pub const fn builtin_arity(builtin: Builtin) -> usize {
     match builtin {
+        Builtin::Argv => 0,
         Builtin::Len
         | Builtin::Pop
         | Builtin::Keys
@@ -163,9 +176,11 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Floor
         | Builtin::Ceil
         | Builtin::Values
-        | Builtin::Entries => 1,
+        | Builtin::Entries
+        | Builtin::FsRead
+        | Builtin::FsExists
+        | Builtin::Env => 1,
         Builtin::Push
-        | Builtin::Has
         | Builtin::Contains
         | Builtin::StartsWith
         | Builtin::EndsWith
@@ -174,7 +189,10 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Min
         | Builtin::Max
         | Builtin::Pow
-        | Builtin::Merge => 2,
+        | Builtin::Merge
+        | Builtin::Has
+        | Builtin::FsWrite
+        | Builtin::FsAppend => 2,
         Builtin::Replace => 3,
     }
 }
@@ -286,6 +304,12 @@ impl BuiltinId {
             27 => Ok(Builtin::Entries),
             28 => Ok(Builtin::Merge),
             29 => Ok(Builtin::Has),
+            30 => Ok(Builtin::FsRead),
+            31 => Ok(Builtin::FsWrite),
+            32 => Ok(Builtin::FsAppend),
+            33 => Ok(Builtin::FsExists),
+            34 => Ok(Builtin::Argv),
+            35 => Ok(Builtin::Env),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -324,6 +348,12 @@ impl From<Builtin> for BuiltinId {
             Builtin::Entries => 27,
             Builtin::Merge => 28,
             Builtin::Has => 29,
+            Builtin::FsRead => 30,
+            Builtin::FsWrite => 31,
+            Builtin::FsAppend => 32,
+            Builtin::FsExists => 33,
+            Builtin::Argv => 34,
+            Builtin::Env => 35,
         };
         Self(id)
     }
@@ -1393,6 +1423,12 @@ mod tests {
             Builtin::Entries,
             Builtin::Merge,
             Builtin::Has,
+            Builtin::FsRead,
+            Builtin::FsWrite,
+            Builtin::FsAppend,
+            Builtin::FsExists,
+            Builtin::Argv,
+            Builtin::Env,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

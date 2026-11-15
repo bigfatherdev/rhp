@@ -170,6 +170,29 @@ fn rhp_run_resolves_imports() {
 }
 
 #[test]
+fn rhp_run_passes_extra_args_to_argv() {
+    // `run_temp_source` nao passa args: sem args, argv() e vazio.
+    let empty = run_temp_source("args0.rhp", "echo len(argv());\n");
+    assert!(empty.status.success());
+    assert_eq!(empty.stdout, b"0\n");
+    // Com args extras, o binario os repassa para `argv()`.
+    let dir = std::env::temp_dir().join(format!("rhp-test-argv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    let file = dir.join("args2.rhp");
+    std::fs::write(&file, "echo len(argv());\necho argv()[1];\n").expect("write");
+    let output = Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .args(["run", &file.to_string_lossy(), "ola", "mundo"])
+        .output()
+        .expect("rhp run com args");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"2\nmundo\n");
+}
+
+#[test]
 fn rhp_run_max_steps_stops_infinite_loop() {
     let output = Command::new(env!("CARGO_BIN_EXE_rhp"))
         .args(["run", "--max-steps", "1000"])

@@ -78,6 +78,7 @@ pub struct Vm {
     globals: HashMap<String, Value>,
     limits: VmLimits,
     steps: u64,
+    argv: Vec<String>,
 }
 
 impl Vm {
@@ -88,7 +89,13 @@ impl Vm {
             globals: HashMap::new(),
             limits: VmLimits::default(),
             steps: 0,
+            argv: Vec::new(),
         }
+    }
+
+    /// Define os argumentos de linha de comando visiveis via `argv()`.
+    pub fn set_argv(&mut self, args: Vec<String>) {
+        self.argv = args;
     }
 
     /// Define limites opcionais de execucao (ver [`VmLimits`]).
@@ -422,7 +429,7 @@ impl Vm {
                     }
                 }
                 args.reverse();
-                let result = call_builtin(builtin, &args)?;
+                let result = call_builtin(builtin, &args, &self.argv)?;
                 self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
@@ -1395,6 +1402,47 @@ mod tests {
             .expect_err("deve falhar")
             .message
             .contains("fora de laco"));
+    }
+
+    #[test]
+    fn runs_fs_and_env_builtins() {
+        let dir = std::env::temp_dir().join(format!("rhp-fs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir temporario");
+        let path = dir.join("dado.txt").to_string_lossy().into_owned();
+        assert_eq!(
+            run_src(&format!("echo fs_write(\"{path}\", \"ola\");")).expect("ok"),
+            "3\n"
+        );
+        assert_eq!(
+            run_src(&format!("echo fs_append(\"{path}\", \"!\");")).expect("ok"),
+            "1\n"
+        );
+        assert_eq!(
+            run_src(&format!("echo fs_read(\"{path}\");")).expect("ok"),
+            "ola!\n"
+        );
+        assert_eq!(
+            run_src(&format!("echo fs_exists(\"{path}\");")).expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src(&format!(
+                "echo fs_exists(\"{}/nao-existe.rhp\");",
+                dir.display()
+            ))
+            .expect("ok"),
+            "false\n"
+        );
+        std::env::set_var("RHP_TESTE_UNICO_XYZ", "123");
+        assert_eq!(
+            run_src("echo env(\"RHP_TESTE_UNICO_XYZ\");").expect("ok"),
+            "123\n"
+        );
+        assert_eq!(
+            run_src("echo env(\"RHP_INEXISTENTE_XYZ\");").expect("ok"),
+            "null\n"
+        );
+        assert_eq!(run_src("echo len(argv());").expect("ok"), "0\n");
     }
 
     #[test]
