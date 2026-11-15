@@ -49,7 +49,9 @@ Validador iterativo (sem recursao nova); analise O(instrucoes).
 - Ajuste honesto: teste de runtime `Print` isolado agora falha na validacao
   (mensagem ainda menciona `pilha`); e um bug real encontrado no caminho
   (efeito de `CallBuiltin`).
-- `cargo test --workspace`: 138 testes, 0 falhas.
+- `cargo test --workspace`: todos os testes verdes, 0 falhas
+  (+2 testes novos de fluxo no bytecode, +1 adaptado de runtime para
+  validacao, +2 de limites `max_stack_depth`/`max_collection_len`).
 - `cargo fmt --check` ok; `cargo clippy ... -D warnings` ok.
 
 ## Limitações e riscos conhecidos

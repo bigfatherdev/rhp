@@ -37,6 +37,24 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).
   Registro: `changes/2026-11-14-feat-fase-6-rede-minima.md`.
+- Diagnosticos estruturados: crate `rhp-diagnostic` (codigos E0xxx–E3xxx,
+  `render` com snippet e `help`) + CLI com `Error[CODIGO]` (ADR 0007).
+  Registro: `changes/2026-11-14-feat-diagnosticos.md`.
+- Verificador de fluxo de pilha no bytecode + `VmLimits` estendido
+  (`max_stack_depth`, `max_collection_len`) + runtime separado em
+  `rhp-vm/src/builtins.rs` (ADR 0008).
+  Registro: `changes/2026-11-14-feat-verificador-pilha.md`.
+- Dedup de constantes e interning O(1) de nomes (sem mudanca semantica;
+  tradeoff documentado) + `reports/MEMORY_MODEL.md`.
+  Registro: `changes/2026-11-14-feat-memoria-cp3.md`.
+- `rhp check [--json]` (lex+imports+compile sem executar), gramatica VSCode
+  versionada com teste de consistencia, desenho de debugger
+  (`docs/DEBUGGER_DESIGN.md`) — sem debugger improvisado (ADR 0010).
+  Registro: `changes/2026-11-14-feat-devtools-check.md`.
+- Modulos v2: apenas semantica proposta em ADR (sem codigo).
+  Registro: `changes/2026-11-14-docs-modulos-v2.md`.
+- Auditoria de maturidade Next Generation.
+  Registro: `changes/2026-11-14-docs-nextgen-audit.md`.
 
 ### Fixed
 

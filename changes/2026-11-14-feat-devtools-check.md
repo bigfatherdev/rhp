@@ -49,8 +49,8 @@ dependências; escaping total de controle.
 
 ## Testes e validação
 
-- `cargo test --workspace`: 141 testes, 0 falhas (15 de integração,
-  incluindo `check`, `--json` e gramática).
+- `cargo test --workspace`: todos os testes verdes, 0 falhas
+  (+2 testes de integracao: `check`/`--json` e consistencia da gramatica).
 - `cargo fmt --check` ok; `cargo clippy --workspace --all-targets -- -D warnings` ok.
 
 ## Limitações e riscos conhecidos

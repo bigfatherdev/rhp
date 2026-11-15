@@ -45,7 +45,8 @@ Migração: não necessária.
 ## Testes e validação
 
 - Falha-antes: teste de pool falhou (2000 entradas).
-- `cargo test --workspace`: 128 testes, 0 falhas.
+- `cargo test --workspace`: todos os testes verdes, 0 falhas
+  (+1 teste de pool: 2000 literais iguais => 1 entrada).
 - `cargo fmt --check` ok; `cargo clippy ... -D warnings` ok.
 
 ## Limitações e riscos conhecidos

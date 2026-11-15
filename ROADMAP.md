@@ -1,6 +1,24 @@
-# ROADMAP.md — Planejamento e estado (missão de engenharia: CP1–CP3 + docs)
+# ROADMAP.md — Planejamento e estado (missao Next Generation: CP1–CP7)
 
-## Auditoria e fortalecimento (2026-11-14, ramo `feat/engineering-audit`)
+## Auditoria e fortalecimento (2026-11-14, ramos `feat/engineering-audit` e `feat/next-generation`)
+
+- [x] CHECKPOINT 1 (auditoria integral) e CHECKPOINT 1 (maturidade):
+  `reports/AUDIT_MASTER.md`, `reports/NEXT_GENERATION_AUDIT.md`.
+- [x] Correcoes P0/P1, P2 de nucleo, `VmLimits`, jaula/teto de imports.
+- [x] Robustez: corpus malformado, property test, verificacao de exemplos.
+- [x] Benchmarks + baseline (sem otimizacoes sem prova).
+- [x] Docs, CLI (`check`), ADRs 0005–0010.
+- [x] CP2 Diagnosticos: `rhp-diagnostic` (E0xxx–E3xxx + render).
+- [x] CP3 Memoria: decisao por valor + dedup/interning + `reports/MEMORY_MODEL.md`.
+- [x] CP4 Bytecode/VM: fluxo de pilha + `VmLimits` estendido + `builtins.rs`.
+- [x] CP5 Modulos: ADR 0009 (semantica, sem codigo).
+- [x] CP6 DevTools: `rhp check [--json]`, gramatica VSCode, desenho de debugger.
+- [x] CP7 Seguranca: limites documentados/testados, sem sandbox ficticia.
+- [x] CP8 Performance: harness + baseline; nenhuma otimizacao sem prova.
+- [x] CP9 Documentacao: specs/ADRs/README/CHANGELOG consistentes.
+- [ ] Pendente (requer aprovacao): RFC de tipos, exports/gerenciador de
+  pacotes, PG/Redis com servidores reais, async (runtime), classes/generics,
+  LSP, otimizacoes com protocolo antes/depois.
 
 - [x] CHECKPOINT 1: `reports/AUDIT_MASTER.md` (1 P0, 5 P1, 13 P2, 10 P3, 7 P4).
 - [x] CHECKPOINT 3: P0/P1 corrigidos (teto de profundidade 128, fmt roundtrip,

@@ -44,9 +44,9 @@ Render O(linha); sem I/O extra. Sem `unsafe`.
 
 ## Testes e validação
 
-- 5 testes unitários (formato exato, sem fonte, 3 tabelas de mapeamento) +
-  integração (`Error[E0001/E1004/E3001]` + caret + snippet + help).
-- `cargo test --workspace`: 126 testes, 0 falhas.
+- 5 testes unitarios (formato exato, sem fonte, 3 tabelas de mapeamento) +
+  integracao (`Error[E0001/E1004/E3001]` + caret + snippet + help).
+- `cargo test --workspace`: suite completa verde, 0 falhas.
 - `cargo fmt --check` ok; `cargo clippy ... -D warnings` ok.
 
 ## Limitações e riscos conhecidos
