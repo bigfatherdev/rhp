@@ -37,6 +37,33 @@
   async (runtime), classes/generics, LSP, otimizações com protocolo
   antes/depois.
 
+## Fase 7 — Paridade PHP, lote imediato (em andamento, 2026-11-15)
+
+Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
+
+- [x] Sintaxe lote 2: bitwise, ternario, `??`, `break`/`continue`, `const`
+  (`changes/2026-11-15-feat-sintaxe-lote2.md`).
+- [x] Stdlib: 20 builtins — strings, matematica, mapas — ids 10–29
+  (`changes/2026-11-15-feat-stdlib-lote1.md`; nota: o registro lote2
+  diz "19, ids 10-28" por engano — vale o correto, sem reescrever o
+  registro anterior).
+- [x] I/O e ambiente: `fs_read/fs_write/fs_append/fs_exists`, `argv()`,
+  `env()`, args repassados (`changes/2026-11-15-feat-io-env.md`).
+- [x] `rhp test` + `rhp doctor`
+  (`changes/2026-11-15-feat-cli-test-doctor.md`).
+- [x] Laco `for-in`, `sort()`, `exit()` + correcao do escopo de
+  `break`/`continue`
+  (`changes/2026-11-15-feat-laco-for-sort-exit.md`,
+  `changes/2026-11-15-fix-laco-escopo-break.md`). 168 testes verdes.
+- [x] JSON std-only: `json_parse`/`json_stringify` sem dependencias, com
+  teto de 128 niveis e erros com posicao
+  (`changes/2026-11-15-feat-json.md`).
+- [ ] Pendente (ordem tecnica): datas/horas, `switch`,
+  `sort`/`filter` com callback (exige primeira-classe), args
+  default/variadicos, destructuring; depois excecoes, closures,
+  namespaces/exports, pacotes, rede v2, tipos, OO, async/DBs/servidor
+  (todos exigem RFC/ADR e gates, cf. auditoria §21).
+
 ## Fase 1 — Fundacao (concluida em 2026-11-14)
 
 - [x] Governanca, workspace, `hello.rhp`, lexer/parser/bytecode/VM/CLI.

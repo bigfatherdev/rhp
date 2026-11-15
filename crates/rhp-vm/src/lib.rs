@@ -14,6 +14,8 @@ mod builtins;
 use builtins::call_builtin;
 pub use builtins::MAX_HTTP_BODY;
 
+mod json;
+
 /// Profundidade maxima da pilha de chamadas (protecao contra estouro).
 pub const MAX_CALL_DEPTH: usize = 512;
 
@@ -34,13 +36,32 @@ pub struct VmLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmError {
     pub message: String,
+    /// Codigo de `exit(codigo)` quando o erro e um pedido de saida;
+    /// `None` para erros comuns. Leitura publica; construcao interna.
+    exit_code: Option<i32>,
 }
 
 impl VmError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            exit_code: None,
         }
+    }
+
+    /// Pedido de `exit(codigo)` (0–255): desenrola frames como erro, mas a
+    /// CLI o traduz em codigo de saida em vez de mensagem de falha.
+    pub(crate) fn exit(code: i32) -> Self {
+        Self {
+            message: format!("exit({code})"),
+            exit_code: Some(code),
+        }
+    }
+
+    /// Codigo de saida pedido por `exit`, se for o caso.
+    #[must_use]
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
     }
 }
 
@@ -78,6 +99,7 @@ pub struct Vm {
     globals: HashMap<String, Value>,
     limits: VmLimits,
     steps: u64,
+    argv: Vec<String>,
 }
 
 impl Vm {
@@ -88,7 +110,13 @@ impl Vm {
             globals: HashMap::new(),
             limits: VmLimits::default(),
             steps: 0,
+            argv: Vec::new(),
         }
+    }
+
+    /// Define os argumentos de linha de comando visiveis via `argv()`.
+    pub fn set_argv(&mut self, args: Vec<String>) {
+        self.argv = args;
     }
 
     /// Define limites opcionais de execucao (ver [`VmLimits`]).
@@ -195,6 +223,20 @@ impl Vm {
             Op::Mul => self.binary(idx, "multiplicacao", mul_values)?,
             Op::Div => self.binary(idx, "divisao", div_values)?,
             Op::Mod => self.binary(idx, "resto", mod_values)?,
+            Op::BitAnd => self.binary(idx, "`&`", bitand_values)?,
+            Op::BitOr => self.binary(idx, "`|`", bitor_values)?,
+            Op::BitXor => self.binary(idx, "`^`", bitxor_values)?,
+            Op::Shl => self.binary(idx, "`<<`", shl_values)?,
+            Op::Shr => self.binary(idx, "`>>`", shr_values)?,
+            Op::Dup => {
+                let value = self.frames[idx]
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| VmError::new("pilha vazia em duplicacao".to_string()))?;
+                self.push_checked(idx, value)?;
+                self.frames[idx].ip += 1;
+            }
             Op::Neg => {
                 let value = self.pop(idx, "operador `-`")?;
                 let result = neg_value(&value)?;
@@ -204,6 +246,12 @@ impl Vm {
             Op::Not => {
                 let value = self.pop(idx, "operador `!`")?;
                 let result = not_value(&value)?;
+                self.push_checked(idx, result)?;
+                self.frames[idx].ip += 1;
+            }
+            Op::BitNot => {
+                let value = self.pop(idx, "operador `~`")?;
+                let result = bitnot_value(&value)?;
                 self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
@@ -253,6 +301,14 @@ impl Vm {
             }
             Op::Jump(target) => {
                 self.frames[idx].ip = target as usize;
+            }
+            Op::JumpIfNotNull(target) => {
+                let value = self.pop(idx, "condicao nula")?;
+                if matches!(value, Value::Null) {
+                    self.frames[idx].ip += 1;
+                } else {
+                    self.frames[idx].ip = target as usize;
+                }
             }
             Op::LoadName(name_idx) => {
                 let name = self.name_of(idx, name_idx)?;
@@ -379,6 +435,25 @@ impl Vm {
                 }
                 self.frames[idx].ip += 1;
             }
+            Op::IterList => {
+                let value = self.pop(idx, "iteracao")?;
+                let list = match value {
+                    Value::Array(items) => items,
+                    Value::Map(entries) => {
+                        let mut keys: Vec<String> = entries.keys().cloned().collect();
+                        keys.sort();
+                        keys.into_iter().map(Value::Str).collect()
+                    }
+                    other => {
+                        return Err(VmError::new(format!(
+                            "`for` exige array ou mapa, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                };
+                self.push_checked(idx, Value::Array(list))?;
+                self.frames[idx].ip += 1;
+            }
             Op::CallBuiltin(id) => {
                 let builtin = id
                     .resolve()
@@ -394,7 +469,7 @@ impl Vm {
                     }
                 }
                 args.reverse();
-                let result = call_builtin(builtin, &args)?;
+                let result = call_builtin(builtin, &args, &self.argv)?;
                 self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
@@ -746,6 +821,77 @@ fn compare_values(left: &Value, right: &Value, op: Ordering) -> Result<Value, Vm
         Ordering::GreaterOrEqual => order != std::cmp::Ordering::Less,
     };
     Ok(Value::Bool(result))
+}
+
+fn bitand_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a & b)),
+        _ => Err(VmError::new(format!(
+            "operador `&` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn bitor_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a | b)),
+        _ => Err(VmError::new(format!(
+            "operador `|` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn bitxor_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
+        _ => Err(VmError::new(format!(
+            "operador `^` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn shl_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => a
+            .checked_shl(*b as u32)
+            .map(Value::Int)
+            .ok_or_else(|| VmError::new(format!("deslocamento invalido em `<<`: {b}"))),
+        _ => Err(VmError::new(format!(
+            "operador `<<` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn shr_values(left: &Value, right: &Value) -> Result<Value, VmError> {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => a
+            .checked_shr(*b as u32)
+            .map(Value::Int)
+            .ok_or_else(|| VmError::new(format!("deslocamento invalido em `>>`: {b}"))),
+        _ => Err(VmError::new(format!(
+            "operador `>>` exige int e int, encontrado {} e {}",
+            type_name(left),
+            type_name(right)
+        ))),
+    }
+}
+
+fn bitnot_value(value: &Value) -> Result<Value, VmError> {
+    match value {
+        Value::Int(v) => Ok(Value::Int(!v)),
+        other => Err(VmError::new(format!(
+            "operador `~` exige int, encontrado {}",
+            type_name(other)
+        ))),
+    }
 }
 
 fn index_value(base: &Value, index: &Value) -> Result<Value, VmError> {
@@ -1180,6 +1326,379 @@ mod tests {
         // Sem limite, programa finito passa normalmente.
         let out = run_src("let i = 0; while i < 3 { i = i + 1; } echo i;").expect("ok");
         assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn runs_stdlib_strings() {
+        assert_eq!(
+            run_src("echo contains(\"ola mundo\", \"mundo\");").expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src("echo starts_with(\"ola\", \"o\");").expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src("echo ends_with(\"ola\", \"a\");").expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src("echo split(\"a,b,c\", \",\");").expect("ok"),
+            "[a, b, c]\n"
+        );
+        assert_eq!(
+            run_src("echo join([\"a\", \"b\"], \"-\");").expect("ok"),
+            "a-b\n"
+        );
+        assert_eq!(run_src("echo trim(\"  x  \");").expect("ok"), "x\n");
+        assert_eq!(run_src("echo upper(\"ola\");").expect("ok"), "OLA\n");
+        assert_eq!(run_src("echo lower(\"OLA\");").expect("ok"), "ola\n");
+        assert_eq!(
+            run_src("echo replace(\"aaa\", \"a\", \"b\");").expect("ok"),
+            "bbb\n"
+        );
+        assert!(run_err("echo join([1], \",\");").contains("strings"));
+    }
+
+    #[test]
+    fn runs_stdlib_math() {
+        assert_eq!(run_src("echo abs(-3);").expect("ok"), "3\n");
+        assert_eq!(run_src("echo abs(-2.5);").expect("ok"), "2.5\n");
+        assert_eq!(run_src("echo min(3, 7);").expect("ok"), "3\n");
+        assert_eq!(run_src("echo max(3, 7.5);").expect("ok"), "7.5\n");
+        assert_eq!(run_src("echo sqrt(9);").expect("ok"), "3\n");
+        assert_eq!(run_src("echo pow(2, 10);").expect("ok"), "1024\n");
+        assert_eq!(run_src("echo floor(2.9);").expect("ok"), "2\n");
+        assert_eq!(run_src("echo ceil(2.1);").expect("ok"), "3\n");
+        assert!(run_err("echo sqrt(-1);").contains("negativo"));
+        assert!(run_err("echo 1 + true;").contains("incompativeis"));
+    }
+
+    #[test]
+    fn runs_stdlib_maps() {
+        assert_eq!(
+            run_src("echo values({b: 1, a: 2});").expect("ok"),
+            "[2, 1]\n"
+        );
+        assert_eq!(
+            run_src("echo entries({b: 1, a: 2});").expect("ok"),
+            "[[a, 2], [b, 1]]\n"
+        );
+        assert_eq!(
+            run_src("echo merge({a: 1}, {a: 2, b: 3});").expect("ok"),
+            "{a: 2, b: 3}\n"
+        );
+        assert_eq!(run_src("echo has({a: 1}, \"a\");").expect("ok"), "true\n");
+        assert_eq!(run_src("echo has({a: 1}, \"z\");").expect("ok"), "false\n");
+    }
+
+    #[test]
+    fn runs_bitwise_ops() {
+        assert_eq!(run_src("echo 6 & 3;").expect("ok"), "2\n");
+        assert_eq!(run_src("echo 6 | 3;").expect("ok"), "7\n");
+        assert_eq!(run_src("echo 6 ^ 3;").expect("ok"), "5\n");
+        assert_eq!(run_src("echo ~5;").expect("ok"), "-6\n");
+        assert_eq!(run_src("echo 1 << 4;").expect("ok"), "16\n");
+        assert_eq!(run_src("echo 256 >> 4;").expect("ok"), "16\n");
+        assert!(run_err("echo 1 & true;").contains("exige int"));
+        assert!(run_err("echo 1 << -1;").contains("deslocamento"));
+        assert!(run_err("echo 1 << 64;").contains("deslocamento"));
+        assert!(run_err("echo ~1.5;").contains("exige int"));
+    }
+
+    #[test]
+    fn runs_ternary_and_null_coalescing() {
+        assert_eq!(run_src("echo true ? 1 : 2;").expect("ok"), "1\n");
+        assert_eq!(run_src("echo false ? 1 : 2;").expect("ok"), "2\n");
+        assert_eq!(run_src("echo null ?? \"x\";").expect("ok"), "x\n");
+        assert_eq!(run_src("echo 0 ?? \"x\";").expect("ok"), "0\n");
+        assert_eq!(run_src("echo false ?? \"x\";").expect("ok"), "false\n");
+        // `??` avalia o lado esquerdo uma unica vez.
+        assert_eq!(
+            run_src("let i = 0; fn inc() { i = i + 1; return i; } echo inc() ?? 99; echo i;")
+                .expect("ok"),
+            "1\n1\n"
+        );
+    }
+
+    #[test]
+    fn runs_break_continue_and_const() {
+        // Pares sao pulados pelo `continue` (inclusive o 6); o `break`
+        // acontece no 7.
+        assert_eq!(
+            run_src("let i = 0; while i < 10 { i = i + 1; if i % 2 == 0 { continue; } if i > 5 { break; } } echo i;").expect("ok"),
+            "7\n"
+        );
+        assert_eq!(run_src("const N = 40 + 2; echo N;").expect("ok"), "42\n");
+        // Erro de compilacao: usa compile() direto (run_src so transporta erros de runtime).
+        let program = rhp_parser::parse_source("const N = 1; N = 2;").expect("parse deve passar");
+        assert!(rhp_bytecode::compile(&program)
+            .expect_err("deve falhar")
+            .message
+            .contains("constante"));
+        // `break`/`continue` fora de laco e erro de compilacao.
+        let program = rhp_parser::parse_source("break;").expect("parse deve passar");
+        assert!(rhp_bytecode::compile(&program)
+            .expect_err("deve falhar")
+            .message
+            .contains("fora de laco"));
+    }
+
+    #[test]
+    fn while_body_scope_does_not_leak_on_break() {
+        // Regressao: `let` no corpo do `while` + `break` vazava para fora.
+        let err = run_err("while true { let vazou = 1; break; } echo vazou;");
+        assert!(err.contains("nao definida"), "obteve: {err}");
+        // E o caminho normal continua fechando o escopo a cada iteracao.
+        let err = run_err("let i = 0; while i < 2 { let tmp = i; i = i + 1; } echo tmp;");
+        assert!(err.contains("nao definida"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_for_over_array_and_map() {
+        assert_eq!(
+            run_src("for x in [3, 1, 2] { echo x; }").expect("ok"),
+            "3\n1\n2\n"
+        );
+        // Mapa: itera chaves ordenadas (mesma ordem de `keys`).
+        assert_eq!(
+            run_src("for k in {b: 1, a: 2} { echo k; }").expect("ok"),
+            "a\nb\n"
+        );
+        // Vazio: corpo nunca executa.
+        assert_eq!(
+            run_src("for x in [] { echo x; } echo \"fim\";").expect("ok"),
+            "fim\n"
+        );
+        assert_eq!(
+            run_src("for k in {} { echo k; } echo \"fim\";").expect("ok"),
+            "fim\n"
+        );
+        // Fora do laco, a variavel nao existe.
+        let err = run_err("for x in [1] { } echo x;");
+        assert!(err.contains("nao definida"), "obteve: {err}");
+        // Nao iteravel e erro com tipo.
+        let err = run_err("for x in 42 { echo x; }");
+        assert!(err.contains("array ou mapa"), "obteve: {err}");
+        let err = run_err("for x in \"ab\" { echo x; }");
+        assert!(err.contains("array ou mapa"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_for_with_break_continue_and_nesting() {
+        assert_eq!(
+            run_src(
+                "for i in [1, 2, 3, 4] { if i % 2 == 0 { continue; } if i > 2 { break; } echo i; }"
+            )
+            .expect("ok"),
+            "1\n"
+        );
+        // `continue` pula para a proxima iteracao (nao trava no incremento).
+        assert_eq!(
+            run_src("let s = 0; for i in [1, 2, 3] { if i == 2 { continue; } s = s + i; } echo s;")
+                .expect("ok"),
+            "4\n"
+        );
+        // Aninhado com soma de pares.
+        assert_eq!(
+            run_src("let n = 0; for a in [1, 2] { for b in [10, 20] { n = n + a + b; } } echo n;")
+                .expect("ok"),
+            "66\n"
+        );
+        // Dentro de funcao e com `while` externo.
+        assert_eq!(
+            run_src("fn soma(xs) { let t = 0; for x in xs { t = t + x; } return t; } echo soma([1, 2, 3]);").expect("ok"),
+            "6\n"
+        );
+        // Iteravel avaliado uma vez (mutar a origem nao afeta a iteracao).
+        assert_eq!(
+            run_src("let a = [1, 2]; for x in a { a = push(a, 9); echo x; }").expect("ok"),
+            "1\n2\n"
+        );
+    }
+
+    #[test]
+    fn runs_sort_builtin() {
+        assert_eq!(run_src("echo sort([3, 1, 2]);").expect("ok"), "[1, 2, 3]\n");
+        assert_eq!(
+            run_src("echo sort([2.5, 1, 2]);").expect("ok"),
+            "[1, 2, 2.5]\n"
+        );
+        assert_eq!(
+            run_src("echo sort([\"b\", \"a\", \"c\"]);").expect("ok"),
+            "[a, b, c]\n"
+        );
+        assert_eq!(
+            run_src("echo sort([true, false, true]);").expect("ok"),
+            "[false, true, true]\n"
+        );
+        assert_eq!(run_src("echo sort([]);").expect("ok"), "[]\n");
+        // Devolve copia: o original nao muda.
+        assert_eq!(
+            run_src("let a = [2, 1]; let b = sort(a); echo a; echo b;").expect("ok"),
+            "[2, 1]\n[1, 2]\n"
+        );
+        // Heterogeneo e erro; nao-array e erro.
+        let err = run_err("echo sort([1, \"a\"]);");
+        assert!(err.contains("homogeneo"), "obteve: {err}");
+        let err = run_err("echo sort({a: 1});");
+        assert!(err.contains("exige array"), "obteve: {err}");
+    }
+
+    #[test]
+    fn reports_exit_code_and_unwinds() {
+        let chunk = compile_src("echo 1; exit(3); echo 2;");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&chunk, &mut out).expect_err("exit deve interromper");
+        assert_eq!(err.exit_code(), Some(3));
+        assert_eq!(out, b"1\n");
+        // `exit(0)` tambem e pedido de saida (codigo 0).
+        let chunk = compile_src("exit(0);");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&chunk, &mut out).expect_err("exit deve interromper");
+        assert_eq!(err.exit_code(), Some(0));
+        // Desenrola chamadas: sai de dentro de funcao.
+        let chunk = compile_src("fn f() { exit(7); } f(); echo \"nunca\";");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&chunk, &mut out).expect_err("exit deve interromper");
+        assert_eq!(err.exit_code(), Some(7));
+        assert!(out.is_empty());
+        // Codigo fora de 0-255 e erro comum (sem codigo de saida).
+        let err = run_err("exit(256);");
+        assert!(err.contains("0 e 255"), "obteve: {err}");
+        let no_code = compile_src("exit(256);");
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let err = vm.run(&no_code, &mut out).expect_err("deve falhar");
+        assert_eq!(err.exit_code(), None);
+    }
+
+    #[test]
+    fn runs_json_roundtrip() {
+        // Tipos basicos.
+        assert_eq!(run_src("echo json_parse(\"null\");").expect("ok"), "null\n");
+        assert_eq!(run_src("echo json_parse(\"true\");").expect("ok"), "true\n");
+        assert_eq!(run_src("echo json_parse(\"42\");").expect("ok"), "42\n");
+        assert_eq!(run_src("echo json_parse(\"4.5\");").expect("ok"), "4.5\n");
+        assert_eq!(
+            run_src("echo json_parse(\"\\\"oi\\\"\");").expect("ok"),
+            "oi\n"
+        );
+        assert_eq!(
+            run_src("echo json_parse(\"[1, true]\");").expect("ok"),
+            "[1, true]\n"
+        );
+        assert_eq!(
+            run_src("echo json_parse(\"{\\\"b\\\": 1, \\\"a\\\": 2}\");").expect("ok"),
+            "{a: 2, b: 1}\n"
+        );
+        // Serializacao canonica (chaves ordenadas, sem espacos).
+        assert_eq!(
+            run_src("echo json_stringify({b: [1, 2], a: \"x\"});").expect("ok"),
+            "{\"a\":\"x\",\"b\":[1,2]}\n"
+        );
+        assert_eq!(run_src("echo json_stringify(2.0);").expect("ok"), "2.0\n");
+        assert_eq!(
+            run_src("echo json_stringify(\"a\\nb\");").expect("ok"),
+            "\"a\\nb\"\n"
+        );
+        // Idempotencia: parse(stringify(v)) preserva o valor.
+        assert_eq!(
+            run_src(
+                "let v = {a: [1, {b: null}], s: \"x\"}; echo json_parse(json_stringify(v)) == v;"
+            )
+            .expect("ok"),
+            "true\n"
+        );
+        // Numero inteiro grande alem de i64 vira Float (perda documentada).
+        assert_eq!(
+            run_src("echo type(json_parse(\"99999999999999999999\"));").expect("ok"),
+            "float\n"
+        );
+    }
+
+    #[test]
+    fn reports_json_errors() {
+        // Malformados com posicao.
+        for bad in [
+            "echo json_parse(\"{oops}\");",
+            "echo json_parse(\"[1,]\");",
+            "echo json_parse(\"{\\\"a\\\":}\");",
+            "echo json_parse(\"01\");",
+            "echo json_parse(\"05\");",
+            "echo json_parse(\"\\\\uD800\");",
+            "echo json_parse(\"trailing x\");",
+        ] {
+            let err = run_err(bad);
+            assert!(err.contains("json_parse"), "obteve: {err} em {bad}");
+        }
+        // Nao-string e erro de tipo.
+        let err = run_err("echo json_parse(42);");
+        assert!(err.contains("exige string"), "obteve: {err}");
+        // Funcao, NaN e infinito nao serializam.
+        let err = run_err("fn f() { } echo json_stringify(f);");
+        assert!(err.contains("nao representa"), "obteve: {err}");
+        let err = run_err("echo json_stringify(pow(-1.0, 0.5));");
+        assert!(err.contains("nao representa"), "obteve: {err}");
+        let err = run_err("echo json_stringify(pow(10.0, 309.0));");
+        assert!(err.contains("nao representa"), "obteve: {err}");
+    }
+
+    #[test]
+    fn reports_json_depth_limit() {
+        // Aninhamento alem de 128 e erro, nunca estouro de pilha.
+        let deep_in: String = "[".repeat(200) + &"]".repeat(200);
+        let err = run_err(&format!("echo json_parse(\"{deep_in}\");"));
+        assert!(err.contains("profundidade"), "obteve: {err}");
+        // Valor aninhado construido em runtime (literal fundo nao parseia).
+        let err = run_err(
+            "let v = 0; let i = 0; while i < 200 { v = [v]; i = i + 1; } echo json_stringify(v);",
+        );
+        assert!(err.contains("profundidade"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_fs_and_env_builtins() {
+        let dir = std::env::temp_dir().join(format!("rhp-fs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir temporario");
+        let path = dir.join("dado.txt").to_string_lossy().into_owned();
+        assert_eq!(
+            run_src(&format!("echo fs_write(\"{path}\", \"ola\");")).expect("ok"),
+            "3\n"
+        );
+        assert_eq!(
+            run_src(&format!("echo fs_append(\"{path}\", \"!\");")).expect("ok"),
+            "1\n"
+        );
+        assert_eq!(
+            run_src(&format!("echo fs_read(\"{path}\");")).expect("ok"),
+            "ola!\n"
+        );
+        assert_eq!(
+            run_src(&format!("echo fs_exists(\"{path}\");")).expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src(&format!(
+                "echo fs_exists(\"{}/nao-existe.rhp\");",
+                dir.display()
+            ))
+            .expect("ok"),
+            "false\n"
+        );
+        std::env::set_var("RHP_TESTE_UNICO_XYZ", "123");
+        assert_eq!(
+            run_src("echo env(\"RHP_TESTE_UNICO_XYZ\");").expect("ok"),
+            "123\n"
+        );
+        assert_eq!(
+            run_src("echo env(\"RHP_INEXISTENTE_XYZ\");").expect("ok"),
+            "null\n"
+        );
+        assert_eq!(run_src("echo len(argv());").expect("ok"), "0\n");
     }
 
     #[test]

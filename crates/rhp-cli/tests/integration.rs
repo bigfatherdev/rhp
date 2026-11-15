@@ -78,6 +78,20 @@ fn rhp_run_expressions_and_variables() {
 }
 
 #[test]
+fn rhp_run_new_syntax_batch() {
+    let output = run_temp_source(
+        "novo.rhp",
+        "const LIMITE = 3;\nlet i = 0;\nwhile i < 10 {\n  i = i + 1;\n  if i % 2 == 0 {\n    continue;\n  }\n  if i > LIMITE {\n    break;\n  }\n  echo i;\n}\necho 6 & 3;\necho 1 << 4;\necho null ?? \"padrao\";\necho true ? \"s\" : \"n\";\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1\n3\n2\n16\npadrao\ns\n");
+}
+
+#[test]
 fn rhp_run_control_flow() {
     let output = run_temp_source(
         "ctrl.rhp",
@@ -89,6 +103,85 @@ fn rhp_run_control_flow() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"0\num\n2\n");
+}
+
+#[test]
+fn rhp_run_for_sort_and_scopes() {
+    let output = run_temp_source(
+        "laco.rhp",
+        "for x in [3, 1, 2] {\n  echo x;\n}\nfor k in {b: 1, a: 2} {\n  echo k;\n}\nlet t = 0;\nfor i in [1, 2, 3, 4] {\n  if i % 2 == 0 {\n    continue;\n  }\n  if i > 2 {\n    break;\n  }\n  t = t + i;\n}\necho t;\necho sort([3, 1, 2]);\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"3\n1\n2\na\nb\n1\n[1, 2, 3]\n");
+}
+
+#[test]
+fn rhp_run_json_roundtrip() {
+    let output = run_temp_source(
+        "json.rhp",
+        "let v = json_parse(\"{\\\"a\\\": [1, true, null]}\");\necho v[\"a\"][0];\necho json_stringify({b: 1, a: \"x\"});\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1\n{\"a\":\"x\",\"b\":1}\n");
+    // Malformado: exit 1 com mensagem de `json_parse`.
+    let bad = run_temp_source("json_ruim.rhp", "echo json_parse(\"{oops}\");\n");
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("json_parse"),
+        "stderr={}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_exit_codes() {
+    // `exit(3)`: stdout anterior preservado + codigo 3, sem mensagem de erro.
+    let output = run_temp_source("sai3.rhp", "echo \"antes\";\nexit(3);\necho \"depois\";\n");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"antes\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `exit(0)`: sucesso.
+    let output = run_temp_source("sai0.rhp", "exit(0);\n");
+    assert!(output.status.success());
+    // Codigo fora de 0-255: erro comum (exit 1).
+    let output = run_temp_source("sai_ruim.rhp", "exit(256);\n");
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn rhp_run_while_scope_does_not_leak() {
+    // Regressao: `let` no corpo do `while` + `break` nao vaza para fora.
+    let output = run_temp_source(
+        "vazou.rhp",
+        "while true {\n  let vazou = 1;\n  break;\n}\necho vazou;\n",
+    );
+    assert!(
+        !output.status.success(),
+        "vazamento de escopo voltou a passar"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nao definida"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -153,6 +246,68 @@ fn rhp_run_resolves_imports() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"42\n");
+}
+
+#[test]
+fn rhp_run_passes_extra_args_to_argv() {
+    // `run_temp_source` nao passa args: sem args, argv() e vazio.
+    let empty = run_temp_source("args0.rhp", "echo len(argv());\n");
+    assert!(empty.status.success());
+    assert_eq!(empty.stdout, b"0\n");
+    // Com args extras, o binario os repassa para `argv()`.
+    let dir = std::env::temp_dir().join(format!("rhp-test-argv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    let file = dir.join("args2.rhp");
+    std::fs::write(&file, "echo len(argv());\necho argv()[1];\n").expect("write");
+    let output = Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .args(["run", &file.to_string_lossy(), "ola", "mundo"])
+        .output()
+        .expect("rhp run com args");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"2\nmundo\n");
+}
+
+#[test]
+fn rhp_test_runs_test_files() {
+    let dir = std::env::temp_dir().join(format!("rhp-test-runner-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    std::fs::write(dir.join("a_test.rhp"), "assert(1 + 1 == 2);\n").expect("write");
+    std::fs::write(dir.join("b_test.rhp"), "assert(false);\n").expect("write");
+    std::fs::write(dir.join("nao_teste.rhp"), "assert(false);\n").expect("write");
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+
+    let mixed = Command::new(rhp_bin)
+        .args(["test", &dir.to_string_lossy()])
+        .output()
+        .expect("rhp test");
+    assert!(!mixed.status.success(), "b_test deveria falhar");
+    let out = String::from_utf8_lossy(&mixed.stdout);
+    let err = String::from_utf8_lossy(&mixed.stderr);
+    assert!(out.contains("a_test.rhp"), "obteve: {out}");
+    assert!(out.contains("FALHOU"), "obteve: {out}");
+    assert!(err.contains("1 falha(s)"), "obteve: {err}");
+
+    let single = Command::new(rhp_bin)
+        .args(["test", &dir.join("a_test.rhp").to_string_lossy()])
+        .output()
+        .expect("rhp test arquivo");
+    assert!(single.status.success(), "a_test deveria passar");
+}
+
+#[test]
+fn rhp_doctor_reports_environment() {
+    let out = Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .arg("doctor")
+        .output()
+        .expect("rhp doctor");
+    assert!(out.status.success(), "doctor deveria passar");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("rhp "), "obteve: {text}");
+    assert!(text.contains("autoteste: ok"), "obteve: {text}");
 }
 
 #[test]
@@ -234,7 +389,8 @@ fn vscode_grammar_covers_language() {
     let text = std::fs::read_to_string(&grammar).expect("nao foi possivel ler gramatica");
     assert!(text.contains("\"scopeName\": \"source.rhp\""));
     for keyword in [
-        "echo", "let", "if", "else", "while", "fn", "return", "import", "true", "false", "null",
+        "echo", "let", "const", "if", "else", "while", "for", "break", "continue", "fn", "return",
+        "import", "true", "false", "null",
     ] {
         assert!(
             text.contains(keyword),
@@ -242,7 +398,46 @@ fn vscode_grammar_covers_language() {
         );
     }
     for builtin in [
-        "len", "push", "pop", "keys", "str", "int", "float", "type", "assert", "http_get",
+        "len",
+        "push",
+        "pop",
+        "keys",
+        "str",
+        "int",
+        "float",
+        "type",
+        "assert",
+        "http_get",
+        "contains",
+        "starts_with",
+        "ends_with",
+        "split",
+        "join",
+        "trim",
+        "upper",
+        "lower",
+        "replace",
+        "abs",
+        "min",
+        "max",
+        "sqrt",
+        "pow",
+        "floor",
+        "ceil",
+        "values",
+        "entries",
+        "merge",
+        "has",
+        "fs_read",
+        "fs_write",
+        "fs_append",
+        "fs_exists",
+        "argv",
+        "env",
+        "sort",
+        "exit",
+        "json_parse",
+        "json_stringify",
     ] {
         assert!(
             text.contains(builtin),

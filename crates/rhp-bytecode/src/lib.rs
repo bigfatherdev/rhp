@@ -82,6 +82,41 @@ pub enum Builtin {
     Assert,
     /// `http_get(url)` — cliente HTTP minimo (somente `http://`), Fase 6.
     HttpGet,
+    // Biblioteca-padrao: strings, matematica e mapas (prox. evolucao).
+    Contains,
+    StartsWith,
+    EndsWith,
+    Split,
+    Join,
+    Trim,
+    Upper,
+    Lower,
+    Replace,
+    Abs,
+    Min,
+    Max,
+    Sqrt,
+    Pow,
+    Floor,
+    Ceil,
+    Values,
+    Entries,
+    Merge,
+    Has,
+    FsRead,
+    FsWrite,
+    FsAppend,
+    FsExists,
+    Argv,
+    Env,
+    /// `sort(array)` — copia ordenada (homogeneo: numeros, strings ou bools).
+    Sort,
+    /// `exit(codigo)` — encerra com codigo 0–255 (via erro especial).
+    Exit,
+    /// `json_parse(texto)` — JSON => valor (nulo/bool/numero/string/array/mapa).
+    JsonParse,
+    /// `json_stringify(valor)` — valor => texto JSON.
+    JsonStringify,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -98,6 +133,36 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "type" => Some(Builtin::Type),
         "assert" => Some(Builtin::Assert),
         "http_get" => Some(Builtin::HttpGet),
+        "contains" => Some(Builtin::Contains),
+        "starts_with" => Some(Builtin::StartsWith),
+        "ends_with" => Some(Builtin::EndsWith),
+        "split" => Some(Builtin::Split),
+        "join" => Some(Builtin::Join),
+        "trim" => Some(Builtin::Trim),
+        "upper" => Some(Builtin::Upper),
+        "lower" => Some(Builtin::Lower),
+        "replace" => Some(Builtin::Replace),
+        "abs" => Some(Builtin::Abs),
+        "min" => Some(Builtin::Min),
+        "max" => Some(Builtin::Max),
+        "sqrt" => Some(Builtin::Sqrt),
+        "pow" => Some(Builtin::Pow),
+        "floor" => Some(Builtin::Floor),
+        "ceil" => Some(Builtin::Ceil),
+        "values" => Some(Builtin::Values),
+        "entries" => Some(Builtin::Entries),
+        "merge" => Some(Builtin::Merge),
+        "has" => Some(Builtin::Has),
+        "fs_read" => Some(Builtin::FsRead),
+        "fs_write" => Some(Builtin::FsWrite),
+        "fs_append" => Some(Builtin::FsAppend),
+        "fs_exists" => Some(Builtin::FsExists),
+        "argv" => Some(Builtin::Argv),
+        "env" => Some(Builtin::Env),
+        "sort" => Some(Builtin::Sort),
+        "exit" => Some(Builtin::Exit),
+        "json_parse" => Some(Builtin::JsonParse),
+        "json_stringify" => Some(Builtin::JsonStringify),
         _ => None,
     }
 }
@@ -105,6 +170,7 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
 #[must_use]
 pub const fn builtin_arity(builtin: Builtin) -> usize {
     match builtin {
+        Builtin::Argv => 0,
         Builtin::Len
         | Builtin::Pop
         | Builtin::Keys
@@ -113,8 +179,37 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Float
         | Builtin::Type
         | Builtin::Assert
-        | Builtin::HttpGet => 1,
-        Builtin::Push => 2,
+        | Builtin::HttpGet
+        | Builtin::Trim
+        | Builtin::Upper
+        | Builtin::Lower
+        | Builtin::Abs
+        | Builtin::Sqrt
+        | Builtin::Floor
+        | Builtin::Ceil
+        | Builtin::Values
+        | Builtin::Entries
+        | Builtin::FsRead
+        | Builtin::FsExists
+        | Builtin::Env
+        | Builtin::Sort
+        | Builtin::Exit
+        | Builtin::JsonParse
+        | Builtin::JsonStringify => 1,
+        Builtin::Push
+        | Builtin::Contains
+        | Builtin::StartsWith
+        | Builtin::EndsWith
+        | Builtin::Split
+        | Builtin::Join
+        | Builtin::Min
+        | Builtin::Max
+        | Builtin::Pow
+        | Builtin::Merge
+        | Builtin::Has
+        | Builtin::FsWrite
+        | Builtin::FsAppend => 2,
+        Builtin::Replace => 3,
     }
 }
 
@@ -135,6 +230,16 @@ pub enum Op {
     Mod,
     Neg,
     Not,
+    BitNot,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    /// Duplica o topo da pilha.
+    Dup,
+    /// Desempilha; se nao for nulo, salta para `ip = alvo`.
+    JumpIfNotNull(u32),
     // Comparacao: dois operandos, empilha `Bool`.
     Eq,
     Ne,
@@ -173,6 +278,9 @@ pub enum Op {
     Index,
     /// Desempilha valor e indice; grava em `names[idx][indice]`.
     StoreIndex(u32),
+    /// Desempilha iteravel e empilha lista de iteracao: array vira copia;
+    /// mapa vira array de chaves `Str` ordenadas; outro tipo e erro.
+    IterList,
     /// Chama o builtin `id` (`n` = aridade fixa do builtin).
     CallBuiltin(BuiltinId),
 }
@@ -195,6 +303,36 @@ impl BuiltinId {
             7 => Ok(Builtin::Type),
             8 => Ok(Builtin::Assert),
             9 => Ok(Builtin::HttpGet),
+            10 => Ok(Builtin::Contains),
+            11 => Ok(Builtin::StartsWith),
+            12 => Ok(Builtin::EndsWith),
+            13 => Ok(Builtin::Split),
+            14 => Ok(Builtin::Join),
+            15 => Ok(Builtin::Trim),
+            16 => Ok(Builtin::Upper),
+            17 => Ok(Builtin::Lower),
+            18 => Ok(Builtin::Replace),
+            19 => Ok(Builtin::Abs),
+            20 => Ok(Builtin::Min),
+            21 => Ok(Builtin::Max),
+            22 => Ok(Builtin::Sqrt),
+            23 => Ok(Builtin::Pow),
+            24 => Ok(Builtin::Floor),
+            25 => Ok(Builtin::Ceil),
+            26 => Ok(Builtin::Values),
+            27 => Ok(Builtin::Entries),
+            28 => Ok(Builtin::Merge),
+            29 => Ok(Builtin::Has),
+            30 => Ok(Builtin::FsRead),
+            31 => Ok(Builtin::FsWrite),
+            32 => Ok(Builtin::FsAppend),
+            33 => Ok(Builtin::FsExists),
+            34 => Ok(Builtin::Argv),
+            35 => Ok(Builtin::Env),
+            36 => Ok(Builtin::Sort),
+            37 => Ok(Builtin::Exit),
+            38 => Ok(Builtin::JsonParse),
+            39 => Ok(Builtin::JsonStringify),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -213,6 +351,36 @@ impl From<Builtin> for BuiltinId {
             Builtin::Type => 7,
             Builtin::Assert => 8,
             Builtin::HttpGet => 9,
+            Builtin::Contains => 10,
+            Builtin::StartsWith => 11,
+            Builtin::EndsWith => 12,
+            Builtin::Split => 13,
+            Builtin::Join => 14,
+            Builtin::Trim => 15,
+            Builtin::Upper => 16,
+            Builtin::Lower => 17,
+            Builtin::Replace => 18,
+            Builtin::Abs => 19,
+            Builtin::Min => 20,
+            Builtin::Max => 21,
+            Builtin::Sqrt => 22,
+            Builtin::Pow => 23,
+            Builtin::Floor => 24,
+            Builtin::Ceil => 25,
+            Builtin::Values => 26,
+            Builtin::Entries => 27,
+            Builtin::Merge => 28,
+            Builtin::Has => 29,
+            Builtin::FsRead => 30,
+            Builtin::FsWrite => 31,
+            Builtin::FsAppend => 32,
+            Builtin::FsExists => 33,
+            Builtin::Argv => 34,
+            Builtin::Env => 35,
+            Builtin::Sort => 36,
+            Builtin::Exit => 37,
+            Builtin::JsonParse => 38,
+            Builtin::JsonStringify => 39,
         };
         Self(id)
     }
@@ -301,7 +469,9 @@ impl Chunk {
                         "chunk invalido em `{context}`: funcao {idx} inexistente"
                     )));
                 }
-                Op::JumpIfFalse(target) | Op::Jump(target) if (target as usize) >= len => {
+                Op::JumpIfFalse(target) | Op::Jump(target) | Op::JumpIfNotNull(target)
+                    if (target as usize) >= len =>
+                {
                     return Err(CompileError::new(format!(
                         "chunk invalido em `{context}`: salto para {target} fora do codigo"
                     )));
@@ -364,7 +534,11 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
                 check_depth(height, 1, op, context)?;
                 (height - 1, Some(vec![ip + 1]))
             }
-            Op::Neg | Op::Not => {
+            Op::Neg | Op::Not | Op::BitNot => {
+                check_depth(height, 1, op, context)?;
+                (height, Some(vec![ip + 1]))
+            }
+            Op::IterList => {
                 check_depth(height, 1, op, context)?;
                 (height, Some(vec![ip + 1]))
             }
@@ -379,15 +553,24 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
             | Op::Le
             | Op::Gt
             | Op::Ge
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
             | Op::Index => {
                 check_depth(height, 2, op, context)?;
                 (height - 1, Some(vec![ip + 1]))
+            }
+            Op::Dup => {
+                check_depth(height, 1, op, context)?;
+                (height + 1, Some(vec![ip + 1]))
             }
             Op::StoreIndex(_) => {
                 check_depth(height, 2, op, context)?;
                 (height - 2, Some(vec![ip + 1]))
             }
-            Op::JumpIfFalse(target) => {
+            Op::JumpIfFalse(target) | Op::JumpIfNotNull(target) => {
                 check_depth(height, 1, op, context)?;
                 (height - 1, Some(vec![target as usize, ip + 1]))
             }
@@ -480,6 +663,30 @@ struct Compiler {
     in_function: bool,
     names: std::collections::HashMap<String, u32>,
     constants: std::collections::HashMap<ConstKey, u32>,
+    /// Pilha de escopos lexicos (nomes de `const` por nivel); espelha os
+    /// `EnterScope`/`ExitScope` emitidos. Usada para `break`/`continue` com
+    /// desenrolamento correto e para proibir atribuicao a constantes.
+    scopes: Vec<std::collections::HashSet<String>>,
+    loops: Vec<LoopCtx>,
+    /// Contador de lacos `for` (nomes ocultos unicos por laco).
+    for_counter: u32,
+}
+
+/// Contexto de compilacao de um laco (para `break`/`continue`).
+struct LoopCtx {
+    /// Profundidade de escopo a manter ao sair com `break`.
+    /// (`while`: fecha tambem o escopo do corpo; `for`: mantem o escopo
+    /// do laco, fechado na saida, pois a condicao vive dentro dele.)
+    break_depth: usize,
+    /// Profundidade de escopo a manter ao voltar com `continue`.
+    continue_depth: usize,
+    /// Inicio do laco (`while`: salto direto do `continue`; `for`: `None`,
+    /// pois o `continue` salta ao incremento — remendado depois do corpo).
+    start: Option<u32>,
+    /// Posicoes de salto a remendar para a saida.
+    breaks: Vec<usize>,
+    /// Posicoes de salto a remendar para o ponto de continuacao.
+    continues: Vec<usize>,
 }
 
 /// Chave de deduplicacao de constantes (somente escalares; `Float` por bits
@@ -501,6 +708,35 @@ impl Compiler {
             in_function,
             names: std::collections::HashMap::new(),
             constants: std::collections::HashMap::new(),
+            scopes: vec![std::collections::HashSet::new()],
+            loops: Vec::new(),
+            for_counter: 0,
+        }
+    }
+
+    fn emit_scope_open(&mut self) {
+        self.emit(Op::EnterScope);
+        self.scopes.push(std::collections::HashSet::new());
+    }
+
+    fn emit_scope_close(&mut self) -> Result<(), CompileError> {
+        if self.scopes.len() <= 1 {
+            return Err(CompileError::new(
+                "desequilibrio interno de escopos".to_string(),
+            ));
+        }
+        self.emit(Op::ExitScope);
+        self.scopes.pop();
+        Ok(())
+    }
+
+    fn is_const(&self, name: &str) -> bool {
+        self.scopes.iter().any(|scope| scope.contains(name))
+    }
+
+    fn declare_const(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string());
         }
     }
 
@@ -557,6 +793,7 @@ impl Compiler {
         debug_assert!((target as usize) <= len as usize);
         match self.chunk.code[pos] {
             Op::JumpIfFalse(_) => self.chunk.code[pos] = Op::JumpIfFalse(target),
+            Op::JumpIfNotNull(_) => self.chunk.code[pos] = Op::JumpIfNotNull(target),
             Op::Jump(_) => self.chunk.code[pos] = Op::Jump(target),
             _ => debug_assert!(false, "patch_jump em posicao sem salto"),
         }
@@ -565,6 +802,128 @@ impl Compiler {
     fn compile_stmts(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
         for stmt in stmts {
             self.compile_stmt(stmt)?;
+        }
+        Ok(())
+    }
+
+    /// Nome oculto do laco `for` (lista ou indice): contem NUL, impossivel
+    /// de escrever no fonte, logo nunca colide com variaveis do usuario.
+    fn hidden_for_name(&mut self, what: &str) -> String {
+        let id = self.for_counter;
+        self.for_counter += 1;
+        format!("\0for:{what}:{id}")
+    }
+
+    /// Compila `for VAR in ITER BLOCO`.
+    ///
+    /// Estrategia (sem runtime novo): avalia `ITER` uma vez, normaliza com
+    /// `IterList` (array = copia; mapa = chaves ordenadas) e itera por
+    /// indice, como um `while` com incremento. `VAR` e declarada a cada
+    /// iteracao no escopo do corpo. `break` fecha corpo + laco; `continue`
+    /// salta ao incremento.
+    fn compile_for(&mut self, var: &str, iter: &Expr, body: &[Stmt]) -> Result<(), CompileError> {
+        self.emit_scope_open();
+        let for_depth = self.scopes.len();
+        let list_name = self.hidden_for_name("lista");
+        let idx_name = self.hidden_for_name("indice");
+        self.compile_expr(iter)?;
+        self.emit(Op::IterList);
+        let list_idx = self.intern_name(&list_name)?;
+        self.emit(Op::DeclareName(list_idx));
+        let zero = self.add_constant(Value::Int(0))?;
+        self.emit(Op::Constant(zero));
+        let idx_pos = self.intern_name(&idx_name)?;
+        self.emit(Op::DeclareName(idx_pos));
+        let loop_start = self.chunk.code.len() as u32;
+        // Condicao: H_idx < len(H_list).
+        let idx_ref = self.intern_name(&idx_name)?;
+        self.emit(Op::LoadName(idx_ref));
+        let list_ref = self.intern_name(&list_name)?;
+        self.emit(Op::LoadName(list_ref));
+        self.emit(Op::CallBuiltin(BuiltinId::from(Builtin::Len)));
+        self.emit(Op::Lt);
+        let exit_jump = self.emit(Op::JumpIfFalse(u32::MAX));
+        self.emit_scope_open();
+        let body_depth = self.scopes.len();
+        self.loops.push(LoopCtx {
+            break_depth: for_depth,
+            continue_depth: body_depth,
+            start: None,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
+        // VAR = H_list[H_idx].
+        let list_elem = self.intern_name(&list_name)?;
+        self.emit(Op::LoadName(list_elem));
+        let idx_elem = self.intern_name(&idx_name)?;
+        self.emit(Op::LoadName(idx_elem));
+        self.emit(Op::Index);
+        let var_idx = self.intern_name(var)?;
+        self.emit(Op::DeclareName(var_idx));
+        // Como no `while`: desvios no corpo mexem no rastreamento estatico;
+        // restaura-o para o caminho normal (incremento apos o corpo).
+        let saved_scopes = self.scopes.clone();
+        self.compile_stmts(body)?;
+        self.scopes = saved_scopes;
+        let continue_target = self.chunk.code.len() as u32;
+        self.emit_scope_close()?;
+        // H_idx = H_idx + 1.
+        let idx_inc = self.intern_name(&idx_name)?;
+        self.emit(Op::LoadName(idx_inc));
+        let one = self.add_constant(Value::Int(1))?;
+        self.emit(Op::Constant(one));
+        self.emit(Op::Add);
+        let idx_store = self.intern_name(&idx_name)?;
+        self.emit(Op::StoreName(idx_store));
+        self.emit(Op::Jump(loop_start));
+        let exit_target = self.chunk.code.len() as u32;
+        self.patch_jump(exit_jump, exit_target);
+        let Some(loop_ctx) = self.loops.pop() else {
+            return Err(CompileError::new(
+                "desequilibrio interno de lacos".to_string(),
+            ));
+        };
+        for pos in &loop_ctx.breaks {
+            self.patch_jump(*pos, exit_target);
+        }
+        for pos in &loop_ctx.continues {
+            self.patch_jump(*pos, continue_target);
+        }
+        self.emit_scope_close()?;
+        Ok(())
+    }
+
+    fn compile_if(
+        &mut self,
+        cond: &Expr,
+        then_branch: &[Stmt],
+        else_branch: &Option<Vec<Stmt>>,
+    ) -> Result<(), CompileError> {
+        self.compile_expr(cond)?;
+        let else_jump = self.emit(Op::JumpIfFalse(u32::MAX));
+        self.emit_scope_open();
+        self.compile_stmts(then_branch)?;
+        // Ramo que sempre diverge (break/continue/return) nao precisa do
+        // fechamento: o desenrolamento ja removeu o escopo e o controle
+        // jamais alcanca este ponto por fall-through.
+        let end_jump = if diverges(then_branch) {
+            None
+        } else {
+            self.emit_scope_close()?;
+            Some(self.emit(Op::Jump(u32::MAX)))
+        };
+        let else_target = self.chunk.code.len() as u32;
+        self.patch_jump(else_jump, else_target);
+        if let Some(else_stmts) = else_branch {
+            self.emit_scope_open();
+            self.compile_stmts(else_stmts)?;
+            if !diverges(else_stmts) {
+                self.emit_scope_close()?;
+            }
+        }
+        let end_target = self.chunk.code.len() as u32;
+        if let Some(end_jump) = end_jump {
+            self.patch_jump(end_jump, end_target);
         }
         Ok(())
     }
@@ -586,13 +945,58 @@ impl Compiler {
                 let name_idx = self.intern_name(name)?;
                 self.emit(Op::DeclareName(name_idx));
             }
+            Stmt::Const { name, init } => {
+                self.compile_expr(init)?;
+                let name_idx = self.intern_name(name)?;
+                self.emit(Op::DeclareName(name_idx));
+                self.declare_const(name);
+            }
+            Stmt::Break => {
+                let Some(loop_ctx) = self.loops.last() else {
+                    return Err(CompileError::new("`break` fora de laco".to_string()));
+                };
+                let break_depth = loop_ctx.break_depth;
+                while self.scopes.len() > break_depth {
+                    self.emit_scope_close()?;
+                }
+                let pos = self.emit(Op::Jump(u32::MAX));
+                if let Some(top) = self.loops.last_mut() {
+                    top.breaks.push(pos);
+                }
+            }
+            Stmt::Continue => {
+                let (continue_depth, start) = match self.loops.last() {
+                    Some(loop_ctx) => (loop_ctx.continue_depth, loop_ctx.start),
+                    None => return Err(CompileError::new("`continue` fora de laco".to_string())),
+                };
+                while self.scopes.len() > continue_depth {
+                    self.emit_scope_close()?;
+                }
+                match start {
+                    Some(target) => {
+                        self.emit(Op::Jump(target));
+                    }
+                    None => {
+                        let pos = self.emit(Op::Jump(u32::MAX));
+                        if let Some(top) = self.loops.last_mut() {
+                            top.continues.push(pos);
+                        }
+                    }
+                }
+            }
             Stmt::Assign { target, expr } => match target {
                 AssignTarget::Var(name) => {
+                    if self.is_const(name) {
+                        return Err(CompileError::new(format!("atribuicao a constante: {name}")));
+                    }
                     self.compile_expr(expr)?;
                     let name_idx = self.intern_name(name)?;
                     self.emit(Op::StoreName(name_idx));
                 }
                 AssignTarget::Index { name, index } => {
+                    if self.is_const(name) {
+                        return Err(CompileError::new(format!("atribuicao a constante: {name}")));
+                    }
                     // Ordem na pilha: [indice, valor]; StoreIndex desempilha
                     // valor e depois indice.
                     self.compile_expr(index)?;
@@ -605,39 +1009,48 @@ impl Compiler {
                 cond,
                 then_branch,
                 else_branch,
-            } => {
-                self.compile_expr(cond)?;
-                let else_jump = self.emit(Op::JumpIfFalse(u32::MAX));
-                self.emit(Op::EnterScope);
-                self.compile_stmts(then_branch)?;
-                self.emit(Op::ExitScope);
-                match else_branch {
-                    Some(else_stmts) => {
-                        let end_jump = self.emit(Op::Jump(u32::MAX));
-                        let else_target = self.chunk.code.len() as u32;
-                        self.patch_jump(else_jump, else_target);
-                        self.emit(Op::EnterScope);
-                        self.compile_stmts(else_stmts)?;
-                        self.emit(Op::ExitScope);
-                        let end_target = self.chunk.code.len() as u32;
-                        self.patch_jump(end_jump, end_target);
-                    }
-                    None => {
-                        let end_target = self.chunk.code.len() as u32;
-                        self.patch_jump(else_jump, end_target);
-                    }
-                }
-            }
+            } => self.compile_if(cond, then_branch, else_branch)?,
             Stmt::While { cond, body } => {
                 let loop_start = self.chunk.code.len() as u32;
                 self.compile_expr(cond)?;
                 let exit_jump = self.emit(Op::JumpIfFalse(u32::MAX));
-                self.emit(Op::EnterScope);
+                // Profundidade ANTES de abrir o escopo do corpo: `break` e
+                // `continue` fecham tambem o escopo do corpo, sem vazar
+                // `let`s internos para fora do laco.
+                let base_depth = self.scopes.len();
+                self.emit_scope_open();
+                self.loops.push(LoopCtx {
+                    break_depth: base_depth,
+                    continue_depth: base_depth,
+                    start: Some(loop_start),
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                });
+                // `break`/`continue` no corpo fecham escopos no rastreamento
+                // estatico; restaura-o para o caminho normal (corpo sem
+                // desvio), que fecha o escopo do corpo logo abaixo. So o
+                // rastreamento e restaurado — pools e saltos sao mantidos.
+                let saved_scopes = self.scopes.clone();
                 self.compile_stmts(body)?;
-                self.emit(Op::ExitScope);
+                self.scopes = saved_scopes;
+                self.emit_scope_close()?;
                 self.emit(Op::Jump(loop_start));
                 let exit_target = self.chunk.code.len() as u32;
                 self.patch_jump(exit_jump, exit_target);
+                let Some(loop_ctx) = self.loops.pop() else {
+                    return Err(CompileError::new(
+                        "desequilibrio interno de lacos".to_string(),
+                    ));
+                };
+                for pos in &loop_ctx.breaks {
+                    self.patch_jump(*pos, exit_target);
+                }
+                for pos in &loop_ctx.continues {
+                    self.patch_jump(*pos, loop_start);
+                }
+            }
+            Stmt::For { var, iter, body } => {
+                self.compile_for(var, iter, body)?;
             }
             Stmt::FnDef { name, params, body } => {
                 let mut seen = std::collections::HashSet::new();
@@ -680,9 +1093,11 @@ impl Compiler {
                 self.emit(Op::Return);
             }
             Stmt::Block(stmts) => {
-                self.emit(Op::EnterScope);
+                self.emit_scope_open();
                 self.compile_stmts(stmts)?;
-                self.emit(Op::ExitScope);
+                if !diverges(stmts) {
+                    self.emit_scope_close()?;
+                }
             }
             Stmt::Import(_) => {
                 // Resolucao de modulos e papel do carregador (`rhp run`);
@@ -752,7 +1167,37 @@ impl Compiler {
                 match op {
                     UnaryOp::Neg => self.emit(Op::Neg),
                     UnaryOp::Not => self.emit(Op::Not),
+                    UnaryOp::BitNot => self.emit(Op::BitNot),
                 };
+            }
+            Expr::Binary {
+                op: BinOp::NullCoalesce,
+                left,
+                right,
+            } => {
+                // Avalia `left` uma unica vez; se nao-nulo, usa o valor.
+                self.compile_expr(left)?;
+                self.emit(Op::Dup);
+                let end = self.emit(Op::JumpIfNotNull(u32::MAX));
+                self.emit(Op::Pop);
+                self.compile_expr(right)?;
+                let end_target = self.chunk.code.len() as u32;
+                self.patch_jump(end, end_target);
+            }
+            Expr::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.compile_expr(cond)?;
+                let else_jump = self.emit(Op::JumpIfFalse(u32::MAX));
+                self.compile_expr(then_branch)?;
+                let end_jump = self.emit(Op::Jump(u32::MAX));
+                let else_target = self.chunk.code.len() as u32;
+                self.patch_jump(else_jump, else_target);
+                self.compile_expr(else_branch)?;
+                let end_target = self.chunk.code.len() as u32;
+                self.patch_jump(end_jump, end_target);
             }
             Expr::Binary { op, left, right } => {
                 self.compile_expr(left)?;
@@ -769,6 +1214,17 @@ impl Compiler {
                     BinOp::Le => self.emit(Op::Le),
                     BinOp::Gt => self.emit(Op::Gt),
                     BinOp::Ge => self.emit(Op::Ge),
+                    BinOp::BitAnd => self.emit(Op::BitAnd),
+                    BinOp::BitOr => self.emit(Op::BitOr),
+                    BinOp::BitXor => self.emit(Op::BitXor),
+                    BinOp::Shl => self.emit(Op::Shl),
+                    BinOp::Shr => self.emit(Op::Shr),
+                    BinOp::NullCoalesce => {
+                        // Inalcancavel: tratado no braco dedicado acima.
+                        return Err(CompileError::new(
+                            "erro interno: NullCoalesce fora do caminho dedicado".to_string(),
+                        ));
+                    }
                 };
             }
             Expr::Call { name, args } => {
@@ -798,6 +1254,23 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+}
+
+/// Indica se a execucao nunca passa do fim desta lista de instrucoes
+/// (termina em `break`, `continue` ou `return`, considerando `if`/`{}`).
+/// Usado para nao emitir fechamento de escopo em codigo inalancavel.
+fn diverges(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Break) | Some(Stmt::Continue) | Some(Stmt::Return { .. }) => true,
+        Some(Stmt::If {
+            then_branch,
+            else_branch: Some(other),
+            ..
+        }) => diverges(then_branch) && diverges(other),
+        Some(Stmt::If { .. }) => false,
+        Some(Stmt::Block(inner)) => diverges(inner),
+        _ => false,
     }
 }
 
@@ -929,6 +1402,75 @@ mod tests {
     }
 
     #[test]
+    fn compiles_ternary_and_null_coalescing() {
+        let chunk = compile_src("echo true ? 1 : 2;");
+        assert!(chunk.code.iter().any(|op| matches!(op, Op::JumpIfFalse(_))));
+        let chunk = compile_src("echo a ?? b;");
+        assert!(chunk.code.contains(&Op::Dup));
+        assert!(chunk
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::JumpIfNotNull(_))));
+    }
+
+    #[test]
+    fn compiles_const_and_rejects_const_assign() {
+        let chunk = compile_src("const N = 10; echo N;");
+        assert!(chunk.code.contains(&Op::DeclareName(0)));
+        let program = parse_source("const N = 1; N = 2;").expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(err.message.contains("constante"));
+        let program = parse_source("const A = [1]; A[0] = 2;").expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(err.message.contains("constante"));
+    }
+
+    #[test]
+    fn compiles_break_continue_and_rejects_outside_loop() {
+        let chunk = compile_src("while true { break; } while true { continue; }");
+        chunk
+            .validate()
+            .expect("laco com break/continue deve validar");
+        let program = parse_source("break;").expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(err.message.contains("fora de laco"));
+        let program = parse_source("continue;").expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(err.message.contains("fora de laco"));
+    }
+
+    #[test]
+    fn compiles_for_loop_with_break_continue() {
+        let chunk = compile_src("for x in [1, 2] { if x == 1 { continue; } break; }");
+        chunk.validate().expect("for deve validar");
+        assert!(chunk.code.contains(&Op::IterList));
+        // `for` aninhado usa nomes ocultos distintos (sem colisao).
+        let nested = compile_src("for a in [1] { for b in [2] { echo b; } }");
+        nested.validate().expect("for aninhado deve validar");
+        // `for` dentro de funcao compila.
+        let in_fn = compile_src("fn f() { for x in [1] { echo x; } }");
+        in_fn.validate().expect("for em funcao deve validar");
+        // Aridade dos novos builtins.
+        let program = parse_source("echo sort([2, 1]); exit(0);").expect("parse deve passar");
+        compile(&program).expect("sort/exit com aridade certa deve passar");
+        let wrong = parse_source("echo sort([1], [2]);").expect("parse deve passar");
+        assert!(compile(&wrong)
+            .expect_err("deve falhar")
+            .message
+            .contains("espera 1"));
+    }
+
+    #[test]
+    fn compiles_bitwise_ops() {
+        let chunk = compile_src("echo 6 & 3 | 1 ^ 2; echo ~5; echo 1 << 4;");
+        assert!(chunk.code.contains(&Op::BitAnd));
+        assert!(chunk.code.contains(&Op::BitOr));
+        assert!(chunk.code.contains(&Op::BitXor));
+        assert!(chunk.code.contains(&Op::BitNot));
+        assert!(chunk.code.contains(&Op::Shl));
+    }
+
+    #[test]
     fn rejects_duplicate_params() {
         let program = parse_source("fn f(a, a) { return a; }").expect("parse deve passar");
         let err = compile(&program).expect_err("deve falhar");
@@ -1016,6 +1558,62 @@ mod tests {
         };
         let err = chunk.validate().expect_err("deve falhar");
         assert!(err.message.contains("altura"));
+    }
+
+    #[test]
+    fn builtin_ids_roundtrip() {
+        let all = [
+            Builtin::Len,
+            Builtin::Push,
+            Builtin::Pop,
+            Builtin::Keys,
+            Builtin::Str,
+            Builtin::Int,
+            Builtin::Float,
+            Builtin::Type,
+            Builtin::Assert,
+            Builtin::HttpGet,
+            Builtin::Contains,
+            Builtin::StartsWith,
+            Builtin::EndsWith,
+            Builtin::Split,
+            Builtin::Join,
+            Builtin::Trim,
+            Builtin::Upper,
+            Builtin::Lower,
+            Builtin::Replace,
+            Builtin::Abs,
+            Builtin::Min,
+            Builtin::Max,
+            Builtin::Sqrt,
+            Builtin::Pow,
+            Builtin::Floor,
+            Builtin::Ceil,
+            Builtin::Values,
+            Builtin::Entries,
+            Builtin::Merge,
+            Builtin::Has,
+            Builtin::FsRead,
+            Builtin::FsWrite,
+            Builtin::FsAppend,
+            Builtin::FsExists,
+            Builtin::Argv,
+            Builtin::Env,
+            Builtin::Sort,
+            Builtin::Exit,
+            Builtin::JsonParse,
+            Builtin::JsonStringify,
+        ];
+        for (expected_id, builtin) in all.iter().enumerate() {
+            let id = BuiltinId::from(*builtin);
+            assert_eq!(id.0 as usize, expected_id);
+            assert_eq!(id.resolve().expect("id valido"), *builtin);
+        }
+        assert_eq!(builtin_by_name("len"), Some(Builtin::Len));
+        assert_eq!(builtin_by_name("nao_existe"), None);
+        assert_eq!(builtin_arity(Builtin::Push), 2);
+        assert_eq!(builtin_arity(Builtin::Replace), 3);
+        assert_eq!(builtin_arity(Builtin::Len), 1);
     }
 
     #[test]

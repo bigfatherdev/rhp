@@ -38,14 +38,19 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 ## 2. Instrucoes
 
 ```text
-Stmt       := LetStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt | FnDef
-           | ReturnStmt | Block | ExprStmt
+Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt
+           | ForStmt | BreakStmt | ContinueStmt | FnDef | ReturnStmt | Block
+           | ImportStmt | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
+ConstStmt  := "const" Ident "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
 Target     := Ident | Ident "[" Expr "]"
 EchoStmt   := "echo" Expr ";"
 IfStmt     := "if" Expr Block ("else" Block)?
 WhileStmt  := "while" Expr Block
+ForStmt    := "for" Ident "in" Expr Block
+BreakStmt  := "break" ";"
+ContinueStmt := "continue" ";"
 FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
 ReturnStmt := "return" Expr? ";"
 ImportStmt := "import" String ";"
@@ -57,8 +62,20 @@ ExprStmt   := Expr ";"
 - `x = e;` exige variavel visivel (escopos internos -> externos -> globais).
 - `echo e;` escreve `Display` do valor + `\n` (qualquer tipo).
 - `if`/`while` exigem condicao `Bool` (sem truthiness implicita). `while`
-  reavalia a condicao a cada iteracao. Blocos `{}` criam escopo; shadowing
+  reavalia a condicao a cada iteracao. `for x in e { ... }` avalia `e` uma
+  vez: array itera os elementos em ordem; mapa itera as chaves `Str` em
+  ordem (mesma ordem de `keys`); outro tipo = erro de runtime ("`for`
+  exige array ou mapa"). `x` e declarada a cada iteracao no escopo do
+  corpo (atribuir a `x` nao afeta a iteracao; para strings, use
+  `for c in split(s, "")`). `break`/`continue` (sempre dentro de `while`
+  ou `for`, mesmo aninhados em `if`/blocos) saem da iteracao ou do laco
+  e fecham tambem o escopo do corpo — `let`s internos nao vazam para fora;
+  fora de laco e erro de compilacao. `continue` no `for` pula ao proximo
+  elemento. `in` e contextual (identificador comum fora do `for`), mas
+  `for` e palavra reservada. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
+- `const NOME = expr;` declara como `let`, mas imutavel: atribuir depois
+  (inclusive `NOME[i] = v`) e erro de compilacao.
 - `fn nome(params) { ... }` declara funcao no escopo atual. Chamada
   `nome(args)` avalia callee e argumentos da esquerda para a direita;
   aridade deve coincidir. `return e;` sai da funcao com o valor (`return;`
@@ -70,8 +87,11 @@ ExprStmt   := Expr ";"
 
 ## 3. Expressoes e precedencia (da menor para a maior)
 
-Igualdade (`==`, `!=`) < comparacao (`<`, `<=`, `>`, `>=`) < aditiva
-(`+`, `-`) < multiplicativa (`*`, `/`, `%`) < unaria (`!`, `-`) < primaria.
+Ternario (`a ? b : c`, associativo a direita) < coalescencia nula
+(`a ?? b`, avalia `a` uma vez; `null` usa `b`) < igualdade (`==`, `!=`) <
+OU-bit (`|`) < XOR-bit (`^`) < E-bit (`&`) < comparacao (`<`, `<=`, `>`,
+`>=`) < deslocamento (`<<`, `>>`) < aditiva (`+`, `-`) < multiplicativa
+(`*`, `/`, `%`) < unaria (`!`, `-`, `~` e `+x` como identidade) < primaria.
 
 ```text
 Primary   := Int | Float | String | "true" | "false" | "null"
@@ -98,6 +118,10 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
   `Str`-`Str` (lexicografica); resto e erro. `==`/`!=` aceitam quaisquer
   valores: `Int`/`Float` comparam numericamente, funcoes por identidade,
   tipos diferentes sao diferentes.
+- Bitwise (`& | ^`, so `Int`): E/OU/XOR bit a bit; `~x` inverte os bits de
+  `Int`; `<<`/`>>` deslocam (deslocamento negativo ou >= 64 = erro).
+- Ternario `c ? a : b` avalia so o ramo escolhido (`c` deve ser `Bool`).
+  `a ?? b` avalia `a` uma vez: se nao-`null`, usa `a`; senao avalia `b`.
 - `Display`: `null`, `true`/`false`, inteiro, float, conteudo da string,
   `[a, b]` para arrays, `{k: v, ...}` (chaves ordenadas) para mapas,
   `<fn nome>` para funcoes.
@@ -137,6 +161,32 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `float(v)` | `Float`->igual; `Int`->converte; `Str`->parse; resto erro. |
 | `type(v)` | `"null"`, `"bool"`, `"int"`, `"float"`, `"string"`, `"array"`, `"mapa"`, `"funcao"`. |
 | `assert(cond)` | `true`->`null`; `false`/nao-bool = erro. |
+| `contains(s, parte)` | `true` se `parte` ocorre em `s` (ambos `Str`). |
+| `starts_with(s, prefix)` | `true` se `s` comeca com `prefixo`. |
+| `ends_with(s, sufixo)` | `true` se `s` termina com `sufixo`. |
+| `split(s, sep)` | `Array` de pedacos; separador vazio divide em caracteres. |
+| `join(arr, sep)` | Junta `Array` de `Str`; nao-`Str` = erro. |
+| `trim(s)` | Remove espacos das pontas (Unicode). |
+| `upper(s)` / `lower(s)` | Caixa alta/baixa (Unicode). |
+| `replace(s, de, para)` | Substitui todas as ocorrencias. |
+| `abs(x)` | Valor absoluto (`Int` com checagem; `Float` direto). |
+| `min(a, b)` / `max(a, b)` | Minimo/maximo numericos (misto vira `Float`). |
+| `sqrt(x)` | Raiz quadrada (`Float`); negativo = erro. |
+| `pow(base, exp)` | Potencia (`Float`; tipos numericos). |
+| `floor(x)` / `ceil(x)` | Para baixo/cima (`Int`); fora de `i64` = erro. |
+| `values(m)` | `Array` com os valores (ordem das chaves). |
+| `entries(m)` | `Array` de pares `[chave, valor]` (ordem das chaves). |
+| `merge(a, b)` | Une dois mapas; chaves de `b` vencem. |
+| `has(m, chave)` | `true` se a chave existe. |
+| `fs_read(caminho)` | Conteudo do arquivo (`Str` UTF-8); erro de I/O ou > 8 MiB = erro. |
+| `fs_write(caminho, texto)` / `fs_append(caminho, texto)` | Escreve/anexa; retorna bytes escritos. Caminhos relativos resolvem no diretorio atual; roda com as permissoes do usuario. |
+| `fs_exists(caminho)` | `true` se legivel (qualquer falha = `false`). |
+| `argv()` | `Array` de `Str` com os argumentos apos o arquivo (`rhp run prog.rhp a b` => `["a", "b"]`). |
+| `env(nome)` | Valor da variavel de ambiente ou `null` se ausente. |
+| `sort(arr)` | Copia ordenada (estavel): numeros (`Int`/`Float`, mistos comparam exato quando possivel), `Str` (ordem lexicografica de bytes UTF-8) ou `Bool` (`false` < `true`); vazio => vazio. Mistura com outros tipos ou nao-array = erro. Nao muta o original (`a = sort(a);`). |
+| `exit(codigo)` | Encerra o programa com codigo 0-255 (fora disso ou nao-`Int` = erro). Desenrola chamadas; em `rhp test`, conta como falha do arquivo. |
+| `json_parse(texto)` | Texto JSON => valor (`null`/`Bool`/`Int` se inteiro em `i64` senao `Float`/`Str`/`Array`/`Mapa`). Gramatica estrita; erro com posicao (byte). Objetos: primeira chave vence (regra dos literais). Teto de 128 niveis. |
+| `json_stringify(valor)` | Valor => texto JSON canonico (chaves ordenadas, sem espacos; `2.0` para floats inteiros). `NaN`/infinito e `Func` = erro. Teto de 128 niveis. |
 | `http_get(url)` | (Fase 6) GET `http://host[:porta]/caminho` com timeouts de 5s (conexao/leitura; DNS usa o resolvedor do sistema, sem timeout proprio), teto de corpo de 1 MiB, so 2xx e corpo UTF-8; resto = erro. Somente esquema `http://`. |
 
 Exemplo:

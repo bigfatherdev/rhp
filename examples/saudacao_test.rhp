@@ -1,0 +1,8 @@
+// Teste de exemplo para `rhp test` (descoberto como `*_test.rhp`).
+// Usa `assert`: falha vira erro de runtime e reprova o arquivo.
+import "saudacao_lib.rhp";
+
+assert(saudacao("mundo") == "ola, mundo!");
+assert(len("rhp") == 3);
+assert(1 + 2 * 3 == 7);
+echo "saudacao_test: ok";
