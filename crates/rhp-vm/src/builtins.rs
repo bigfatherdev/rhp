@@ -3,7 +3,7 @@
 //! Separado do nucleo de execucao (`Vm::step`) por responsabilidade:
 //! aqui vivem efeitos (rede, conversoes); la, despacho e pilha.
 
-use super::{type_name, VmError};
+use super::{type_name, DbConn, DbHandles, VmError};
 use rhp_bytecode::{Builtin, Value};
 
 /// Corpo maximo aceito por `http_get` (protecao contra exaustao de memoria).
@@ -16,6 +16,7 @@ pub(super) fn call_builtin(
     builtin: Builtin,
     args: &[Value],
     argv: &[String],
+    db: &mut DbHandles,
 ) -> Result<Value, VmError> {
     match builtin {
         Builtin::Len => match &args[0] {
@@ -354,6 +355,128 @@ pub(super) fn call_builtin(
         Builtin::Now => super::time::now_unix(),
         Builtin::Sleep => super::time::sleep_secs(&args[0]),
         Builtin::DateStr => super::time::date_string(&args[0]),
+        Builtin::DbOpen => match &args[0] {
+            Value::Str(path) => {
+                let conn = if let Some(conninfo) = path.strip_prefix("pg:") {
+                    super::pg::Connection::connect(conninfo)
+                        .map(DbConn::Postgres)
+                        .map_err(VmError::new)?
+                } else {
+                    super::sqlite::Connection::open(path)
+                        .map(DbConn::Sqlite)
+                        .map_err(VmError::new)?
+                };
+                let handle = db.next;
+                db.next += 1;
+                db.conns.insert(handle, conn);
+                Ok(Value::Int(handle))
+            }
+            other => Err(VmError::new(format!(
+                "`db_open` exige caminho (string), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::DbExec => {
+            let handle = db_handle(&args[0])?;
+            let sql = db_sql(&args[1])?;
+            let params = db_params(&args[2])?;
+            let conn = db_conn(db, handle)?;
+            match conn {
+                DbConn::Sqlite(conn) => conn
+                    .exec(&sql, &params)
+                    .map(Value::Int)
+                    .map_err(VmError::new),
+                DbConn::Postgres(conn) => {
+                    let pg_params = pg_params(&params)?;
+                    conn.exec(&sql, &pg_params)
+                        .map(Value::Int)
+                        .map_err(VmError::new)
+                }
+            }
+        }
+        Builtin::DbQuery => {
+            let handle = db_handle(&args[0])?;
+            let sql = db_sql(&args[1])?;
+            let params = db_params(&args[2])?;
+            let conn = db_conn(db, handle)?;
+            match conn {
+                DbConn::Sqlite(conn) => conn
+                    .query(&sql, &params)
+                    .map(|rows| {
+                        Value::Array(
+                            rows.into_iter()
+                                .map(|row| {
+                                    Value::Map(
+                                        row.into_iter()
+                                            .map(|(k, v)| {
+                                                let value = match v {
+                                                    super::sqlite::SqlColumn::Int(n) => {
+                                                        Value::Int(n)
+                                                    }
+                                                    super::sqlite::SqlColumn::Float(n) => {
+                                                        Value::Float(n)
+                                                    }
+                                                    super::sqlite::SqlColumn::Text(s) => {
+                                                        Value::Str(s)
+                                                    }
+                                                    super::sqlite::SqlColumn::Null => Value::Null,
+                                                };
+                                                (k, value)
+                                            })
+                                            .collect(),
+                                    )
+                                })
+                                .collect(),
+                        )
+                    })
+                    .map_err(VmError::new),
+                DbConn::Postgres(conn) => {
+                    let pg_params = pg_params(&params)?;
+                    conn.query(&sql, &pg_params)
+                        .map(|rows| {
+                            Value::Array(
+                                rows.into_iter()
+                                    .map(|row| {
+                                        Value::Map(
+                                            row.into_iter()
+                                                .map(|(k, v)| {
+                                                    let value = match v {
+                                                        super::pg::PgValue::Int(n) => Value::Int(n),
+                                                        super::pg::PgValue::Float(n) => {
+                                                            Value::Float(n)
+                                                        }
+                                                        super::pg::PgValue::Bool(b) => {
+                                                            Value::Bool(b)
+                                                        }
+                                                        super::pg::PgValue::Text(s) => {
+                                                            Value::Str(s)
+                                                        }
+                                                        super::pg::PgValue::Null => Value::Null,
+                                                    };
+                                                    (k, value)
+                                                })
+                                                .collect(),
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .map_err(VmError::new)
+                }
+            }
+        }
+        Builtin::DbClose => {
+            let handle = db_handle(&args[0])?;
+            match db.conns.remove(&handle) {
+                Some(DbConn::Sqlite(_)) => Ok(Value::Null),
+                Some(DbConn::Postgres(conn)) => {
+                    conn.close().map(|()| Value::Null).map_err(VmError::new)
+                }
+                None => Err(VmError::new(format!(
+                    "`db_close`: handle {handle} invalido ou ja fechado"
+                ))),
+            }
+        }
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)
@@ -802,6 +925,74 @@ fn http_fetch_body(url: &str, opts: &FetchOpts) -> Result<Value, VmError> {
         return Ok(Value::Map(entries));
     }
 }
+/// Handle `db_*` (inteiro nao-negativo).
+fn db_handle(value: &Value) -> Result<i64, VmError> {
+    match value {
+        Value::Int(handle) if *handle >= 0 => Ok(*handle),
+        other => Err(VmError::new(format!(
+            "`db`: handle invalido, encontrado {}",
+            type_name(other)
+        ))),
+    }
+}
+
+/// SQL como string.
+fn db_sql(value: &Value) -> Result<String, VmError> {
+    match value {
+        Value::Str(sql) => Ok(sql.clone()),
+        other => Err(VmError::new(format!(
+            "`db`: SQL exige string, encontrado {}",
+            type_name(other)
+        ))),
+    }
+}
+
+/// Array de parametros RHP => valores SQL.
+fn db_params(value: &Value) -> Result<Vec<super::sqlite::SqlValue>, VmError> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Int(n) => Ok(super::sqlite::SqlValue::Int(*n)),
+                Value::Float(n) => Ok(super::sqlite::SqlValue::Float(*n)),
+                Value::Str(s) => Ok(super::sqlite::SqlValue::Text(s.clone())),
+                Value::Bool(true) => Ok(super::sqlite::SqlValue::Int(1)),
+                Value::Bool(false) => Ok(super::sqlite::SqlValue::Int(0)),
+                Value::Null => Ok(super::sqlite::SqlValue::Null),
+                other => Err(VmError::new(format!(
+                    "`db`: parametro exige numero/string/bool/null, encontrado {}",
+                    type_name(other)
+                ))),
+            })
+            .collect(),
+        other => Err(VmError::new(format!(
+            "`db`: parametros exigem array, encontrado {}",
+            type_name(other)
+        ))),
+    }
+}
+
+/// Conexao aberta pelo handle (fechado/inexistente = erro).
+fn db_conn(db: &mut DbHandles, handle: i64) -> Result<&mut DbConn, VmError> {
+    db.conns
+        .get_mut(&handle)
+        .ok_or_else(|| VmError::new(format!("`db`: handle {handle} invalido ou ja fechado")))
+}
+
+/// Converte params RHP para parametros PG (texto; `?` nao existe no PG,
+/// use `$1`, `$2`... no SQL).
+fn pg_params(params: &[super::sqlite::SqlValue]) -> Result<Vec<super::pg::PgParam>, VmError> {
+    params
+        .iter()
+        .map(|p| match p {
+            super::sqlite::SqlValue::Int(n) => Ok(super::pg::PgParam::Text(n.to_string())),
+            super::sqlite::SqlValue::Float(n) => Ok(super::pg::PgParam::Text(n.to_string())),
+            super::sqlite::SqlValue::Text(s) => Ok(super::pg::PgParam::Text(s.clone())),
+            super::sqlite::SqlValue::Null => Ok(super::pg::PgParam::Null),
+        })
+        .collect()
+}
+
 /// Cliente HTTP minimo (somente `http://`), sem dependencias externas.
 ///
 /// Timeouts de 5s para conexao e leitura; aceita apenas status 2xx e

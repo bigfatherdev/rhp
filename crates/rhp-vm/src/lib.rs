@@ -15,6 +15,8 @@ use builtins::call_builtin;
 pub use builtins::MAX_HTTP_BODY;
 
 mod json;
+mod pg;
+mod sqlite;
 mod time;
 
 /// Profundidade maxima da pilha de chamadas (protecao contra estouro).
@@ -112,6 +114,22 @@ pub struct Vm {
     limits: VmLimits,
     steps: u64,
     argv: Vec<String>,
+    /// Conexoes de banco abertas (`db_open`); chave = handle `Int`.
+    db: DbHandles,
+}
+
+/// Conexoes de banco da VM (B2: SQLite; B3: +PostgreSQL).
+#[derive(Debug, Default)]
+struct DbHandles {
+    conns: HashMap<i64, DbConn>,
+    next: i64,
+}
+
+/// Conexao de banco por tras de um handle (`db_*`).
+#[derive(Debug)]
+enum DbConn {
+    Sqlite(sqlite::Connection),
+    Postgres(pg::Connection),
 }
 
 impl Vm {
@@ -123,6 +141,7 @@ impl Vm {
             limits: VmLimits::default(),
             steps: 0,
             argv: Vec::new(),
+            db: DbHandles::default(),
         }
     }
 
@@ -525,7 +544,7 @@ impl Vm {
                     }
                 }
                 args.reverse();
-                let result = call_builtin(builtin, &args, &self.argv)?;
+                let result = call_builtin(builtin, &args, &self.argv, &mut self.db)?;
                 self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }
@@ -1603,6 +1622,47 @@ mod tests {
         let start = Instant::now();
         assert_eq!(run_src("echo sleep(0);").expect("ok"), "null\n");
         assert!(start.elapsed().as_secs() < 5, "sleep(0) demorou demais");
+    }
+
+    #[test]
+    fn rejects_bad_pg_conninfo() {
+        // Sem servidor: formato invalido, porta invalida, recusa rapida.
+        for bad in [
+            "echo db_open(\"pg:no-equals\");",
+            "echo db_open(\"pg:port=abc\");",
+            "echo db_open(\"pg:host=127.0.0.1 port=1 user=rhp dbname=rhp\");",
+        ] {
+            let err = run_err(bad);
+            assert!(err.contains("`db`"), "obteve: {err} em {bad}");
+        }
+    }
+
+    #[test]
+    fn runs_sqlite_crud() {
+        let dir = std::env::temp_dir().join(format!("rhp-db-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir temporario");
+        let path = dir.join("t.db").to_string_lossy().into_owned();
+        let setup = format!(
+            "let h = db_open(\"{path}\");\necho db_exec(h, \"CREATE TABLE t (id, nome, preco)\", []);\necho db_exec(h, \"INSERT INTO t VALUES (?, ?, ?)\", [1, \"a\", 2.5]);\necho db_exec(h, \"INSERT INTO t VALUES (2, null, 3.0)\", []);\necho db_query(h, \"SELECT id, nome, preco FROM t ORDER BY id\", []);\necho db_close(h);\n"
+        );
+        let out = run_src(&setup).expect("ok");
+        assert_eq!(
+            out,
+            "0\n1\n1\n[{id: 1, nome: a, preco: 2.5}, {id: 2, nome: null, preco: 3}]\nnull\n"
+        );
+        // Arquivo criado de verdade.
+        assert!(std::fs::metadata(&path).is_ok(), "banco nao foi criado");
+        // Tipos e erros.
+        let err = run_err(&format!(
+            "let h = db_open(\"{path}\"); echo db_exec(h, \"SELEC 1\", []);"
+        ));
+        assert!(err.contains("preparar"), "obteve: {err}");
+        let err = run_err(&format!(
+            "let h = db_open(\"{path}\"); echo db_exec(h, \"SELECT ?\", [1, 2]);"
+        ));
+        assert!(err.contains("parametro"), "obteve: {err}");
+        let err = run_err(&format!("let h = db_open(\"{path}\"); echo db_query(h, \"SELECT * FROM t\", []); echo db_close(h); echo db_query(h, \"SELECT 1\", []);"));
+        assert!(err.contains("fechado"), "obteve: {err}");
     }
 
     #[test]

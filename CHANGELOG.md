@@ -64,6 +64,12 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - Rede v2: `http_fetch(url, opts)` (redirects, headers, timeout;
   `http_get` preservado). Fase A concluída.
   Registro: `changes/2026-11-15-feat-rede-v2.md`.
+- SQLite via FFI mínimo ao `libsqlite3` (sem crate externa):
+  `db_open/exec/query/close` (ADR 0011).
+  Registro: `changes/2026-11-15-feat-sqlite.md`.
+- PostgreSQL via protocolo próprio (mesmos `db_*`, prefixo `pg:`),
+  testado contra servidor real. Fase B concluída.
+  Registro: `changes/2026-11-15-feat-postgres.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).
