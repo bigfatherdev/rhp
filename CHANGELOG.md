@@ -50,6 +50,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   serializador proprios, sem dependencias; teto de 128 niveis; erros
   com posicao).
   Registro: `changes/2026-11-15-feat-json.md`.
+- Exceções: `try`/`catch`/`finally` + `throw` (RFC 0001), com propagação
+  entre funções, `finally` em todos os caminhos (`exit()` não aciona) e
+  erro como valor (`{tipo, mensagem}`).
+  Registros: `RFCs/0001-excecoes.md`, `changes/2026-11-15-feat-excecoes.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).

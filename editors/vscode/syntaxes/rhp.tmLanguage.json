@@ -34,7 +34,7 @@
     },
     "keyword": {
       "name": "keyword.control.rhp",
-      "match": "\\b(echo|let|const|if|else|while|for|break|continue|fn|return|import|true|false|null)\\b"
+      "match": "\\b(echo|let|const|if|else|while|for|try|catch|finally|throw|break|continue|fn|return|import|true|false|null)\\b"
     },
     "builtin": {
       "name": "support.function.builtin.rhp",

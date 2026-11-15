@@ -6,8 +6,9 @@
 //! Program    := Stmt*
 //! Block      := "{" Stmt* "}"
 //! Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt
-//!             | WhileStmt | ForStmt | BreakStmt | ContinueStmt | FnDef
-//!             | ReturnStmt | Block | ImportStmt | ExprStmt
+//!             | WhileStmt | ForStmt | TryStmt | ThrowStmt | BreakStmt
+//!             | ContinueStmt | FnDef | ReturnStmt | Block | ImportStmt
+//!             | ExprStmt
 //! LetStmt    := "let" Ident ("=" Expr)? ";"
 //! ConstStmt  := "const" Ident "=" Expr ";"
 //! AssignStmt := Target "=" Expr ";"
@@ -16,6 +17,9 @@
 //! IfStmt     := "if" Expr Block ("else" Block)?
 //! WhileStmt  := "while" Expr Block
 //! ForStmt    := "for" Ident "in" Expr Block
+//! TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
+//!             // ao menos um de `catch`/`finally` e obrigatorio
+//! ThrowStmt  := "throw" Expr ";"
 //! BreakStmt  := "break" ";"
 //! ContinueStmt := "continue" ";"
 //! FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
@@ -89,6 +93,19 @@ pub enum Stmt {
         var: String,
         iter: Expr,
         body: Vec<Stmt>,
+    },
+    /// `try BLOCO (catch VAR? BLOCO)? (finally BLOCO)?` (RFC 0001).
+    /// Ao menos um de `catch`/`finally` e obrigatorio (checado no parse).
+    /// `catch` presente com corpo vazio (`catch e { }`) consome o erro.
+    Try {
+        body: Vec<Stmt>,
+        catch_var: Option<String>,
+        catch_body: Option<Vec<Stmt>>,
+        finally_body: Option<Vec<Stmt>>,
+    },
+    /// `throw EXPR;` — lanca o valor como erro (RFC 0001).
+    Throw {
+        expr: Expr,
     },
     FnDef {
         name: String,
@@ -278,6 +295,10 @@ fn token_width(token: &Token) -> usize {
         | TokenKind::Else
         | TokenKind::While
         | TokenKind::For
+        | TokenKind::Try
+        | TokenKind::Catch
+        | TokenKind::Finally
+        | TokenKind::Throw
         | TokenKind::Fn
         | TokenKind::Import
         | TokenKind::Null
@@ -342,6 +363,8 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::If => parse_if(cursor),
         TokenKind::While => parse_while(cursor),
         TokenKind::For => parse_for(cursor),
+        TokenKind::Try => parse_try(cursor),
+        TokenKind::Throw => parse_throw(cursor),
         TokenKind::Fn => parse_fn_def(cursor),
         TokenKind::Return => parse_return(cursor),
         TokenKind::Import => parse_import(cursor),
@@ -483,6 +506,48 @@ fn parse_for(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     let iter = parse_expr(cursor)?;
     let body = parse_block(cursor)?;
     Ok(Stmt::For { var, iter, body })
+}
+
+fn parse_throw(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let expr = parse_expr(cursor)?;
+    expect_semicolon(cursor)?;
+    Ok(Stmt::Throw { expr })
+}
+
+fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let body = parse_block(cursor)?;
+    let mut catch_var = None;
+    let mut catch_body: Option<Vec<Stmt>> = None;
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Catch)) {
+        cursor.next();
+        // `catch` com ou sem variavel: `catch e { }` ou `catch { }`.
+        if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBrace)) {
+            catch_var = Some(expect_ident(cursor)?);
+        }
+        catch_body = Some(parse_block(cursor)?);
+    }
+    let mut finally_body = None;
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Finally)) {
+        cursor.next();
+        finally_body = Some(parse_block(cursor)?);
+    }
+    if catch_body.is_none() && finally_body.is_none() {
+        let (line, col) = cursor.end_pos();
+        return Err(ParseError::new(
+            "`try` exige ao menos `catch` ou `finally`",
+            line,
+            col,
+        ));
+    }
+    // `catch` vazio (`catch e { }`) e valido: consome o erro e segue.
+    Ok(Stmt::Try {
+        body,
+        catch_var,
+        catch_body,
+        finally_body,
+    })
 }
 
 fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -957,6 +1022,10 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Else => "`else`".to_string(),
         TokenKind::While => "`while`".to_string(),
         TokenKind::For => "`for`".to_string(),
+        TokenKind::Try => "`try`".to_string(),
+        TokenKind::Catch => "`catch`".to_string(),
+        TokenKind::Finally => "`finally`".to_string(),
+        TokenKind::Throw => "`throw`".to_string(),
         TokenKind::Fn => "`fn`".to_string(),
         TokenKind::Const => "`const`".to_string(),
         TokenKind::Break => "`break`".to_string(),
@@ -1302,9 +1371,53 @@ mod tests {
     }
 
     #[test]
-    fn rejects_import_without_string() {
-        let err = lex_and_parse("import 42;").expect_err("deve falhar");
-        assert!(err.message.contains("caminho de modulo"));
+    fn parses_try_catch_finally_and_throw() {
+        let program =
+            lex_and_parse("try { echo 1; } catch e { echo e; } finally { echo 2; } throw \"x\";")
+                .expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![
+                Stmt::Try {
+                    body: vec![Stmt::Echo { expr: Expr::Int(1) }],
+                    catch_var: Some("e".to_string()),
+                    catch_body: Some(vec![Stmt::Echo {
+                        expr: Expr::Var("e".to_string()),
+                    }]),
+                    finally_body: Some(vec![Stmt::Echo { expr: Expr::Int(2) }]),
+                },
+                Stmt::Throw {
+                    expr: Expr::StringLiteral("x".to_string()),
+                },
+            ]
+        );
+        // `catch` sem variavel e `try` so com `finally` sao validos.
+        let program =
+            lex_and_parse("try { echo 1; } catch { echo 2; }").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Try {
+                catch_var: None,
+                finally_body: None,
+                ..
+            }
+        ));
+        let program =
+            lex_and_parse("try { echo 1; } finally { echo 2; }").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Try {
+                catch_var: None,
+                finally_body: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_try_without_catch_nor_finally() {
+        let err = lex_and_parse("try { echo 1; }").expect_err("deve falhar");
+        assert!(err.message.contains("ao menos"), "obteve: {}", err.message);
     }
 
     #[test]

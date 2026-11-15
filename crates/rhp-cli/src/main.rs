@@ -608,6 +608,20 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
             }
             Stmt::While { body, .. } => check_block_imports(body, "em `while`")?,
             Stmt::For { body, .. } => check_block_imports(body, "em `for`")?,
+            Stmt::Try {
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                check_block_imports(body, "em `try`")?;
+                if let Some(catch_body) = catch_body {
+                    check_block_imports(catch_body, "em `catch`")?;
+                }
+                if let Some(finally_body) = finally_body {
+                    check_block_imports(finally_body, "em `finally`")?;
+                }
+            }
             Stmt::FnDef { body, name, .. } => {
                 check_block_imports(body, &format!("na funcao `{name}`"))?;
             }

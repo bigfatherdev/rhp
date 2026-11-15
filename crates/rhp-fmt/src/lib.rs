@@ -108,6 +108,38 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str("}\n");
         }
+        Stmt::Try {
+            body,
+            catch_var,
+            catch_body,
+            finally_body,
+        } => {
+            indent(level, out);
+            out.push_str("try {\n");
+            fmt_block(body, level + 1, out);
+            indent(level, out);
+            if let Some(catch_body) = catch_body {
+                match catch_var {
+                    Some(var) => out.push_str(&format!("}} catch {var} {{\n")),
+                    None => out.push_str("} catch {\n"),
+                }
+                fmt_block(catch_body, level + 1, out);
+                indent(level, out);
+            }
+            match finally_body {
+                Some(finally_body) => {
+                    out.push_str("} finally {\n");
+                    fmt_block(finally_body, level + 1, out);
+                    indent(level, out);
+                    out.push_str("}\n");
+                }
+                None => out.push_str("}\n"),
+            }
+        }
+        Stmt::Throw { expr } => {
+            indent(level, out);
+            let _ = writeln!(out, "throw {};", fmt_expr(expr, 0));
+        }
         Stmt::For { var, iter, body } => {
             indent(level, out);
             let _ = writeln!(out, "for {var} in {} {{", fmt_expr(iter, 0));
@@ -381,6 +413,22 @@ mod tests {
         );
         // `in` continua identificador comum fora do `for`.
         check_idempotent("let in = 1;\necho in;\n");
+    }
+
+    #[test]
+    fn formats_try_catch_finally_and_throw() {
+        assert_eq!(
+            fmt("try{echo 1;}catch e{echo e;}finally{echo 2;}"),
+            "try {\n  echo 1;\n} catch e {\n  echo e;\n} finally {\n  echo 2;\n}\n"
+        );
+        assert_eq!(
+            fmt("try{echo 1;}catch{echo 2;}"),
+            "try {\n  echo 1;\n} catch {\n  echo 2;\n}\n"
+        );
+        assert_eq!(fmt("throw 1+2;"), "throw 1 + 2;\n");
+        check_idempotent(
+            "try {\n  echo 1;\n} catch e {\n  echo e;\n} finally {\n  echo 2;\n}\nthrow \"x\";\n",
+        );
     }
 
     #[test]

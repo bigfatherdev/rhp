@@ -142,6 +142,35 @@ fn rhp_run_json_roundtrip() {
 }
 
 #[test]
+fn rhp_run_try_catch_finally() {
+    let output = run_temp_source(
+        "try.rhp",
+        "try {\n  throw \"boom\";\n} catch e {\n  echo e;\n} finally {\n  echo \"fim\";\n}\ntry {\n  echo json_parse(\"{oops}\");\n} catch e {\n  echo e[\"tipo\"];\n}\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"boom\nfim\nruntime\n");
+    // Sem handler: exit 1 com a mensagem original.
+    let uncaught = run_temp_source("try_ruim.rhp", "throw \"x\";\n");
+    assert!(!uncaught.status.success());
+    assert!(
+        String::from_utf8_lossy(&uncaught.stderr).contains("excecao nao capturada: x"),
+        "stderr={}",
+        String::from_utf8_lossy(&uncaught.stderr)
+    );
+    // `exit` dentro de `try` pula `finally` e sai com o codigo.
+    let said = run_temp_source(
+        "try_sai.rhp",
+        "try {\n  echo \"antes\";\n  exit(3);\n} finally {\n  echo \"fim\";\n}\n",
+    );
+    assert_eq!(said.status.code(), Some(3));
+    assert_eq!(said.stdout, b"antes\n");
+}
+
+#[test]
 fn rhp_run_exit_codes() {
     // `exit(3)`: stdout anterior preservado + codigo 3, sem mensagem de erro.
     let output = run_temp_source("sai3.rhp", "echo \"antes\";\nexit(3);\necho \"depois\";\n");
@@ -389,8 +418,8 @@ fn vscode_grammar_covers_language() {
     let text = std::fs::read_to_string(&grammar).expect("nao foi possivel ler gramatica");
     assert!(text.contains("\"scopeName\": \"source.rhp\""));
     for keyword in [
-        "echo", "let", "const", "if", "else", "while", "for", "break", "continue", "fn", "return",
-        "import", "true", "false", "null",
+        "echo", "let", "const", "if", "else", "while", "for", "try", "catch", "finally", "throw",
+        "break", "continue", "fn", "return", "import", "true", "false", "null",
     ] {
         assert!(
             text.contains(keyword),

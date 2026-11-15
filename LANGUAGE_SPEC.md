@@ -39,8 +39,8 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 
 ```text
 Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt
-           | ForStmt | BreakStmt | ContinueStmt | FnDef | ReturnStmt | Block
-           | ImportStmt | ExprStmt
+           | ForStmt | TryStmt | ThrowStmt | BreakStmt | ContinueStmt | FnDef
+           | ReturnStmt | Block | ImportStmt | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
 ConstStmt  := "const" Ident "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
@@ -49,6 +49,9 @@ EchoStmt   := "echo" Expr ";"
 IfStmt     := "if" Expr Block ("else" Block)?
 WhileStmt  := "while" Expr Block
 ForStmt    := "for" Ident "in" Expr Block
+TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
+           // ao menos um de `catch`/`finally` e obrigatorio
+ThrowStmt  := "throw" Expr ";"
 BreakStmt  := "break" ";"
 ContinueStmt := "continue" ";"
 FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
@@ -74,6 +77,15 @@ ExprStmt   := Expr ";"
   elemento. `in` e contextual (identificador comum fora do `for`), mas
   `for` e palavra reservada. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
+- `try B (catch V? C)? (finally F)?` (ao menos um dos dois): erro em `B`
+  (incluindo `throw`, `assert` falho, builtin com erro) procura o `catch`
+  mais interno na mesma funcao; sem handler, desenrola chamadas (rodando
+  `finally`s) e falha como hoje. `V` recebe o erro: mapa
+  `{tipo: "runtime", mensagem: "..."}` para erros internos, ou o valor de
+  `throw`. `F` roda sempre (normal, `catch`, erro propagado, `return`/
+  `break`/`continue` que cruzem o `try`); `return`/`throw` em `F`
+  substituem o fluxo. `exit()` nao aciona `finally`. `try` sem `catch`
+  nem `finally` e erro de parse.
 - `const NOME = expr;` declara como `let`, mas imutavel: atribuir depois
   (inclusive `NOME[i] = v`) e erro de compilacao.
 - `fn nome(params) { ... }` declara funcao no escopo atual. Chamada
@@ -196,6 +208,13 @@ let a = [1, 2];
 a = push(a, 3);
 echo len(a);      // 3
 echo keys({b: 1, a: 2}); // [a, b]
+try {
+  echo json_parse("{oops}");
+} catch e {
+  echo e["mensagem"];   // detalhe do erro, sem abortar
+} finally {
+  echo "fim";
+}
 ```
 
 ## 7. Erros (lex com linha:coluna base 1; runtime com mensagem)
@@ -214,6 +233,8 @@ Exemplos invalidos:
 - `if 1 { }` (runtime: condicao deve ser bool).
 - `echo [1][5];` (runtime: indice fora do intervalo).
 - `echo {}["x"];` (runtime: chave inexistente).
+- `try { echo 1; }` sem `catch`/`finally` (parse: "`try` exige ao menos").
+- `throw "boom";` sem `try` (runtime: `excecao nao capturada: boom`).
 - `import "a.rhp"; import "a.rhp";` com `a.rhp` importando de volta
   (erro: importacao circular).
 

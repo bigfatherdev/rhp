@@ -66,9 +66,9 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 
 ## Fases A–D — RHP para sites/sistemas (plano aprovado, em andamento)
 
-- [x] A1: RFC 0001 — exceções (`RFCs/0001-excecoes.md`, estado: proposta).
-- [ ] A2–A5: implementar exceções, namespaces/exports (ADR 0009),
-  datas/horas, rede v2.
+- [x] A1: RFC 0001 — exceções (`RFCs/0001-excecoes.md`, aceita e implementada).
+- [x] A2: exceções implementadas (lexer/parser/bytecode/VM/fmt/CLI/specs).
+- [ ] A3–A5: namespaces/exports (ADR 0009), datas/horas, rede v2.
 - [ ] Fase B: persistência (ADR SQLite, driver, PostgreSQL com servidor
   real).
 - [ ] Fase C: servidor HTTP (RFC concorrência, router, middleware,

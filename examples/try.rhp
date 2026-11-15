@@ -1,0 +1,15 @@
+let entrada = "{invalido}";
+try {
+  echo json_parse(entrada);
+} catch e {
+  echo e["tipo"];
+  echo e["mensagem"];
+} finally {
+  echo "fim";
+}
+try {
+  throw "aviso";
+} catch {
+  echo "silenciado";
+}
+echo "ok";

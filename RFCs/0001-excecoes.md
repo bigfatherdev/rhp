@@ -2,7 +2,7 @@
 
 - ID: RFC-0001
 - Data: 2026-11-15
-- Estado: proposta
+- Estado: aceita (autorizacao do plano de sistemas, 2026-11-15; implementada em A2)
 - Autores: agente (sessão Fase A) + responsável pelo projeto (aprovação pendente)
 - Escopo: linguagem, compilador, bytecode, VM, CLI, specs, diagnósticos
 

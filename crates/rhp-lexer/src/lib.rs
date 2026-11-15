@@ -1,10 +1,11 @@
-//! Lexer escrito a mao para o RHP (Fase 2 / Marco 2).
+//! Lexer escrito a mao para o RHP (Fase A: + `try`/`catch`/`finally`/`throw`).
 //!
 //! Reconhece o subconjunto implementado: palavras-chave (`echo`, `let`,
-//! `const`, `if`, `else`, `while`, `for`, `break`, `continue`, `fn`,
-//! `return`, `import`, `true`, `false`, `null`), identificadores, literais
-//! (string, inteiro, float), operadores e pontuacao. Comentarios de linha
-//! `//` sao ignorados. Erros carregam linha/coluna.
+//! `const`, `if`, `else`, `while`, `for`, `break`, `continue`, `try`,
+//! `catch`, `finally`, `throw`, `fn`, `return`, `import`, `true`, `false`,
+//! `null`), identificadores, literais (string, inteiro, float), operadores
+//! e pontuacao. Comentarios de linha `//` sao ignorados. Erros carregam
+//! linha/coluna.
 //!
 //! Nota: `in` (do `for x in ...`) NAO e palavra-chave: e lido como
 //! identificador comum e reconhecido posicionalmente pelo parser, para
@@ -25,6 +26,10 @@ pub enum TokenKind {
     For,
     Break,
     Continue,
+    Try,
+    Catch,
+    Finally,
+    Throw,
     Fn,
     Return,
     Import,
@@ -562,6 +567,10 @@ fn lex_ident_or_keyword(
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
         "for" => TokenKind::For,
+        "try" => TokenKind::Try,
+        "catch" => TokenKind::Catch,
+        "finally" => TokenKind::Finally,
+        "throw" => TokenKind::Throw,
         "fn" => TokenKind::Fn,
         "return" => TokenKind::Return,
         "import" => TokenKind::Import,
@@ -674,6 +683,16 @@ mod tests {
                 TokenKind::Return,
                 TokenKind::Import,
                 TokenKind::Echo,
+            ]
+        );
+        // `try`/`catch`/`finally`/`throw` (Fase A, RFC 0001).
+        assert_eq!(
+            kinds("try catch finally throw"),
+            vec![
+                TokenKind::Try,
+                TokenKind::Catch,
+                TokenKind::Finally,
+                TokenKind::Throw,
             ]
         );
         // `in` e contextual (do `for x in ...`): continua identificador.
