@@ -340,6 +340,17 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+        Builtin::JsonParse => match &args[0] {
+            Value::Str(text) => super::json::parse_json(text),
+            other => Err(VmError::new(format!(
+                "`json_parse` exige string, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::JsonStringify => match super::json::stringify_json(&args[0]) {
+            Ok(text) => Ok(Value::Str(text)),
+            Err(e) => Err(e),
+        },
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)

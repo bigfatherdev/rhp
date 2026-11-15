@@ -46,6 +46,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   builtins `sort(array)` (copia ordenada estavel) e `exit(codigo)`
   (0-255; vira exit code no `rhp run`).
   Registro: `changes/2026-11-15-feat-laco-for-sort-exit.md`.
+- Builtins `json_parse(texto)` / `json_stringify(valor)` (parser e
+  serializador proprios, sem dependencias; teto de 128 niveis; erros
+  com posicao).
+  Registro: `changes/2026-11-15-feat-json.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).

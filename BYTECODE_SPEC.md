@@ -46,7 +46,7 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 | `Index` | `pop` indice e base; empilha `base[indice]` (regras §3). |
 | `StoreIndex(n)` | `pop` valor e indice; grava em `names[n][indice]`. |
 | `IterList` | `pop` iteravel; empilha lista de iteracao (`Array` = copia; `Mapa` = chaves `Str` ordenadas; resto = erro). |
-| `CallBuiltin(id)` | Executa builtin de id 0–37 com aridade fixa (tabela §4). |
+| `CallBuiltin(id)` | Executa builtin de id 0–39 com aridade fixa (tabela §4). |
 
 ## 3. Compilacao (Marco 2 + Fases 3–4)
 
@@ -85,7 +85,7 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 15 Trim 16 Upper 17 Lower 18 Replace 19 Abs 20 Min 21 Max 22 Sqrt
 23 Pow 24 Floor 25 Ceil 26 Values 27 Entries 28 Merge 29 Has
 30 FsRead 31 FsWrite 32 FsAppend 33 FsExists 34 Argv 35 Env
-36 Sort 37 Exit`
+36 Sort 37 Exit 38 JsonParse 39 JsonStringify`
 (aridades na tabela §6 de `LANGUAGE_SPEC.md`). Ids desconhecidos invalidam
 o chunk; `BuiltinId` tem teste anti-deriva.
 

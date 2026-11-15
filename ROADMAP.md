@@ -55,7 +55,10 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
   `break`/`continue`
   (`changes/2026-11-15-feat-laco-for-sort-exit.md`,
   `changes/2026-11-15-fix-laco-escopo-break.md`). 168 testes verdes.
-- [ ] Pendente (ordem tecnica): JSON std-only, datas/horas, `switch`,
+- [x] JSON std-only: `json_parse`/`json_stringify` sem dependencias, com
+  teto de 128 niveis e erros com posicao
+  (`changes/2026-11-15-feat-json.md`).
+- [ ] Pendente (ordem tecnica): datas/horas, `switch`,
   `sort`/`filter` com callback (exige primeira-classe), args
   default/variadicos, destructuring; depois excecoes, closures,
   namespaces/exports, pacotes, rede v2, tipos, OO, async/DBs/servidor

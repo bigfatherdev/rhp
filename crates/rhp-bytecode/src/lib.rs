@@ -113,6 +113,10 @@ pub enum Builtin {
     Sort,
     /// `exit(codigo)` — encerra com codigo 0–255 (via erro especial).
     Exit,
+    /// `json_parse(texto)` — JSON => valor (nulo/bool/numero/string/array/mapa).
+    JsonParse,
+    /// `json_stringify(valor)` — valor => texto JSON.
+    JsonStringify,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -157,6 +161,8 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "env" => Some(Builtin::Env),
         "sort" => Some(Builtin::Sort),
         "exit" => Some(Builtin::Exit),
+        "json_parse" => Some(Builtin::JsonParse),
+        "json_stringify" => Some(Builtin::JsonStringify),
         _ => None,
     }
 }
@@ -187,7 +193,9 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::FsExists
         | Builtin::Env
         | Builtin::Sort
-        | Builtin::Exit => 1,
+        | Builtin::Exit
+        | Builtin::JsonParse
+        | Builtin::JsonStringify => 1,
         Builtin::Push
         | Builtin::Contains
         | Builtin::StartsWith
@@ -323,6 +331,8 @@ impl BuiltinId {
             35 => Ok(Builtin::Env),
             36 => Ok(Builtin::Sort),
             37 => Ok(Builtin::Exit),
+            38 => Ok(Builtin::JsonParse),
+            39 => Ok(Builtin::JsonStringify),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -369,6 +379,8 @@ impl From<Builtin> for BuiltinId {
             Builtin::Env => 35,
             Builtin::Sort => 36,
             Builtin::Exit => 37,
+            Builtin::JsonParse => 38,
+            Builtin::JsonStringify => 39,
         };
         Self(id)
     }
@@ -1589,6 +1601,8 @@ mod tests {
             Builtin::Env,
             Builtin::Sort,
             Builtin::Exit,
+            Builtin::JsonParse,
+            Builtin::JsonStringify,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

@@ -14,6 +14,8 @@ mod builtins;
 use builtins::call_builtin;
 pub use builtins::MAX_HTTP_BODY;
 
+mod json;
+
 /// Profundidade maxima da pilha de chamadas (protecao contra estouro).
 pub const MAX_CALL_DEPTH: usize = 512;
 
@@ -1572,6 +1574,90 @@ mod tests {
         let mut out = Vec::new();
         let err = vm.run(&no_code, &mut out).expect_err("deve falhar");
         assert_eq!(err.exit_code(), None);
+    }
+
+    #[test]
+    fn runs_json_roundtrip() {
+        // Tipos basicos.
+        assert_eq!(run_src("echo json_parse(\"null\");").expect("ok"), "null\n");
+        assert_eq!(run_src("echo json_parse(\"true\");").expect("ok"), "true\n");
+        assert_eq!(run_src("echo json_parse(\"42\");").expect("ok"), "42\n");
+        assert_eq!(run_src("echo json_parse(\"4.5\");").expect("ok"), "4.5\n");
+        assert_eq!(
+            run_src("echo json_parse(\"\\\"oi\\\"\");").expect("ok"),
+            "oi\n"
+        );
+        assert_eq!(
+            run_src("echo json_parse(\"[1, true]\");").expect("ok"),
+            "[1, true]\n"
+        );
+        assert_eq!(
+            run_src("echo json_parse(\"{\\\"b\\\": 1, \\\"a\\\": 2}\");").expect("ok"),
+            "{a: 2, b: 1}\n"
+        );
+        // Serializacao canonica (chaves ordenadas, sem espacos).
+        assert_eq!(
+            run_src("echo json_stringify({b: [1, 2], a: \"x\"});").expect("ok"),
+            "{\"a\":\"x\",\"b\":[1,2]}\n"
+        );
+        assert_eq!(run_src("echo json_stringify(2.0);").expect("ok"), "2.0\n");
+        assert_eq!(
+            run_src("echo json_stringify(\"a\\nb\");").expect("ok"),
+            "\"a\\nb\"\n"
+        );
+        // Idempotencia: parse(stringify(v)) preserva o valor.
+        assert_eq!(
+            run_src(
+                "let v = {a: [1, {b: null}], s: \"x\"}; echo json_parse(json_stringify(v)) == v;"
+            )
+            .expect("ok"),
+            "true\n"
+        );
+        // Numero inteiro grande alem de i64 vira Float (perda documentada).
+        assert_eq!(
+            run_src("echo type(json_parse(\"99999999999999999999\"));").expect("ok"),
+            "float\n"
+        );
+    }
+
+    #[test]
+    fn reports_json_errors() {
+        // Malformados com posicao.
+        for bad in [
+            "echo json_parse(\"{oops}\");",
+            "echo json_parse(\"[1,]\");",
+            "echo json_parse(\"{\\\"a\\\":}\");",
+            "echo json_parse(\"01\");",
+            "echo json_parse(\"05\");",
+            "echo json_parse(\"\\\\uD800\");",
+            "echo json_parse(\"trailing x\");",
+        ] {
+            let err = run_err(bad);
+            assert!(err.contains("json_parse"), "obteve: {err} em {bad}");
+        }
+        // Nao-string e erro de tipo.
+        let err = run_err("echo json_parse(42);");
+        assert!(err.contains("exige string"), "obteve: {err}");
+        // Funcao, NaN e infinito nao serializam.
+        let err = run_err("fn f() { } echo json_stringify(f);");
+        assert!(err.contains("nao representa"), "obteve: {err}");
+        let err = run_err("echo json_stringify(pow(-1.0, 0.5));");
+        assert!(err.contains("nao representa"), "obteve: {err}");
+        let err = run_err("echo json_stringify(pow(10.0, 309.0));");
+        assert!(err.contains("nao representa"), "obteve: {err}");
+    }
+
+    #[test]
+    fn reports_json_depth_limit() {
+        // Aninhamento alem de 128 e erro, nunca estouro de pilha.
+        let deep_in: String = "[".repeat(200) + &"]".repeat(200);
+        let err = run_err(&format!("echo json_parse(\"{deep_in}\");"));
+        assert!(err.contains("profundidade"), "obteve: {err}");
+        // Valor aninhado construido em runtime (literal fundo nao parseia).
+        let err = run_err(
+            "let v = 0; let i = 0; while i < 200 { v = [v]; i = i + 1; } echo json_stringify(v);",
+        );
+        assert!(err.contains("profundidade"), "obteve: {err}");
     }
 
     #[test]

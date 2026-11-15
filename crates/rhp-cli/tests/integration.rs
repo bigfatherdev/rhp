@@ -120,6 +120,28 @@ fn rhp_run_for_sort_and_scopes() {
 }
 
 #[test]
+fn rhp_run_json_roundtrip() {
+    let output = run_temp_source(
+        "json.rhp",
+        "let v = json_parse(\"{\\\"a\\\": [1, true, null]}\");\necho v[\"a\"][0];\necho json_stringify({b: 1, a: \"x\"});\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1\n{\"a\":\"x\",\"b\":1}\n");
+    // Malformado: exit 1 com mensagem de `json_parse`.
+    let bad = run_temp_source("json_ruim.rhp", "echo json_parse(\"{oops}\");\n");
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("json_parse"),
+        "stderr={}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+#[test]
 fn rhp_run_exit_codes() {
     // `exit(3)`: stdout anterior preservado + codigo 3, sem mensagem de erro.
     let output = run_temp_source("sai3.rhp", "echo \"antes\";\nexit(3);\necho \"depois\";\n");
@@ -414,6 +436,8 @@ fn vscode_grammar_covers_language() {
         "env",
         "sort",
         "exit",
+        "json_parse",
+        "json_stringify",
     ] {
         assert!(
             text.contains(builtin),

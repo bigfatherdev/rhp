@@ -51,6 +51,7 @@ let a = [1, 2]; a[0] = 9; a = push(a, 3);
 echo len(a); echo pop(a); echo keys({b: 1});
 echo str(42); echo int("42"); echo float(2); echo type(a);
 echo sort([3, 1, 2]); echo split("a,b", ",");
+echo json_parse("{\"a\": 1}"); echo json_stringify({a: [1, 2]});
 assert(a == [9, 2, 3]); echo http_get("http://127.0.0.1:8080/x");
 exit(0);
 ```
