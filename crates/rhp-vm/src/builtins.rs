@@ -351,6 +351,9 @@ pub(super) fn call_builtin(
             Ok(text) => Ok(Value::Str(text)),
             Err(e) => Err(e),
         },
+        Builtin::Now => super::time::now_unix(),
+        Builtin::Sleep => super::time::sleep_secs(&args[0]),
+        Builtin::DateStr => super::time::date_string(&args[0]),
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)

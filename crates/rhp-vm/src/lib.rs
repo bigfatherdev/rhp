@@ -15,6 +15,7 @@ use builtins::call_builtin;
 pub use builtins::MAX_HTTP_BODY;
 
 mod json;
+mod time;
 
 /// Profundidade maxima da pilha de chamadas (protecao contra estouro).
 pub const MAX_CALL_DEPTH: usize = 512;
@@ -1553,6 +1554,55 @@ mod tests {
             .expect_err("deve falhar")
             .message
             .contains("fora de laco"));
+    }
+
+    #[test]
+    fn runs_time_builtins() {
+        // `now()` = epoch Int nao-negativo e nao-decrescente.
+        let t1 = run_src("echo type(now());").expect("ok");
+        assert_eq!(t1, "int\n");
+        // `date_str` com vetores conhecidos (UTC, bissextos, negativos).
+        assert_eq!(
+            run_src("echo date_str(0);").expect("ok"),
+            "1970-01-01T00:00:00Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(-1);").expect("ok"),
+            "1969-12-31T23:59:59Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(951782400);").expect("ok"),
+            "2000-02-29T00:00:00Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(1763123303);").expect("ok"),
+            "2025-11-14T12:28:23Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(253402300799);").expect("ok"),
+            "9999-12-31T23:59:59Z\n"
+        );
+        assert_eq!(
+            run_src("echo date_str(-2208988800);").expect("ok"),
+            "1900-01-01T00:00:00Z\n"
+        );
+        // Tipos errados.
+        let err = run_err("echo date_str(\"x\");");
+        assert!(err.contains("epoch"), "obteve: {err}");
+        let err = run_err("echo sleep(\"x\");");
+        assert!(err.contains("segundos"), "obteve: {err}");
+        let err = run_err("echo sleep(-1);");
+        assert!(err.contains(">= 0"), "obteve: {err}");
+        let err = run_err("echo sleep(3601);");
+        assert!(err.contains("teto"), "obteve: {err}");
+    }
+
+    #[test]
+    fn sleep_zero_returns_quickly() {
+        use std::time::Instant;
+        let start = Instant::now();
+        assert_eq!(run_src("echo sleep(0);").expect("ok"), "null\n");
+        assert!(start.elapsed().as_secs() < 5, "sleep(0) demorou demais");
     }
 
     #[test]

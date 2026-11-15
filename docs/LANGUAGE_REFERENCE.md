@@ -52,6 +52,7 @@ echo len(a); echo pop(a); echo keys({b: 1});
 echo str(42); echo int("42"); echo float(2); echo type(a);
 echo sort([3, 1, 2]); echo split("a,b", ",");
 echo json_parse("{\"a\": 1}"); echo json_stringify({a: [1, 2]});
+echo now(); echo date_str(0); echo sleep(0);
 try { echo json_parse(x); } catch e { echo e["mensagem"]; } finally { echo "fim"; }
 assert(a == [9, 2, 3]); echo http_get("http://127.0.0.1:8080/x");
 exit(0);

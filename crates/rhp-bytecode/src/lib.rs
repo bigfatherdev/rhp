@@ -117,6 +117,12 @@ pub enum Builtin {
     JsonParse,
     /// `json_stringify(valor)` — valor => texto JSON.
     JsonStringify,
+    /// `now()` — segundos desde 1970-01-01T00:00:00Z (`Int`).
+    Now,
+    /// `sleep(segundos)` — bloqueia a thread (`Int`/`Float`, teto 1h).
+    Sleep,
+    /// `date_str(ts)` — `Int` (epoch) => `"AAAA-MM-DDTHH:MM:SSZ"` (UTC).
+    DateStr,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -163,6 +169,9 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "exit" => Some(Builtin::Exit),
         "json_parse" => Some(Builtin::JsonParse),
         "json_stringify" => Some(Builtin::JsonStringify),
+        "now" => Some(Builtin::Now),
+        "sleep" => Some(Builtin::Sleep),
+        "date_str" => Some(Builtin::DateStr),
         _ => None,
     }
 }
@@ -170,7 +179,7 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
 #[must_use]
 pub const fn builtin_arity(builtin: Builtin) -> usize {
     match builtin {
-        Builtin::Argv => 0,
+        Builtin::Argv | Builtin::Now => 0,
         Builtin::Len
         | Builtin::Pop
         | Builtin::Keys
@@ -195,7 +204,9 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Sort
         | Builtin::Exit
         | Builtin::JsonParse
-        | Builtin::JsonStringify => 1,
+        | Builtin::JsonStringify
+        | Builtin::Sleep
+        | Builtin::DateStr => 1,
         Builtin::Push
         | Builtin::Contains
         | Builtin::StartsWith
@@ -342,6 +353,9 @@ impl BuiltinId {
             37 => Ok(Builtin::Exit),
             38 => Ok(Builtin::JsonParse),
             39 => Ok(Builtin::JsonStringify),
+            40 => Ok(Builtin::Now),
+            41 => Ok(Builtin::Sleep),
+            42 => Ok(Builtin::DateStr),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -390,6 +404,9 @@ impl From<Builtin> for BuiltinId {
             Builtin::Exit => 37,
             Builtin::JsonParse => 38,
             Builtin::JsonStringify => 39,
+            Builtin::Now => 40,
+            Builtin::Sleep => 41,
+            Builtin::DateStr => 42,
         };
         Self(id)
     }
@@ -1844,6 +1861,9 @@ mod tests {
             Builtin::Exit,
             Builtin::JsonParse,
             Builtin::JsonStringify,
+            Builtin::Now,
+            Builtin::Sleep,
+            Builtin::DateStr,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

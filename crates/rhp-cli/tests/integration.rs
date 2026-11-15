@@ -171,6 +171,20 @@ fn rhp_run_try_catch_finally() {
 }
 
 #[test]
+fn rhp_run_time_builtins() {
+    let output = run_temp_source(
+        "hora.rhp",
+        "echo date_str(0);\necho type(now());\necho sleep(0);\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1970-01-01T00:00:00Z\nint\nnull\n");
+}
+
+#[test]
 fn rhp_run_exit_codes() {
     // `exit(3)`: stdout anterior preservado + codigo 3, sem mensagem de erro.
     let output = run_temp_source("sai3.rhp", "echo \"antes\";\nexit(3);\necho \"depois\";\n");
@@ -467,6 +481,9 @@ fn vscode_grammar_covers_language() {
         "exit",
         "json_parse",
         "json_stringify",
+        "now",
+        "sleep",
+        "date_str",
     ] {
         assert!(
             text.contains(builtin),
