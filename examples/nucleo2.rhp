@@ -1,0 +1,25 @@
+// Exemplos do lote nucleo-2 (RFC 0008).
+echo match 2 { 1 => "um", 2 => "dois", default => "outro" };
+echo match 9 { 1 => "um", default => "outro" };
+
+let nome = null;
+echo nome ?: "anonimo";
+echo "RHP" ?: "anonimo";
+
+let dobro = fn (x) => x * 2;
+echo dobro(21);
+echo map([1, 2, 3], fn (x) => x + 1);
+
+for let i = 0; i < 3; i = i + 1 { echo i; }
+for ;; { echo "uma vez"; break; }
+
+let j = 0;
+while j < 2 {
+  j = j + 1;
+  switch j {
+    case 1 { echo "um"; break 2; }
+    default { echo j; }
+  }
+  echo "depois-do-switch";
+}
+echo "fim";

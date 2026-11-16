@@ -64,6 +64,8 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
   A–C): namespaces/exports (restante: re-export), pacotes, tipos, OO,
   async/DBs (restante: Redis), LSP/debugger completos (todos exigem
   RFC/ADR e gates, cf. auditoria §21).
+- [x] Lote nucleo-2 (RFC 0008 aceita e implementada: `match` estrito,
+  Elvis `?:`, arrow `=>`, `for(;;)`, `break`/`continue N`).
 - [x] `switch` com fallthrough (RFC 0004 aceita e implementada:
   `case`/`default`, `break`/`continue`, escopo por ramo).
 - [x] HOFs com callback (RFC 0005 aceita e implementada: `map`, `filter`,

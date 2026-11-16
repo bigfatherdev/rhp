@@ -50,9 +50,9 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 
 ```text
 Stmt       := LetStmt | ConstStmt | DestructureStmt | AssignStmt | EchoStmt
-           | IfStmt | WhileStmt | ForStmt | SwitchStmt | TryStmt | ThrowStmt
-           | BreakStmt | ContinueStmt | FnDef
-           | ReturnStmt | Block | ImportStmt | ExprStmt
+           | IfStmt | WhileStmt | ForStmt | ForCStmt | SwitchStmt | TryStmt
+           | ThrowStmt | BreakStmt | ContinueStmt | FnDef | ReturnStmt
+           | Block | ImportStmt | ImportNames | Export | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
 ConstStmt  := "const" Ident "=" Expr ";"
 DestructureStmt := ("let" | "const") ("[" Ident ("," Ident)* "]"
@@ -63,14 +63,17 @@ EchoStmt   := "echo" Expr ";"
 IfStmt     := "if" Expr Block ("else" Block)?
 WhileStmt  := "while" Expr Block
 ForStmt    := "for" Ident "in" Expr Block
+ForCStmt   := "for" Stmt? ";" Expr? ";" (Assign | Expr)? Block
+           // `init` = `let`/`const`/atribuicao/expressao; `passo` sem `let`;
+           // secoes vazias ok (`for (;;)` = infinito)
 SwitchStmt := "switch" Expr "{" (CaseClause | DefaultClause)* "}"
 CaseClause := "case" Expr Block   // `default` unico, posicao livre
 DefaultClause := "default" Block
 TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
            // ao menos um de `catch`/`finally` e obrigatorio
 ThrowStmt  := "throw" Expr ";"
-BreakStmt  := "break" ";"
-ContinueStmt := "continue" ";"
+BreakStmt  := "break" Int? ";"     // N >= 1, padrao 1 (sai de N breakables)
+ContinueStmt := "continue" Int? ";" // N >= 1, padrao 1 (conta laco e `switch`)
 FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" Block
 Param      := Ident ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
 ReturnStmt := "return" Expr? ";"
@@ -97,8 +100,9 @@ ExprStmt   := Expr ";"
   `for c in split(s, "")`). `break` (dentro de `while`, `for` ou `switch`,
   mesmo aninhados em `if`/blocos) sai do laco/`switch` mais interno e fecha
   tambem o escopo do corpo — `let`s internos nao vazam para fora; fora de
-  laco/`switch` e erro de compilacao. `continue` exige laco externo (pula
-  `switch`s no caminho). `continue` no `for` pula ao proximo
+  laco/`switch` e erro de compilacao. `continue`/`continue 1` em `switch`
+  equivale a `break` dele (gotcha do PHP); `continue N` conta N breakables
+  (laco ou `switch`) para fora. `continue` no `for` pula ao proximo
   elemento. `in` e contextual (identificador comum fora do `for`), mas
   `for` e palavra reservada. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
@@ -106,12 +110,25 @@ ExprStmt   := Expr ";"
   vez; cada `case` compara com `==` do RHP em ordem ate o primeiro match
   (preguicoso); sem `break`, o controle cai no proximo ramo (fallthrough);
   `default` e unico, em qualquer posicao, e casa quando alcancado sem match
-  anterior. `break` sai do `switch` (mais interno); `continue` ignora o
-  `switch` e mira o laco mais externo (sem laco = erro de compilacao).
+  anterior. `break` sai do `switch` (mais interno); `continue` em `switch`
+  equivale a `break` dele (gotcha do PHP; `continue N` conta niveis
+  incluindo `switch`, ver RFC 0008).
   Cada ramo tem escopo proprio (`let` repetido em ramos distintos nao
   colide). `case`/`default` fora de `switch` e erro de parse; `switch`
   vazio e permitido. `switch(true)` com cases int nao casa (`==` nao promove
   `Bool`; ver `PHP_DIFFERENCES.md`).
+- `match e { c1 => v1, default => v2 }` (RFC 0008, expressao): avalia `e`
+  uma vez; bracos em ordem com igualdade estrita, primeiro match vence (sem
+  fallthrough); `default` unico, em qualquer posicao, casa quando alcancado;
+  sem match e sem `default` = erro de runtime (capturavel por `try`).
+- `fn (p) => expr` e acucar para closure com corpo `[return expr]`
+  (fmt normaliza para bloco).
+- `for init; cond; passo { corpo }` (RFC 0008): `init`/`passo` executados
+  como statements (`let`/`const` so no `init`); `cond` ausente = `true`;
+  `continue` salta ao passo; `init` com `let` nao vaza (escopo proprio).
+  `break N;`/`continue N;` (`N` literal >= 1, padrao 1): contam N breakables
+  (laco ou `switch`) para fora; em laco continuam-no, em `switch` equivalem
+  a `break` dele; alem do aninhamento = erro de compilacao.
 - `try B (catch V? C)? (finally F)?` (ao menos um dos dois): erro em `B`
   (incluindo `throw`, `assert` falho, builtin com erro) procura o `catch`
   mais interno na mesma funcao; sem handler, desenrola chamadas (rodando
@@ -155,8 +172,11 @@ OU-bit (`|`) < XOR-bit (`^`) < E-bit (`&`) < comparacao (`<`, `<=`, `>`,
 
 ```text
 Primary   := Int | Float | String | "true" | "false" | "null"
-           | Array | Map | Ident | Closure | "(" Expr ")"
+           | Array | Map | Ident | Closure | Match | "(" Expr ")"
 Closure   := "fn" "(" (Ident ("," Ident)*)? ")" Block
+           | "fn" "(" (Ident ("," Ident)*)? ")" "=>" Expr  // arrow: corpo `[return expr]`
+Match     := "match" Expr "{" (MatchArm ",")* (MatchArm ","?)? "}"
+MatchArm  := (Expr | "default") "=>" Expr
 Array     := "[" (Expr ("," Expr)*)? "]"
 Map       := "{" ((String | Ident) ":" Expr ("," ...)*)? "}"
 Call      := Ident "(" (Expr ("," Expr)*)? ")"
@@ -181,10 +201,14 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
   `Str`-`Str` (lexicografica); resto e erro. `==`/`!=` aceitam quaisquer
   valores: `Int`/`Float` comparam numericamente, funcoes por identidade de
   definicao + igualdade do ambiente capturado, tipos diferentes sao diferentes.
+  `match` usa igualdade **estrita** (mesmo tipo; `Int`/`Float` promovem
+  numericamente como no `==`).
 - Bitwise (`& | ^`, so `Int`): E/OU/XOR bit a bit; `~x` inverte os bits de
   `Int`; `<<`/`>>` deslocam (deslocamento negativo ou >= 64 = erro).
 - Ternario `c ? a : b` avalia so o ramo escolhido (`c` deve ser `Bool`).
   `a ?? b` avalia `a` uma vez: se nao-`null`, usa `a`; senao avalia `b`.
+  Elvis `a ?: b` e acucar de parse para `a ?? b` (sem truthiness: aqui so
+  `null` aciona `b`, divergencia deliberada do PHP).
 - `Display`: `null`, `true`/`false`, inteiro, float, conteudo da string,
   `[a, b]` para arrays, `{k: v, ...}` (chaves ordenadas) para mapas,
   `<fn nome>` para funcoes.

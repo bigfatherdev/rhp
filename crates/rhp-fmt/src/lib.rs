@@ -93,6 +93,14 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str("continue;\n");
         }
+        Stmt::BreakN(n) => {
+            indent(level, out);
+            let _ = writeln!(out, "break {n};");
+        }
+        Stmt::ContinueN(n) => {
+            indent(level, out);
+            let _ = writeln!(out, "continue {n};");
+        }
         Stmt::Assign { target, expr } => {
             indent(level, out);
             match target {
@@ -170,6 +178,18 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
         Stmt::For { var, iter, body } => {
             indent(level, out);
             let _ = writeln!(out, "for {var} in {} {{", fmt_expr(iter, 0));
+            fmt_block(body, level + 1, out);
+            indent(level, out);
+            out.push_str("}\n");
+        }
+        Stmt::ForC {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            indent(level, out);
+            let _ = writeln!(out, "{} {{", fmt_for_c_head(init, cond, step));
             fmt_block(body, level + 1, out);
             indent(level, out);
             out.push_str("}\n");
@@ -278,6 +298,44 @@ fn fmt_params(params: &[Param], variadic: Option<&str>) -> String {
         parts.push(format!("...{rest}"));
     }
     parts.join(", ")
+}
+
+/// Statement em uma linha (cabecalho do for-C; RFC 0008): formata com
+/// nivel 0 e remove a quebra final. So usado com `let`/`const`/atribuicao
+/// (o parser restringe init/passo a formas de linha unica).
+fn fmt_stmt_one_line(stmt: &Stmt) -> String {
+    let mut out = String::new();
+    fmt_stmt(stmt, 0, &mut out);
+    out.trim_end().to_string()
+}
+
+/// Cabecalho `for init; cond; passo` (partes vazias ok; RFC 0008).
+fn fmt_for_c_head(
+    init: &Option<Box<Stmt>>,
+    cond: &Option<Expr>,
+    step: &Option<Box<Stmt>>,
+) -> String {
+    let mut head = String::from("for");
+    match init {
+        Some(stmt) => {
+            head.push(' ');
+            head.push_str(&fmt_stmt_one_line(stmt));
+        }
+        None => head.push_str(" ;"),
+    }
+    match cond {
+        Some(expr) => {
+            head.push(' ');
+            head.push_str(&fmt_expr(expr, 0));
+            head.push(';');
+        }
+        None => head.push_str(" ;"),
+    }
+    if let Some(stmt) = step {
+        head.push(' ');
+        head.push_str(fmt_stmt_one_line(stmt).trim_end_matches(';').trim_end());
+    }
+    head
 }
 
 /// Precedencia para parenteses minimos (maior = liga mais forte).
@@ -414,6 +472,20 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
                 fmt_params(&data.params, data.variadic.as_deref())
             )
         }
+        Expr::Match { subject, arms } => {
+            // Como closures: indentacao relativa (estavel e reparsavel;
+            // `match` aninhado nao herda o nivel absoluto).
+            let mut out = format!("match {} {{\n", fmt_expr(subject, 0));
+            for arm in arms {
+                let cond = match &arm.cond {
+                    Some(cond) => fmt_expr(cond, 0),
+                    None => "default".to_string(),
+                };
+                out.push_str(&format!("  {cond} => {},\n", fmt_expr(&arm.value, 0)));
+            }
+            out.push('}');
+            out
+        }
     }
 }
 
@@ -521,6 +593,38 @@ mod tests {
         );
         check_idempotent("let [a, b] = f([1, 2]);");
         check_idempotent("const {k: v} = m;");
+    }
+
+    #[test]
+    fn formats_match_expression() {
+        assert_eq!(
+            fmt("echo match x{1=>\"a\",default=>\"b\"};"),
+            "echo match x {\n  1 => \"a\",\n  default => \"b\",\n};\n"
+        );
+        // Aninhado: indentacao relativa, mas estavel e reparsavel.
+        check_idempotent(
+            "echo match x { 1 => match y { 1 => \"a\", default => \"b\" }, default => \"c\" };",
+        );
+        check_idempotent("let v = match f(1) { 1 => [1], default => [] };");
+    }
+
+    #[test]
+    fn formats_elvis_arrow_forc_and_break_levels() {
+        // Elvis desugara para `??` no parse (fmt mostra a forma canonica).
+        assert_eq!(fmt("echo a?:b;"), "echo a ?? b;\n");
+        // Arrow normaliza para bloco.
+        assert_eq!(
+            fmt("let f=fn(x)=>x+1;"),
+            "let f = fn (x) {\n  return x + 1;\n};\n"
+        );
+        // For-C canonico; niveis de break/continue preservados.
+        assert_eq!(
+            fmt("for let i=0;i<3;i=i+1{echo i;}"),
+            "for let i = 0; i < 3; i = i + 1 {\n  echo i;\n}\n"
+        );
+        assert_eq!(fmt("for;;{break 2;}"), "for ; ; {\n  break 2;\n}\n");
+        check_idempotent("for ; x < 3; x = x + 1 { echo x; }");
+        check_idempotent("while true { switch x { case 1 { continue 2; } default { break; } } }");
     }
 
     #[test]
