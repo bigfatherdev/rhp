@@ -70,6 +70,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - PostgreSQL via protocolo próprio (mesmos `db_*`, prefixo `pg:`),
   testado contra servidor real. Fase B concluída.
   Registro: `changes/2026-11-15-feat-postgres.md`.
+- Servidor HTTP: `http_serve(porta, handler, opts)` (RFC 0002; thread por
+  conexão, 500 sem vazar, `exit` termina o servidor).
+  Registro: `changes/2026-11-15-feat-http-serve.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).

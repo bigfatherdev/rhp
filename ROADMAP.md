@@ -76,8 +76,9 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 - [x] B2: SQLite (`db_open/exec/query/close` via `libsqlite3`).
 - [x] B3: PostgreSQL com servidor real (`db_*` via protocolo próprio).
   **Fase B concluída** (persistência).
-- [ ] Fase C: servidor HTTP (RFC concorrência, router, middleware,
-  sessões).
+- [x] C1: RFC 0002 — concorrência + servidor.
+- [x] C2: `http_serve` (thread por conexão, handler stateless, 500 sem vazar).
+- [ ] C3: middleware, cookies/sessões, templates.
 - [ ] Fase D: produção (TLS via ADR, pacotes v0, `rhp build`, auth,
   limites, release `0.y.0`).
 

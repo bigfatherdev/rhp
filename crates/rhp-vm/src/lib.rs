@@ -5,15 +5,18 @@
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
 use rhp_bytecode::{builtin_arity, Chunk, FuncDef, Op, Value};
+use rhp_parser::Program;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
 use std::rc::Rc;
+use std::sync::Arc;
 
 mod builtins;
 use builtins::call_builtin;
 pub use builtins::MAX_HTTP_BODY;
 
+mod http_server;
 mod json;
 mod pg;
 mod sqlite;
@@ -114,6 +117,9 @@ pub struct Vm {
     limits: VmLimits,
     steps: u64,
     argv: Vec<String>,
+    /// Programa-fonte (AST) para recompilacao por thread (`http_serve`;
+    /// so dados owned, `Send+Sync`).
+    program: Option<Arc<Program>>,
     /// Conexoes de banco abertas (`db_open`); chave = handle `Int`.
     db: DbHandles,
 }
@@ -141,6 +147,7 @@ impl Vm {
             limits: VmLimits::default(),
             steps: 0,
             argv: Vec::new(),
+            program: None,
             db: DbHandles::default(),
         }
     }
@@ -153,6 +160,11 @@ impl Vm {
     /// Define limites opcionais de execucao (ver [`VmLimits`]).
     pub fn set_limits(&mut self, limits: VmLimits) {
         self.limits = limits;
+    }
+
+    /// Define o programa-fonte para recompilacao por thread (`http_serve`).
+    pub fn set_program(&mut self, program: Arc<Program>) {
+        self.program = Some(program);
     }
 
     /// Executa o chunk escrevendo a saida de `Print` em `output`.
@@ -169,7 +181,41 @@ impl Vm {
         chunk
             .validate()
             .map_err(|e| VmError::new(format!("bytecode invalido: {e}")))?;
+        self.reset(chunk);
 
+        while !self.frames.is_empty() {
+            let idx = self.frames.len() - 1;
+            match self.step(idx, output)? {
+                Step::Continue => {}
+                Step::Done => return Ok(()),
+            }
+        }
+        Err(VmError::new("execucao terminou sem `Halt`"))
+    }
+
+    /// Executa o chunk e devolve o valor no topo da pilha (`Null` se vazia).
+    /// Usado pelo `http_serve` para capturar o retorno do handler.
+    pub fn run_value(&mut self, chunk: &Chunk, output: &mut dyn Write) -> Result<Value, VmError> {
+        chunk
+            .validate()
+            .map_err(|e| VmError::new(format!("bytecode invalido: {e}")))?;
+        self.reset(chunk);
+
+        while !self.frames.is_empty() {
+            let idx = self.frames.len() - 1;
+            match self.step(idx, output)? {
+                Step::Continue => {}
+                Step::Done => {
+                    let value = self.frames[idx].stack.pop().unwrap_or(Value::Null);
+                    return Ok(value);
+                }
+            }
+        }
+        Err(VmError::new("execucao terminou sem `Halt`"))
+    }
+
+    /// Reinicia frames/globais/passos com um chunk validado.
+    fn reset(&mut self, chunk: &Chunk) {
         self.frames.clear();
         self.globals.clear();
         self.steps = 0;
@@ -183,15 +229,6 @@ impl Vm {
             scopes: vec![HashMap::new()],
             handlers: Vec::new(),
         });
-
-        while !self.frames.is_empty() {
-            let idx = self.frames.len() - 1;
-            match self.step(idx, output)? {
-                Step::Continue => {}
-                Step::Done => return Ok(()),
-            }
-        }
-        Err(VmError::new("execucao terminou sem `Halt`"))
     }
 
     /// Executa e retorna a saida como `String` (conveniencia para testes).
@@ -544,7 +581,13 @@ impl Vm {
                     }
                 }
                 args.reverse();
-                let result = call_builtin(builtin, &args, &self.argv, &mut self.db)?;
+                let result = call_builtin(
+                    builtin,
+                    &args,
+                    &self.argv,
+                    &mut self.db,
+                    self.program.clone(),
+                )?;
                 self.push_checked(idx, result)?;
                 self.frames[idx].ip += 1;
             }

@@ -5,6 +5,7 @@
 
 use super::{type_name, DbConn, DbHandles, VmError};
 use rhp_bytecode::{Builtin, Value};
+use std::sync::Arc;
 
 /// Corpo maximo aceito por `http_get` (protecao contra exaustao de memoria).
 pub const MAX_HTTP_BODY: usize = 1024 * 1024;
@@ -17,6 +18,7 @@ pub(super) fn call_builtin(
     args: &[Value],
     argv: &[String],
     db: &mut DbHandles,
+    program: Option<Arc<rhp_parser::Program>>,
 ) -> Result<Value, VmError> {
     match builtin {
         Builtin::Len => match &args[0] {
@@ -477,6 +479,7 @@ pub(super) fn call_builtin(
                 ))),
             }
         }
+        Builtin::HttpServe => super::http_server::serve_builtin(args, program),
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)

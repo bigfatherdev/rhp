@@ -41,6 +41,8 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 
 ## Proximos passos
 
+- Servidor HTTP em 10 linhas (`docs/EXEMPLO_SERVIDOR.md`): `http_serve`
+  com `try`/`catch`, JSON e query strings.
 - Como contribuir: `CONTRIBUTING.md`
 - Garantias e limites: `SECURITY.md`
 - Medir desempenho: `docs/BENCHMARKS.md`

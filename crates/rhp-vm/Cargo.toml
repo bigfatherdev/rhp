@@ -7,6 +7,4 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 rhp-bytecode = { path = "../rhp-bytecode" }
-
-[dev-dependencies]
 rhp-parser = { path = "../rhp-parser" }

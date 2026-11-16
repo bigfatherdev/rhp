@@ -2,7 +2,7 @@
 
 - ID: RFC-0002
 - Data: 2026-11-15
-- Estado: proposta
+- Estado: aceita (autorizacao do plano de sistemas, 2026-11-15; implementada em C2)
 - Contexto: Fase C do plano de sistemas; sem runtime de rede não há
   sites/sistemas. Pré-requisitos prontos: `try` (isolamento de falha por
   request), JSON (APIs), `rhp test` (contratos de handler).
@@ -42,14 +42,15 @@ Threads do std, uma por conexão (`thread-per-connection`):
 
 ## 4. Proposta: `http_serve(porta, nome_handler, opts)`
 
-Aridade 3 (`opts` obrigatório; `{}` = padrões):
+Aridade 3 (`opts` obrigatório; `{}` = padrões). Porta 0 = livre do SO
+(útil em testes; a porta efetiva sai no stdout: `rhp: ouvindo em ...`).
 
 ```rhp
 http_serve(8080, "app", {});
 http_serve(8080, "app", {"max_conexoes": 64, "max_requisicoes": 100});
 ```
 
-- `porta`: `Int` 1–65535. `nome_handler`: `Str` com nome de `fn` global
+- `porta`: `Int` 0–65535 (0 = livre do SO). `nome_handler`: `Str` com nome de `fn` global
   de 1 parâmetro (`fn app(req)`). `opts`: mapa.
 - Por request: parse (método, caminho limpo, `query` decodificada,
   `cabecalhos` em minúsculas, `corpo` UTF-8 ou 500) → `req` (mapa) →
