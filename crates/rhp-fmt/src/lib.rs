@@ -5,7 +5,7 @@
 //! exatamente uma quebra de linha. O formatador e idempotente:
 //! `format(parse(format(p))) == format(p)`.
 
-use rhp_parser::{AssignTarget, BinOp, Expr, Param, Program, Stmt, UnaryOp};
+use rhp_parser::{AssignTarget, BinOp, DestructureTarget, Expr, Param, Program, Stmt, UnaryOp};
 use std::fmt::Write as _;
 
 /// Formata o programa no estilo canonico.
@@ -57,6 +57,33 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
         Stmt::Const { name, init } => {
             indent(level, out);
             let _ = writeln!(out, "const {name} = {};", fmt_expr(init, 0));
+        }
+        Stmt::Destructure {
+            target,
+            init,
+            is_const,
+        } => {
+            indent(level, out);
+            let keyword = if *is_const { "const" } else { "let" };
+            let pattern = match target {
+                DestructureTarget::Positional(names) => {
+                    format!("[{}]", names.join(", "))
+                }
+                DestructureTarget::ByKey(pairs) => {
+                    let parts: Vec<String> = pairs
+                        .iter()
+                        .map(|(key, name)| {
+                            if key == name {
+                                key.clone()
+                            } else {
+                                format!("{key}: {name}")
+                            }
+                        })
+                        .collect();
+                    format!("{{{}}}", parts.join(", "))
+                }
+            };
+            let _ = writeln!(out, "{keyword} {pattern} = {};", fmt_expr(init, 0));
         }
         Stmt::Break => {
             indent(level, out);
@@ -483,6 +510,17 @@ mod tests {
         );
         check_idempotent("let g = fn (a = 1 + 2, ...r) { return a; };");
         check_idempotent("fn f(a = [1, 2], b = {x: 1}) { return a; }");
+    }
+
+    #[test]
+    fn formats_destructuring() {
+        assert_eq!(fmt("let [a,b]=[1,2];"), "let [a, b] = [1, 2];\n");
+        assert_eq!(
+            fmt("const {k:v,x}={k:1,x:2};"),
+            "const {k: v, x} = {k: 1, x: 2};\n"
+        );
+        check_idempotent("let [a, b] = f([1, 2]);");
+        check_idempotent("const {k: v} = m;");
     }
 
     #[test]

@@ -49,11 +49,14 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 ## 2. Instrucoes
 
 ```text
-Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt
-           | ForStmt | SwitchStmt | TryStmt | ThrowStmt | BreakStmt
-           | ContinueStmt | FnDef | ReturnStmt | Block | ImportStmt | ExprStmt
+Stmt       := LetStmt | ConstStmt | DestructureStmt | AssignStmt | EchoStmt
+           | IfStmt | WhileStmt | ForStmt | SwitchStmt | TryStmt | ThrowStmt
+           | BreakStmt | ContinueStmt | FnDef
+           | ReturnStmt | Block | ImportStmt | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
 ConstStmt  := "const" Ident "=" Expr ";"
+DestructureStmt := ("let" | "const") ("[" Ident ("," Ident)* "]"
+           | "{" (Ident | Ident ":" Ident) ("," (Ident | Ident ":" Ident))* "}") "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
 Target     := Ident | Ident "[" Expr "]"
 EchoStmt   := "echo" Expr ";"
@@ -77,6 +80,12 @@ ExprStmt   := Expr ";"
 
 - `let x = e;` declara no escopo atual (`let x;` inicializa com `null`).
   Redeclarar no mesmo escopo e erro em runtime.
+- `let [a, b] = e;` / `let {x} = e;` / `let {k: v} = e;` (e formas `const`,
+  que congelam todos; RFC 0007): avalia `e` uma vez e desempacota por
+  posicao (array) ou chave (mapa; `{x}` = chave `"x"`). Indice fora dos
+  limites, chave ausente e duplicata no padrao = erro (regras vigentes de
+  `Index`/`DeclareName`; sem `null` silencioso). Padroes vazios e aninhados
+  = erro de parse.
 - `x = e;` exige variavel visivel (escopos internos -> externos -> globais).
 - `echo e;` escreve `Display` do valor + `\n` (qualquer tipo).
 - `if`/`while` exigem condicao `Bool` (sem truthiness implicita). `while`

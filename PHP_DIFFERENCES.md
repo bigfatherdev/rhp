@@ -48,6 +48,13 @@ a semantica for especificada e implementada.
   constantes, compostos de constantes), como no PHP; avaliados em compilação.
 - Sem spread em chamada, sem named arguments (fases futuras).
 
+## Destructuring (RFC 0007, Fase 2)
+
+- `let [a, b]` / `let {x}` / `let {k: v}` (e `const`); PHP usa `[$a, $b]` /
+  `['k' => $v]` (com `$`, sem `const` desestruturado).
+- Raso apenas (aninhado = erro de parse); sem `[, b]` nem `[a = 1]`.
+- Estrito: posição/chave ausente = erro (PHP dá `null` + aviso).
+
 - Sintaxe comparada (`echo`, `;`, strings) apos ampliacao da linguagem.
 - Sistema de tipos e conversoes.
 - Semantica de `echo`/`print` vs PHP.

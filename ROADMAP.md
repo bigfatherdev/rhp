@@ -61,8 +61,7 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
   teto de 128 niveis e erros com posicao
   (  `changes/2026-11-15-feat-json.md`).
 - [ ] Pendente (ordem tecnica; o resto do lote imediato saiu nas Fases
-  A–C): destructuring; depois
-  namespaces/exports (restante: re-export), pacotes, tipos, OO,
+  A–C): namespaces/exports (restante: re-export), pacotes, tipos, OO,
   async/DBs (restante: Redis), LSP/debugger completos (todos exigem
   RFC/ADR e gates, cf. auditoria §21).
 - [x] `switch` com fallthrough (RFC 0004 aceita e implementada:
@@ -71,6 +70,8 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
   `usort` estavel via protocolo de chamada pendente).
 - [x] Parametros default e variadicos (RFC 0006 aceita e implementada:
   defaults constantes dobrados, `...rest`).
+- [x] Destructuring raso (RFC 0007 aceita e implementada: `let [a, b]` /
+  `let {x}` / `let {k: v}` + `const`).
 - [x] Closures de primeira classe (RFC 0003 aceita e implementada:
   `fn (params) { }`, captura por valor, `MakeFunc`, `CallValue`).
 

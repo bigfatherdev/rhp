@@ -1721,6 +1721,43 @@ mod tests {
     }
 
     #[test]
+    fn runs_destructuring() {
+        // Array por posicao; excedentes ignorados.
+        assert_eq!(
+            run_src("let [a, b] = [1, 2, 3]; echo a; echo b;").expect("ok"),
+            "1\n2\n"
+        );
+        // Mapa: atalho e renomeado.
+        assert_eq!(
+            run_src("let {x} = {x: 10, y: 20}; echo x;").expect("ok"),
+            "10\n"
+        );
+        assert_eq!(
+            run_src("let {k: v} = {k: 99}; echo v;").expect("ok"),
+            "99\n"
+        );
+        // `const` congela todos (atribuir depois e erro de compilacao).
+        assert_eq!(
+            run_src("const [c, d] = [3, 4]; echo c + d;").expect("ok"),
+            "7\n"
+        );
+        // RHS avaliado uma unica vez.
+        assert_eq!(
+            run_src("let n = 0; fn prox() { n = n + 1; return [7, 8]; } let [a, b] = prox(); echo a; echo b; echo n;")
+                .expect("ok"),
+            "7\n8\n1\n"
+        );
+        // Erros herdados: indice fora, chave ausente, duplicata, const.
+        assert!(run_err("let [a, b] = [1]; echo a;").contains("fora do intervalo"));
+        assert!(run_err("let {z} = {x: 1}; echo z;").contains("chave"));
+        assert!(run_err("let [a, a] = [1, 2];").contains("ja declarada"));
+        // Atribuir a `const` desestruturado e erro de compilacao (regra vigente).
+        let program = parse_source("const [c] = [1]; c = 2;").expect("parse deve passar");
+        let err = rhp_bytecode::compile(&program).expect_err("atribuicao a const deve falhar");
+        assert!(err.message.contains("constante"), "obteve: {}", err.message);
+    }
+
+    #[test]
     fn runs_switch_statement() {
         // Match + break (sem fallthrough).
         assert_eq!(

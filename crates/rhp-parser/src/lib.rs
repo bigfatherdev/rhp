@@ -72,6 +72,14 @@ pub enum Stmt {
         name: String,
         init: Option<Expr>,
     },
+    /// `let [a, b] = expr;` / `let {x} = expr;` / `let {k: v} = expr;`
+    /// (e as formas `const`, que congelam todos; RFC 0007). RHS avaliado
+    /// uma vez; faltas viram erro do `Index` vigente (sem `null`).
+    Destructure {
+        target: DestructureTarget,
+        init: Expr,
+        is_const: bool,
+    },
     /// `const NOME = expr;` — como `let`, mas imutavel (atribuicao posterior e erro de compilacao).
     Const {
         name: String,
@@ -181,6 +189,15 @@ pub struct SwitchCase {
 pub enum AssignTarget {
     Var(String),
     Index { name: String, index: Expr },
+}
+
+/// Padrao de destructuring (raso; RFC 0007): por posicao `[a, b]` ou por
+/// chave `{x}` (atalho p/ `("x","x")`) / `{k: v}` (`(chave, nome)`).
+/// Aninhados sao erro de parse.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DestructureTarget {
+    Positional(Vec<String>),
+    ByKey(Vec<(String, String)>),
 }
 
 /// Expressao do RHP.
@@ -457,6 +474,21 @@ fn parse_echo(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 
 fn parse_const(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
+    // `const [a, b] = ...` / `const {x} = ...` (congela todos; RFC 0007).
+    if matches!(
+        cursor.peek().map(|t| &t.kind),
+        Some(TokenKind::LBracket | TokenKind::LBrace)
+    ) {
+        let target = parse_destructure_target(cursor)?;
+        expect_token(cursor, &TokenKind::Assign, "esperado `=` apos padrao")?;
+        let init = parse_expr(cursor)?;
+        expect_semicolon(cursor)?;
+        return Ok(Stmt::Destructure {
+            target,
+            init,
+            is_const: true,
+        });
+    }
     let name = expect_ident(cursor)?;
     expect_token(
         cursor,
@@ -470,6 +502,21 @@ fn parse_const(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 
 fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
+    // `let [a, b] = ...` / `let {x} = ...` / `let {k: v} = ...` (RFC 0007).
+    if matches!(
+        cursor.peek().map(|t| &t.kind),
+        Some(TokenKind::LBracket | TokenKind::LBrace)
+    ) {
+        let target = parse_destructure_target(cursor)?;
+        expect_token(cursor, &TokenKind::Assign, "esperado `=` apos padrao")?;
+        let init = parse_expr(cursor)?;
+        expect_semicolon(cursor)?;
+        return Ok(Stmt::Destructure {
+            target,
+            init,
+            is_const: false,
+        });
+    }
     let name = expect_ident(cursor)?;
     let init = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Assign)) {
         cursor.next();
@@ -479,6 +526,76 @@ fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     };
     expect_semicolon(cursor)?;
     Ok(Stmt::Let { name, init })
+}
+
+/// Padrao de destructuring apos `let`/`const` (cursor no `[` ou `{`).
+fn parse_destructure_target(cursor: &mut Cursor<'_>) -> Result<DestructureTarget, ParseError> {
+    match cursor.next().map(|t| t.kind.clone()) {
+        Some(TokenKind::LBracket) => {
+            let mut names = Vec::new();
+            if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RBracket)) {
+                loop {
+                    names.push(expect_ident(cursor)?);
+                    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
+                        cursor.next();
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            expect_token(cursor, &TokenKind::RBracket, "esperado `]` apos padrao")?;
+            if names.is_empty() {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "padrao `[]` vazio (declare ao menos um nome)".to_string(),
+                    line,
+                    col,
+                ));
+            }
+            Ok(DestructureTarget::Positional(names))
+        }
+        Some(TokenKind::LBrace) => {
+            let mut pairs = Vec::new();
+            if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RBrace)) {
+                loop {
+                    let key = expect_ident(cursor)?;
+                    // `{k: v}` renomeia; `{x}` e atalho para `("x", "x")`.
+                    let name = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) {
+                        cursor.next();
+                        expect_ident(cursor)?
+                    } else {
+                        key.clone()
+                    };
+                    pairs.push((key, name));
+                    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
+                        cursor.next();
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            expect_token(cursor, &TokenKind::RBrace, "esperado `}` apos padrao")?;
+            if pairs.is_empty() {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "padrao `{}` vazio (declare ao menos um nome)".to_string(),
+                    line,
+                    col,
+                ));
+            }
+            Ok(DestructureTarget::ByKey(pairs))
+        }
+        _ => {
+            let (line, col) = cursor.end_pos();
+            Err(ParseError::new(
+                "esperado `[` ou `{` apos `let`/`const` para destructuring".to_string(),
+                line,
+                col,
+            ))
+        }
+    }
 }
 
 /// `alvo = expr;` ou instrucao por expressao.
@@ -1722,6 +1839,45 @@ mod tests {
         assert!(err.to_string().contains("`)`"), "obteve: {err}");
         // `...` sem nome.
         lex_and_parse("fn f(...) { }").expect_err("`...` sem nome deve falhar");
+    }
+
+    #[test]
+    fn parses_destructuring_forms() {
+        let program = lex_and_parse("let [a, b] = arr;").expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::Destructure {
+                target: DestructureTarget::Positional(vec!["a".to_string(), "b".to_string()]),
+                init: Expr::Var("arr".to_string()),
+                is_const: false,
+            }]
+        );
+        let program = lex_and_parse("const {k: v, x} = m;").expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::Destructure {
+                target: DestructureTarget::ByKey(vec![
+                    ("k".to_string(), "v".to_string()),
+                    ("x".to_string(), "x".to_string()),
+                ]),
+                init: Expr::Var("m".to_string()),
+                is_const: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_destructure_forms() {
+        // Padrao vazio.
+        lex_and_parse("let [] = a;").expect_err("`[]` vazio deve falhar");
+        lex_and_parse("let {} = m;").expect_err("`{}` vazio deve falhar");
+        // Aninhado: `expect_ident` rejeita.
+        lex_and_parse("let [[a]] = x;").expect_err("aninhado deve falhar");
+        lex_and_parse("let {k: [v]} = m;").expect_err("aninhado deve falhar");
+        // Placeholder `[, b]` nao suportado.
+        lex_and_parse("let [, b] = x;").expect_err("placeholder deve falhar");
+        // `const` sem init continua erro (regra vigente).
+        lex_and_parse("const [a] ;").expect_err("const sem init deve falhar");
     }
 
     #[test]

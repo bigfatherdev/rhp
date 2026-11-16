@@ -20,6 +20,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - Parâmetros default e variádicos (RFC 0006, Fase 2): `b = expr-const`
   dobrado em compilação, `...rest` coletando excedentes.
   Registro: `changes/2026-11-16-feat-args-default-variadicos.md`.
+- Destructuring raso (RFC 0007, Fase 2): `let [a, b]` / `let {x}` /
+  `let {k: v}` (+ `const`), erros herdados, sem `null` silencioso.
+  Registro: `changes/2026-11-16-feat-destructuring.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 

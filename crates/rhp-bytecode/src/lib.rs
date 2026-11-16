@@ -4,7 +4,9 @@
 //! vetor de instrucoes, mais builtins da biblioteca-padrao nucleo. A VM e
 //! baseada em pilha e valida o chunk (recursivamente) antes de executar.
 
-use rhp_parser::{AssignTarget, BinOp, Expr, Program, Stmt, SwitchCase, UnaryOp};
+use rhp_parser::{
+    AssignTarget, BinOp, DestructureTarget, Expr, Program, Stmt, SwitchCase, UnaryOp,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
@@ -1176,6 +1178,14 @@ impl Compiler {
         format!("\0for:{what}:{id}")
     }
 
+    /// Nome oculto generico para temporarios (ex.: RHS do destructuring):
+    /// contem NUL, impossivel no fonte (contador compartilhado com o `for`).
+    fn hidden_name(&mut self, what: &str) -> String {
+        let id = self.for_counter;
+        self.for_counter += 1;
+        format!("\0tmp:{what}:{id}")
+    }
+
     /// Compila `for VAR in ITER BLOCO`.
     ///
     /// Estrategia (sem runtime novo): avalia `ITER` uma vez, normaliza com
@@ -1527,6 +1537,46 @@ impl Compiler {
                 let name_idx = self.intern_name(name)?;
                 self.emit(Op::DeclareName(name_idx));
                 self.declare_const(name);
+            }
+            Stmt::Destructure {
+                target,
+                init,
+                is_const,
+            } => {
+                // RHS uma vez em temporario oculto; cada alvo = `tmp[i|k]`
+                // declarado (erros de indice/chave/duplicata herdados).
+                self.compile_expr(init)?;
+                let tmp = self.hidden_name("destructure");
+                let tmp_idx = self.intern_name(&tmp)?;
+                self.emit(Op::DeclareName(tmp_idx));
+                match target {
+                    DestructureTarget::Positional(names) => {
+                        for (i, name) in names.iter().enumerate() {
+                            let name_idx = self.intern_name(name)?;
+                            self.emit(Op::LoadName(tmp_idx));
+                            let key_idx = self.add_constant(Value::Int(i as i64))?;
+                            self.emit(Op::Constant(key_idx));
+                            self.emit(Op::Index);
+                            self.emit(Op::DeclareName(name_idx));
+                            if *is_const {
+                                self.declare_const(name);
+                            }
+                        }
+                    }
+                    DestructureTarget::ByKey(pairs) => {
+                        for (key, name) in pairs {
+                            let name_idx = self.intern_name(name)?;
+                            self.emit(Op::LoadName(tmp_idx));
+                            let key_idx = self.add_constant(Value::Str(key.clone()))?;
+                            self.emit(Op::Constant(key_idx));
+                            self.emit(Op::Index);
+                            self.emit(Op::DeclareName(name_idx));
+                            if *is_const {
+                                self.declare_const(name);
+                            }
+                        }
+                    }
+                }
             }
             Stmt::Break => {
                 let Some(loop_ctx) = self.loops.last() else {
@@ -2058,6 +2108,24 @@ mod tests {
         let program = parse_source("fn f(a, ...a) { return a; }").expect("parse deve passar");
         let err = compile(&program).expect_err("rest duplicado deve falhar");
         assert!(err.message.contains("duplicado"));
+    }
+
+    #[test]
+    fn compiles_destructuring() {
+        // Temporario oculto + `Index` + `DeclareName` por alvo; valido.
+        let chunk = compile_src("let [a, b] = [1, 2];");
+        chunk.validate().expect("destructure deve validar");
+        let declares = chunk
+            .code
+            .iter()
+            .filter(|op| matches!(op, Op::DeclareName(_)))
+            .count();
+        assert_eq!(declares, 3, "temporario + 2 nomes");
+        assert!(chunk.code.contains(&Op::Index));
+        // `const` marca todos como imutaveis (atribuicao posterior falha).
+        let program = parse_source("const {x} = {x: 1}; x = 2;").expect("parse deve passar");
+        let err = compile(&program).expect_err("atribuicao a const deve falhar");
+        assert!(err.message.contains("constante"));
     }
 
     #[test]

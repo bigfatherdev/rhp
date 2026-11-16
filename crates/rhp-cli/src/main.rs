@@ -1023,6 +1023,33 @@ impl Renamer<'_> {
                     init: renamed_init,
                 }
             }
+            Stmt::Destructure {
+                target,
+                init,
+                is_const,
+            } => {
+                let renamed_init = self.expr(init);
+                let target = match target {
+                    rhp_parser::DestructureTarget::Positional(names) => {
+                        rhp_parser::DestructureTarget::Positional(
+                            names.iter().map(|n| self.declare(n)).collect(),
+                        )
+                    }
+                    rhp_parser::DestructureTarget::ByKey(pairs) => {
+                        rhp_parser::DestructureTarget::ByKey(
+                            pairs
+                                .iter()
+                                .map(|(k, n)| (k.clone(), self.declare(n)))
+                                .collect(),
+                        )
+                    }
+                };
+                Stmt::Destructure {
+                    target,
+                    init: renamed_init,
+                    is_const: *is_const,
+                }
+            }
             Stmt::Break => Stmt::Break,
             Stmt::Continue => Stmt::Continue,
             Stmt::Assign { target, expr } => {
@@ -1293,6 +1320,7 @@ fn check_stmt_expr_imports(stmt: &Stmt) -> Result<(), LoadError> {
             Ok(())
         }
         Stmt::Throw { expr } => check_expr_imports(expr),
+        Stmt::Destructure { init, .. } => check_expr_imports(init),
         Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::For { iter: cond, .. } => {
             check_expr_imports(cond)
         }
@@ -1680,6 +1708,43 @@ mod tests {
         )
         .expect("deve passar");
         assert_eq!(buf, b"3\n[]\n30\n[30]\n");
+    }
+
+    #[test]
+    fn runs_destructuring_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "let [a, b] = [1, 2]; echo a + b; const {k: v} = {k: 40}; echo v + 2;",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"3\n42\n");
+    }
+
+    #[test]
+    fn rename_destructuring_declares_names() {
+        use std::collections::HashSet as Set;
+        let stmts = rhp_parser::parse_source("let x = [1, 2];\nlet [a, b] = x;\necho a;\n")
+            .expect("parse deve passar")
+            .statements;
+        let top: Set<String> = ["x".to_string()].into_iter().collect();
+        let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
+        match &renamed[1] {
+            Stmt::Destructure { target, init, .. } => {
+                assert!(matches!(
+                    init,
+                    rhp_parser::Expr::Var(name) if name == "__rhp_mod0__x"
+                ));
+                match target {
+                    rhp_parser::DestructureTarget::Positional(names) => {
+                        assert_eq!(names, &["a".to_string(), "b".to_string()]);
+                    }
+                    other => panic!("esperado Positional, obteve {other:?}"),
+                }
+            }
+            other => panic!("esperado Destructure, obteve {other:?}"),
+        }
     }
 
     #[test]
