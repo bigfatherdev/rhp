@@ -20,19 +20,22 @@ Decisao arquitetural e alternativas em `reports/MEMORY_MODEL.md` (+ ADR 0002).
   `return`/`Halt`, liberando seus valores (sem `Drop` customizado).
 - **Custos assumidos**: copias O(n) por `push`/atribuicao de compostos
   (documentado; mudar isso e mudanca semantica e exige RFC). `VmLimits`
-  (`max_steps`) e tetos de HTTP/fonte/profundidade limitam crescimento
-  patologico; sem teto geral de heap (ver `SECURITY.md`).
+  (`max_steps`, `max_heap_bytes` opt-in via `--max-heap-bytes`) e tetos de
+  HTTP/fonte/profundidade limitam crescimento patologico. O teto de heap
+  mede o **modelo** (RFC 0015: `Str` = `len`, `Array` = 8/elemento,
+  `Map`/env = chave + 8 por entrada, escalares = 0), nao o alocador
+  real — teto rigido de RSS continua sendo cgroup/ulimit.
 
 ## Fora do modelo (nao prometido)
 
 Ownership estatico, borrow checker da linguagem, threads/async, limites de
-memoria medidos em bytes, compactacao, weak refs. Ver "A definir" abaixo
-para o que ainda exige RFC.
+memoria do alocador real (o teto `max_heap_bytes` mede o modelo),
+compactacao, weak refs. Ver "A definir" abaixo para o que ainda exige RFC.
 
 ## A definir (requer RFC antes de implementar)
 
 - Compartilhamento interno (CoW/`Rc`) ou arena para ativacoes.
 - Internacao de strings em runtime.
 - Concorrencia e excecoes/unwinding.
-- Limites de heap/stack medidos.
+- Limites de stack medidos em bytes.
 - Compatibilidade de bytecode persistido (hoje nao serializado).
