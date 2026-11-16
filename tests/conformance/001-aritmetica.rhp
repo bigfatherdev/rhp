@@ -1,0 +1,6 @@
+echo 2 + 3 * 4;
+echo (2 + 3) * 4;
+echo 10 - 2 - 3;
+echo 17 % 5;
+echo 7 / 2;
+echo 7.0 / 2;

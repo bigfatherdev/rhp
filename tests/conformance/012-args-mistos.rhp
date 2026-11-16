@@ -1,0 +1,5 @@
+fn soma(a, b) {
+  return a + b;
+}
+echo soma(b: 2, a: 40);
+echo soma(...[1, 2]);

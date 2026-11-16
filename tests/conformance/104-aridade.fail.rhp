@@ -1,0 +1,4 @@
+fn f(a, b) {
+  return a;
+}
+echo f(1);

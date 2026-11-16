@@ -6,6 +6,12 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- Suite de conformidade `tests/conformance/` (Etapa 3, Tooling): 18
+  programas válidos com stdout pinada + 6 inválidos com stderr pinada,
+  via `rhp run` (`crates/rhp-cli/tests/conformance.rs`); property tests
+  std-only ampliados (`-`, `<`/`==`, `len()` de concatenação; 1800
+  programas gerados). Registro:
+  `changes/2026-11-16-test-conformidade-etapa3.md`.
 - Closures de primeira classe (RFC 0003, PHP-100 P1): `fn (params) { }`
   como expressão com captura por valor, `MakeFunc`, chamadas de callee
   arbitrário (`CallValue`), `import` em closure rejeitado no loader.

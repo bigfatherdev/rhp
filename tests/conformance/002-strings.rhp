@@ -1,0 +1,5 @@
+echo "ola" + ", mundo";
+echo len("ola");
+echo str(42) + "!";
+echo int("7") + 1;
+echo float("2.5") * 2;

@@ -1,0 +1,10 @@
+fn fabrica() {
+  let x = 1;
+  let f = fn () { return x; };
+  x = 2;
+  return f;
+}
+let f = fabrica();
+echo f();
+echo map([1, 2, 3], fn (v) => v * 2);
+echo filter([1, 2, 3, 4], fn (v) => v % 2 == 0);

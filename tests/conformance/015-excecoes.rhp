@@ -1,0 +1,11 @@
+try {
+  throw "aviso";
+} catch e {
+  echo e;
+}
+try {
+  echo "dentro";
+} finally {
+  echo "fim";
+}
+echo "ok";

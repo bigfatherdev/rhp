@@ -1,0 +1,9 @@
+let a = [1, 2];
+a = push(a, 3);
+echo a;
+echo pop(a);
+echo len(a);
+echo keys({b: 1, a: 2});
+let m = {};
+m["k"] = 42;
+echo m;

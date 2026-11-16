@@ -1,0 +1,7 @@
+let n = 0;
+fn prox() {
+  n = n + 1;
+  return n;
+}
+echo [prox(), prox()];
+echo n;

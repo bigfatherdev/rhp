@@ -1,0 +1,10 @@
+let i = 0;
+let s = 0;
+while i < 5 {
+  i = i + 1;
+  if i % 2 == 0 {
+    continue;
+  }
+  s = s + i;
+}
+echo s;

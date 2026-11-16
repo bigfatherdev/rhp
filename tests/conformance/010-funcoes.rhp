@@ -1,0 +1,17 @@
+fn fat(n) {
+  if n <= 1 {
+    return 1;
+  }
+  return n * fat(n - 1);
+}
+echo fat(5);
+fn soma(a, b = 10) {
+  return a + b;
+}
+echo soma(1);
+echo soma(1, 2);
+fn mostra(primeiro, ...rest) {
+  echo primeiro;
+  echo rest;
+}
+mostra(1, 2, 3);
