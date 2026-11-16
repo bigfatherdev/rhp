@@ -4,7 +4,7 @@
 //! globais compartilhadas. O bytecode e tratado como entrada potencialmente
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
-use rhp_bytecode::{builtin_arity, Chunk, FuncDef, Op, Value};
+use rhp_bytecode::{builtin_arity, Chunk, FuncDef, FuncValue, Op, Value};
 use rhp_parser::Program;
 use std::collections::HashMap;
 use std::fmt;
@@ -438,7 +438,22 @@ impl Vm {
                     .cloned()
                     .ok_or_else(|| VmError::new(format!("funcao {func_idx} inexistente")))?;
                 let name = func.name.clone();
-                self.declare(idx, &name, Value::Func(func))?;
+                // Semantica uniforme (RFC 0003): funcao nomeada aninhada
+                // tambem fecha sobre o ambiente de definicao.
+                let env = self.capture_env(idx);
+                self.declare(idx, &name, Value::Func(FuncValue { def: func, env }))?;
+                self.frames[idx].ip += 1;
+            }
+            Op::MakeFunc(func_idx) => {
+                let def = self.frames[idx]
+                    .funcs
+                    .get(func_idx as usize)
+                    .cloned()
+                    .ok_or_else(|| VmError::new(format!("funcao {func_idx} inexistente")))?;
+                let env = self.capture_env(idx);
+                self.frames[idx]
+                    .stack
+                    .push(Value::Func(FuncValue { def, env }));
                 self.frames[idx].ip += 1;
             }
             Op::Call(arity) => {
@@ -678,6 +693,18 @@ impl Vm {
         false
     }
 
+    /// Fotografa o ambiente atual por valor (RFC 0003): funde os escopos
+    /// do mais externo ao mais interno, de modo que o interno sombreie.
+    fn capture_env(&self, idx: usize) -> std::collections::HashMap<String, Value> {
+        let mut env = std::collections::HashMap::new();
+        for scope in self.frames[idx].scopes.iter() {
+            for (k, v) in scope {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+        env
+    }
+
     /// Declara no escopo atual (ou globais, no topo do programa principal).
     fn declare(&mut self, idx: usize, name: &str, value: Value) -> Result<(), VmError> {
         if self.frames.len() == 1 && self.frames[idx].scopes.len() == 1 {
@@ -724,11 +751,11 @@ impl Vm {
                 )));
             }
         };
-        if func.params.len() != arity {
+        if func.def.params.len() != arity {
             return Err(VmError::new(format!(
                 "funcao `{}` espera {} argumentos, recebeu {}",
-                func.name,
-                func.params.len(),
+                func.def.name,
+                func.def.params.len(),
                 arity
             )));
         }
@@ -737,16 +764,25 @@ impl Vm {
                 "limite de chamadas excedido (recursao muito profunda?)",
             ));
         }
-        let mut scope = HashMap::with_capacity(func.params.len());
-        for (param, arg) in func.params.iter().zip(args) {
+        // Escopo unico da ativacao: ambiente capturado + parametros por
+        // cima (parametro sombreia variavel capturada com o mesmo nome).
+        // Guarda de `ExitScope` preservada: base continua com 1 escopo.
+        let mut scope = func.env.clone();
+        for (param, arg) in func.def.params.iter().zip(args) {
             scope.insert(param.clone(), arg);
         }
         self.frames[idx].ip += 1;
         self.frames.push(Frame {
-            code: func.body.code.clone(),
-            constants: func.body.constants.clone(),
-            names: func.body.names.clone(),
-            funcs: func.body.funcs.iter().map(|f| Rc::new(f.clone())).collect(),
+            code: func.def.body.code.clone(),
+            constants: func.def.body.constants.clone(),
+            names: func.def.body.names.clone(),
+            funcs: func
+                .def
+                .body
+                .funcs
+                .iter()
+                .map(|f| Rc::new(f.clone()))
+                .collect(),
             ip: 0,
             stack: Vec::new(),
             scopes: vec![scope],
@@ -960,7 +996,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Str(a), Value::Str(b)) => a == b,
         (Value::Array(a), Value::Array(b)) => a == b,
         (Value::Map(a), Value::Map(b)) => a == b,
-        (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
+        (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(&a.def, &b.def) && a.env == b.env,
         _ => false,
     }
 }
@@ -1310,6 +1346,50 @@ mod tests {
         assert!(run_err("echo f();").contains("nao definida"));
         assert!(run_err("let f = 1; echo f();").contains("como funcao"));
         assert!(run_err("fn f(a) { return a; } echo f(1, 2);").contains("espera 1"));
+    }
+
+    #[test]
+    fn closures_capture_by_value_and_call() {
+        // Basico: atribuicao + chamada.
+        assert_eq!(
+            run_src("let f = fn (x) { return x + 1; }; echo f(41);").expect("ok"),
+            "42\n"
+        );
+        // IIFE: chamada direta do literal.
+        assert_eq!(
+            run_src("echo (fn (x) { return x * 2; })(21);").expect("ok"),
+            "42\n"
+        );
+        // Captura por valor: snapshot do escopo de ativacao. `n = 20`
+        // altera o escopo, nao o clone que a closure carrega.
+        assert_eq!(
+            run_src("fn mk() { let n = 10; let f = fn () { return n; }; n = 20; return f; } let g = mk(); echo g();").expect("ok"),
+            "10\n"
+        );
+        // Nivel superior: `let` vive em `globals` (mapa do modulo), fora
+        // da cadeia de escopos — closure e `fn` nomeada enxergam o valor
+        // atual, em paridade (nao congela comportamento existente).
+        assert_eq!(
+            run_src("let n = 10; let f = fn () { return n; }; n = 20; echo f();").expect("ok"),
+            "20\n"
+        );
+        assert_eq!(
+            run_src("let n = 10; fn g() { return n; } n = 20; echo g();").expect("ok"),
+            "20\n"
+        );
+        // Parametro sombreia variavel capturada com o mesmo nome.
+        assert_eq!(
+            run_src("let x = 1; let f = fn (x) { return x; }; echo f(2);").expect("ok"),
+            "2\n"
+        );
+        // Encadeada via variavel: `f(x)(y)`.
+        assert_eq!(
+            run_src("let f = fn (x) { return fn (y) { return x + y; }; }; echo f(40)(2);")
+                .expect("ok"),
+            "42\n"
+        );
+        // Nao-funcao em callee arbitrario continua erro claro.
+        assert!(run_err("let f = 1; echo (f)(2);").contains("como funcao"));
     }
 
     #[test]

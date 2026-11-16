@@ -105,7 +105,16 @@ ExprStmt   := Expr ";"
   retorna `null`); fim do corpo sem `return` tambem retorna `null`.
   `return` fora de funcao e erro de compilacao. Recursao permitida ate
   `MAX_CALL_DEPTH = 512` (erro apos o limite). Funcoes enxergam parametros,
-  locais proprios e globais (sem closures sobre locais de outras funcoes).
+  locais proprios, ambiente capturado (closures) e globais.
+- `fn (params) { ... }` (sem nome) e expressao: cria funcao de primeira
+  classe capturando o ambiente atual por valor (snapshot dos escopos
+  internos para os externos; parametros sombreiam capturadas). Atribuicao
+  posterior ao mesmo nome nao afeta a closure ja criada dentro de funcoes;
+  no nivel superior, `let` vive em `globals` e segue dinamico (paridade com
+  `fn` nomeada). Chamada de callee arbitrario: `(fn (x) { ... })(41)`,
+  `f(x)(y)`; `f(x)` direto preserva o caminho classico (precedencia de
+  builtins). `import`/`export` dentro de closure e erro do loader
+  (so nivel superior). Display: `<fn {closure}>` para anonimas.
 - `ExprStmt` (ex.: `f();`) avalia e descarta o valor.
 
 ## 3. Expressoes e precedencia (da menor para a maior)
@@ -118,11 +127,14 @@ OU-bit (`|`) < XOR-bit (`^`) < E-bit (`&`) < comparacao (`<`, `<=`, `>`,
 
 ```text
 Primary   := Int | Float | String | "true" | "false" | "null"
-           | Array | Map | Ident | Call | "(" Expr ")"
+           | Array | Map | Ident | Closure | "(" Expr ")"
+Closure   := "fn" "(" (Ident ("," Ident)*)? ")" Block
 Array     := "[" (Expr ("," Expr)*)? "]"
 Map       := "{" ((String | Ident) ":" Expr ("," ...)*)? "}"
 Call      := Ident "(" (Expr ("," Expr)*)? ")"
-// Posfixo: Primary ("[" Expr "]")*  (indexacao encadeada em leitura)
+CallValue := Postfix "(" (Expr ("," Expr)*)? ")" // callee arbitrario
+// Posfixo: Primary (("[" Expr "]") | ("(" Args ")"))* (indexacao e
+// chamada encadeadas; callee `Ident` simples usa `Call` classico)
 ```
 
 Literais: inteiros `i64` (`42`), floats (`1.5`, ao menos um digito apos o
@@ -139,8 +151,8 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
   `%` exige `Int` e `Int`. `-x` exige numero; `!b` exige `Bool`.
 - Comparacao: `< <= > >=` aceitam numero-numero (com promocao) e
   `Str`-`Str` (lexicografica); resto e erro. `==`/`!=` aceitam quaisquer
-  valores: `Int`/`Float` comparam numericamente, funcoes por identidade,
-  tipos diferentes sao diferentes.
+  valores: `Int`/`Float` comparam numericamente, funcoes por identidade de
+  definicao + igualdade do ambiente capturado, tipos diferentes sao diferentes.
 - Bitwise (`& | ^`, so `Int`): E/OU/XOR bit a bit; `~x` inverte os bits de
   `Int`; `<<`/`>>` deslocam (deslocamento negativo ou >= 64 = erro).
 - Ternario `c ? a : b` avalia so o ramo escolhido (`c` deve ser `Bool`).

@@ -19,8 +19,16 @@ pub enum Value {
     Str(String),
     Array(Vec<Value>),
     Map(HashMap<String, Value>),
-    /// Funcao definida por `fn`: parametros + corpo compilado.
-    Func(Rc<FuncDef>),
+    /// Funcao de primeira classe (RFC 0003): definicao compilada +
+    /// ambiente capturado por valor no momento da criacao (`MakeFunc`).
+    Func(FuncValue),
+}
+
+/// Valor funcional de primeira classe: definicao + ambiente capturado.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncValue {
+    pub def: Rc<FuncDef>,
+    pub env: HashMap<String, Value>,
 }
 
 impl fmt::Display for Value {
@@ -55,7 +63,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            Self::Func(func) => write!(f, "<fn {}>", func.name),
+            Self::Func(func) => write!(f, "<fn {}>", func.def.name),
         }
     }
 }
@@ -300,6 +308,10 @@ pub enum Op {
     ExitScope,
     /// Cria `Func` de `funcs[idx]` e declara no escopo atual.
     DefineFunc(u32),
+    /// Cria `Func` de `funcs[idx]` capturando o ambiente atual por valor
+    /// (RFC 0003: snapshot dos escopos internos para os externos) e o
+    /// empilha como valor de primeira classe.
+    MakeFunc(u32),
     /// Chama a funcao no topo (apos `aridade` argumentos); empilha retorno.
     Call(u32),
     /// Retorna da funcao com o valor no topo da pilha.
@@ -530,7 +542,7 @@ impl Chunk {
                         "chunk invalido em `{context}`: nome {idx} fora do pool"
                     )));
                 }
-                Op::DefineFunc(idx) if (idx as usize) >= self.funcs.len() => {
+                Op::DefineFunc(idx) | Op::MakeFunc(idx) if (idx as usize) >= self.funcs.len() => {
                     return Err(CompileError::new(format!(
                         "chunk invalido em `{context}`: funcao {idx} inexistente"
                     )));
@@ -651,6 +663,8 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
             }
             Op::Jump(target) => (height, Some(vec![target as usize])),
             Op::DefineFunc(_) | Op::EnterScope | Op::ExitScope => (height, Some(vec![ip + 1])),
+            // `MakeFunc` captura o ambiente sem tocar na pilha de operandos.
+            Op::MakeFunc(_) => (height + 1, Some(vec![ip + 1])),
             Op::Halt | Op::Return => (height, None),
             Op::Call(arity) => {
                 let arity = arity as usize;
@@ -922,6 +936,40 @@ impl Compiler {
             self.compile_stmt(stmt)?;
         }
         Ok(())
+    }
+
+    /// Compila o corpo de uma funcao (nomeada ou closure) em compilador
+    /// aninhado, registra o `FuncDef` na tabela e devolve o indice.
+    /// Usado por `Stmt::FnDef` e `Expr::Closure` (RFC 0003).
+    fn compile_func_body(
+        &mut self,
+        name: &str,
+        params: &[String],
+        body: &[Stmt],
+    ) -> Result<u32, CompileError> {
+        let mut seen = std::collections::HashSet::new();
+        for param in params {
+            if !seen.insert(param) {
+                return Err(CompileError::new(format!("parametro duplicado: {param}")));
+            }
+        }
+        let mut fn_compiler = Compiler::new(true);
+        fn_compiler.compile_stmts(body)?;
+        let null_idx = fn_compiler.add_constant(Value::Null)?;
+        fn_compiler.emit(Op::Constant(null_idx));
+        fn_compiler.emit(Op::Return);
+        fn_compiler.emit(Op::Halt);
+        let body_chunk = fn_compiler.chunk;
+        body_chunk.validate()?;
+        if self.chunk.funcs.len() >= u32::MAX as usize {
+            return Err(CompileError::new("limite de funcoes excedido"));
+        }
+        self.chunk.funcs.push(FuncDef {
+            name: name.to_string(),
+            params: params.to_vec(),
+            body: body_chunk,
+        });
+        Ok((self.chunk.funcs.len() - 1) as u32)
     }
 
     /// Nome oculto do laco `for` (lista ou indice): contem NUL, impossivel
@@ -1298,29 +1346,7 @@ impl Compiler {
                 self.compile_for(var, iter, body)?;
             }
             Stmt::FnDef { name, params, body } => {
-                let mut seen = std::collections::HashSet::new();
-                for param in params {
-                    if !seen.insert(param) {
-                        return Err(CompileError::new(format!("parametro duplicado: {param}")));
-                    }
-                }
-                let mut fn_compiler = Compiler::new(true);
-                fn_compiler.compile_stmts(body)?;
-                let null_idx = fn_compiler.add_constant(Value::Null)?;
-                fn_compiler.emit(Op::Constant(null_idx));
-                fn_compiler.emit(Op::Return);
-                fn_compiler.emit(Op::Halt);
-                let body_chunk = fn_compiler.chunk;
-                body_chunk.validate()?;
-                if self.chunk.funcs.len() >= u32::MAX as usize {
-                    return Err(CompileError::new("limite de funcoes excedido"));
-                }
-                self.chunk.funcs.push(FuncDef {
-                    name: name.clone(),
-                    params: params.clone(),
-                    body: body_chunk,
-                });
-                let func_idx = (self.chunk.funcs.len() - 1) as u32;
+                let func_idx = self.compile_func_body(name, params, body)?;
                 self.intern_name(name)?;
                 self.emit(Op::DefineFunc(func_idx));
             }
@@ -1523,6 +1549,29 @@ impl Compiler {
                     self.emit(Op::Call(args.len() as u32));
                 }
             }
+            Expr::CallValue { callee, args } => {
+                // `f(x)` direto preserva o caminho classico (precedencia
+                // de builtins e erro de aridade em compilacao).
+                if let Expr::Var(name) = callee.as_ref() {
+                    self.compile_expr(&Expr::Call {
+                        name: name.clone(),
+                        args: args.clone(),
+                    })?;
+                } else {
+                    self.compile_expr(callee)?;
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                    }
+                    if args.len() > u32::MAX as usize {
+                        return Err(CompileError::new("numero de argumentos excedido"));
+                    }
+                    self.emit(Op::Call(args.len() as u32));
+                }
+            }
+            Expr::Closure(data) => {
+                let func_idx = self.compile_func_body("{closure}", &data.params, &data.body)?;
+                self.emit(Op::MakeFunc(func_idx));
+            }
         }
         Ok(())
     }
@@ -1636,6 +1685,20 @@ mod tests {
     fn compiles_builtin_call() {
         let chunk = compile_src("echo len([1, 2]);");
         assert!(chunk.code.contains(&Op::CallBuiltin(BuiltinId(0))));
+    }
+
+    #[test]
+    fn compiles_closure_and_general_calls() {
+        // Closure vira `MakeFunc` (valor); `f(1)` direto preserva `Call`.
+        let chunk = compile_src("let f = fn (x) { return x; }; echo f(1);");
+        assert_eq!(chunk.funcs.len(), 1);
+        assert_eq!(chunk.funcs[0].name, "{closure}");
+        assert!(chunk.code.contains(&Op::MakeFunc(0)));
+        assert!(chunk.code.contains(&Op::Call(1)));
+        // Chamada de callee arbitrario compila callee + `Call`.
+        let chunk = compile_src("echo (fn (x) { return x; })(41);");
+        assert!(chunk.code.contains(&Op::MakeFunc(0)));
+        assert!(chunk.code.contains(&Op::Call(1)));
     }
 
     #[test]
@@ -1989,6 +2052,13 @@ mod tests {
             params: vec![],
             body: Chunk::new(),
         });
-        assert_eq!(Value::Func(func).to_string(), "<fn f>");
+        assert_eq!(
+            Value::Func(FuncValue {
+                def: func,
+                env: HashMap::new()
+            })
+            .to_string(),
+            "<fn f>"
+        );
     }
 }

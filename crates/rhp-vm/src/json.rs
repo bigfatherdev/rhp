@@ -364,7 +364,7 @@ fn stringify_into(value: &Value, out: &mut String, depth: usize) -> Result<(), V
             return Err(VmError::new(format!(
                 "`json_stringify` nao representa {} (`{}`)",
                 type_name(value),
-                func.name
+                func.def.name
             )));
         }
     }

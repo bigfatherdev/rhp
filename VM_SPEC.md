@@ -4,10 +4,11 @@
 
 - Pilha de frames explicitos (`MAX_CALL_DEPTH = 512`); cada frame tem codigo,
   constantes, nomes, funcoes (`Rc`), `ip`, pilha de operandos e pilha de
-  escopos locais (`scopes[0]` = ativacao: vazio no principal, params na funcao).
+  escopos locais (`scopes[0]` = ativacao: vazio no principal, params + env
+  capturado na funcao — escopo unico, ver RFC 0003).
 - Mapa de globais compartilhado: `let`/`fn` no topo do programa principal
   declaram globais, visiveis a todas as funcoes. Funcoes enxergam params,
-  locais proprios e globais.
+  env capturado (closures), locais proprios e globais.
 - Entrada: `&Chunk` validado recursivamente. Saida: `&mut dyn Write`.
 
 ## 2. Ciclo de execucao
@@ -16,7 +17,10 @@
 2. Frame principal; loop ate `Halt` (so valido com um frame) ou `Return`
    (desempilha frame, entrega valor ao chamador).
 3. `Call(a)`: `pop` callee + `a` args (ordem preservada), checa tipo `Func`,
-   aridade e profundidade; novo frame com params vinculados; continua nele.
+   aridade e profundidade; novo frame com escopo unico (clone do env
+   capturado + params vinculados, params sombreiam); continua nele.
+   `MakeFunc(f)`: empilha `Func{def, env: snapshot atual}` (internos→externos).
+   `DefineFunc(f)`: idem + declara (captura uniforme para `fn` nomeada).
 4. Fim do codigo sem `Halt`/`Return` alcancado => erro (defesa em
    profundidade; chunks validados nao atingem).
 

@@ -1183,6 +1183,22 @@ impl Renamer<'_> {
                 name: self.reference(name),
                 args: args.iter().map(|e| self.expr(e)).collect(),
             },
+            Expr::CallValue { callee, args } => Expr::CallValue {
+                callee: Box::new(self.expr(callee)),
+                args: args.iter().map(|e| self.expr(e)).collect(),
+            },
+            Expr::Closure(data) => {
+                self.scopes.push(HashSet::new());
+                for param in &data.params {
+                    self.declare(param);
+                }
+                let body = data.body.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                Expr::Closure(Box::new(rhp_parser::ClosureData {
+                    params: data.params.clone(),
+                    body,
+                }))
+            }
         }
     }
 }
@@ -1205,6 +1221,81 @@ fn collect_imports(statements: &[Stmt]) -> Result<RawImports, LoadError> {
 
 /// Rejeita `import`/`export` dentro de blocos/funcoes (a semantica seria
 /// icar o modulo para o topo, surpreendente e nao documentada).
+/// Varre as expressoes diretas de um statement a procura de corpos de
+/// closure com `import`/`export` (unico aninhamento via expressao).
+fn check_stmt_expr_imports(stmt: &Stmt) -> Result<(), LoadError> {
+    match stmt {
+        Stmt::Echo { expr }
+        | Stmt::Const { init: expr, .. }
+        | Stmt::Assign { expr, .. }
+        | Stmt::ExprStmt { expr } => check_expr_imports(expr),
+        Stmt::Let { init, .. } => {
+            if let Some(expr) = init {
+                check_expr_imports(expr)?;
+            }
+            Ok(())
+        }
+        Stmt::Return { expr } => {
+            if let Some(expr) = expr {
+                check_expr_imports(expr)?;
+            }
+            Ok(())
+        }
+        Stmt::Throw { expr } => check_expr_imports(expr),
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::For { iter: cond, .. } => {
+            check_expr_imports(cond)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Desce recursivamente ate corpos de closure e aplica a mesma regra de
+/// `check_block_imports` (erro claro em vez de ignorar silencioso).
+fn check_expr_imports(expr: &rhp_parser::Expr) -> Result<(), LoadError> {
+    use rhp_parser::Expr as E;
+    match expr {
+        E::Closure(data) => check_block_imports(&data.body, "em closure"),
+        E::CallValue { callee, args } => {
+            check_expr_imports(callee)?;
+            for arg in args {
+                check_expr_imports(arg)?;
+            }
+            Ok(())
+        }
+        E::Array(items) | E::Call { args: items, .. } => {
+            for item in items {
+                check_expr_imports(item)?;
+            }
+            Ok(())
+        }
+        E::Map(entries) => {
+            for (_, v) in entries {
+                check_expr_imports(v)?;
+            }
+            Ok(())
+        }
+        E::Index { base, index } => {
+            check_expr_imports(base)?;
+            check_expr_imports(index)
+        }
+        E::Unary { expr, .. } => check_expr_imports(expr),
+        E::Binary { left, right, .. } => {
+            check_expr_imports(left)?;
+            check_expr_imports(right)
+        }
+        E::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            check_expr_imports(cond)?;
+            check_expr_imports(then_branch)?;
+            check_expr_imports(else_branch)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
     for stmt in statements {
         match stmt {
@@ -1239,7 +1330,9 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
                 check_block_imports(body, &format!("na funcao `{name}`"))?;
             }
             Stmt::Block(body) => check_block_imports(body, "em bloco")?,
-            _ => {}
+            // Closure e o unico caminho de `import` aninhado via expressao
+            // (RFC 0003); rejeita com o mesmo erro claro das funcoes.
+            other => check_stmt_expr_imports(other)?,
         }
     }
     Ok(())
@@ -1471,6 +1564,58 @@ mod tests {
                 other => panic!("esperado Var, obteve {other:?}"),
             },
             other => panic!("esperado Echo, obteve {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runs_closures_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "let f = fn (x) { return x + 1; }; echo f(41); echo (fn (x) { return x * 2; })(21);",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"42\n42\n");
+    }
+
+    #[test]
+    fn rejects_import_inside_closure() {
+        let dir = temp_dir("closure-import");
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "let f = fn () {\n  import \"outro.rhp\";\n  return 1;\n};\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nivel superior"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rename_closures_shadow_params() {
+        use std::collections::HashSet as Set;
+        // Parametro sombreia o topo; livre do corpo e renomeada.
+        let stmts = rhp_parser::parse_source("let x = 1;\nlet f = fn (x) {\n  return x;\n};\n")
+            .expect("parse deve passar")
+            .statements;
+        let top: Set<String> = ["x".to_string(), "f".to_string()].into_iter().collect();
+        let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
+        match &renamed[1] {
+            Stmt::Let {
+                init: Some(expr), ..
+            } => match expr {
+                rhp_parser::Expr::Closure(data) => {
+                    assert_eq!(data.params, &["x".to_string()]);
+                    assert!(matches!(&data.body[0],
+                        Stmt::Return { expr: Some(rhp_parser::Expr::Var(name)) }
+                        if name == "x"));
+                }
+                other => panic!("esperada Closure, obteve {other:?}"),
+            },
+            other => panic!("esperado Let, obteve {other:?}"),
         }
     }
 

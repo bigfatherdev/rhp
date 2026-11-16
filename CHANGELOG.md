@@ -4,6 +4,13 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ## [unreleased]
 
+### Added
+
+- Closures de primeira classe (RFC 0003, PHP-100 P1): `fn (params) { }`
+  como expressão com captura por valor, `MakeFunc`, chamadas de callee
+  arbitrário (`CallValue`), `import` em closure rejeitado no loader.
+  Registro: `changes/2026-11-16-feat-closures-primeira-classe.md`.
+
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 
 ### Added

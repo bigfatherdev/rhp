@@ -6,7 +6,8 @@ Decisao arquitetural e alternativas em `reports/MEMORY_MODEL.md` (+ ADR 0002).
 ## Modelo vigente: valores por copia, sem compartilhamento
 
 - `Value::{Null, Bool, Int, Float, Str, Array(Vec<Value>),
-  Map(HashMap<String, Value>), Func(Rc<FuncDef>)}`; tudo `Clone`.
+  Map(HashMap<String, Value>), Func(FuncValue)}` com
+  `FuncValue { def: Rc<FuncDef>, env: HashMap<String, Value> }`; tudo `Clone`.
 - **Semantica por valor**: atribuicao, passagem de argumentos, retorno e
   `push` copiam integralmente o valor. Nao ha aliasing observavel:
   mutar via uma variavel nunca afeta outra (inclui `a[i] = v`, atomico).

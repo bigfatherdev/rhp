@@ -40,12 +40,14 @@
 //! Addition   := Multiplication (("+" | "-") Multiplication)*
 //! Multiplication := Unary (("*" | "/" | "%") Unary)*
 //! Unary      := ("!" | "-" | "~" | "+") Unary | Postfix
-//! Postfix    := Primary ("[" Expr "]")*
+//! Postfix    := Primary (("[" Expr "]") | ("(" Args ")"))*
 //! Primary    := Int | Float | String | "true" | "false" | "null"
-//!             | Array | Map | Ident | Call | "(" Expr ")"
+//!             | Array | Map | Ident | Closure | "(" Expr ")"
+//! Closure    := "fn" "(" (Ident ("," Ident)*)? ")" Block
 //! Array      := "[" (Expr ("," Expr)*)? "]"
 //! Map        := "{" ((String | Ident) ":" Expr ("," ...)*)? "}"
-//! Call       := Ident "(" (Expr ("," Expr)*)? ")"
+//! Call       := Ident "(" (Expr ("," Expr)*)? ")"   // callee direto
+//! CallValue  := Postfix "(" (Expr ("," Expr)*)? ")" // callee arbitrario
 //! ```
 
 use rhp_lexer::{Token, TokenKind};
@@ -186,6 +188,25 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// Chamada de callee arbitrario: `f()(1)`, `(fn(x) { x })(2)`,
+    /// `arr[0](x)`. `f(x)` direto continua `Call` (precedencia de builtins
+    /// preservada byte a byte). `Box` no callee para nao inflar `sizeof(Expr)`
+    /// (o guarda de profundidade assume frames enxutos; ver MAX_PARSE_DEPTH).
+    CallValue {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// `fn (params) { corpo }` como valor (closure, RFC 0003).
+    /// Sem nome: recursao usa o `let` externo (ligacao tardia).
+    /// `Box` proposital: mantem `Expr` no tamanho anterior a RFC 0003.
+    Closure(Box<ClosureData>),
+}
+
+/// Corpo de closure, sempre heap-alocado (ver `Expr::Closure`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureData {
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
 }
 
 /// Operador binario.
@@ -576,10 +597,17 @@ fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
     let name = expect_ident(cursor)?;
+    let params = parse_params_list(cursor, "apos nome da funcao")?;
+    let body = parse_block(cursor)?;
+    Ok(Stmt::FnDef { name, params, body })
+}
+
+/// Lista de parametros `(a, b, ...)`: `(` ja deve ser o proximo token.
+fn parse_params_list(cursor: &mut Cursor<'_>, context: &str) -> Result<Vec<String>, ParseError> {
     expect_token(
         cursor,
         &TokenKind::LParen,
-        "esperado `(` apos nome da funcao",
+        &format!("esperado `(` {context}"),
     )?;
     let mut params = Vec::new();
     if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RParen)) {
@@ -593,8 +621,25 @@ fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         }
     }
     expect_token(cursor, &TokenKind::RParen, "esperado `)` apos parametros")?;
-    let body = parse_block(cursor)?;
-    Ok(Stmt::FnDef { name, params, body })
+    Ok(params)
+}
+
+/// Argumentos de chamada `(a, b, ...)`: `(` ja deve ser o proximo token.
+fn parse_call_args(cursor: &mut Cursor<'_>) -> Result<Vec<Expr>, ParseError> {
+    cursor.next();
+    let mut args = Vec::new();
+    if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RParen)) {
+        loop {
+            args.push(parse_expr(cursor)?);
+            if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
+                cursor.next();
+            } else {
+                break;
+            }
+        }
+    }
+    expect_token(cursor, &TokenKind::RParen, "esperado `)` apos argumentos")?;
+    Ok(args)
 }
 
 fn parse_return(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -995,16 +1040,45 @@ fn parse_unary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_postfix(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_primary(cursor)?;
-    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBracket)) {
-        cursor.next();
-        let index = parse_expr(cursor)?;
-        expect_token(cursor, &TokenKind::RBracket, "esperado `]`")?;
-        expr = Expr::Index {
-            base: Box::new(expr),
-            index: Box::new(index),
-        };
+    loop {
+        match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::LBracket) => {
+                expr = parse_index_suffix(cursor, expr)?;
+            }
+            Some(TokenKind::LParen) => {
+                expr = parse_call_suffix(cursor, expr)?;
+            }
+            _ => break,
+        }
     }
     Ok(expr)
+}
+
+/// Corpo do sufixo `[indice]` isolado para manter o frame de
+/// `parse_postfix` pequeno no caminho quente (ver MAX_PARSE_DEPTH).
+#[inline(never)]
+fn parse_index_suffix(cursor: &mut Cursor<'_>, base: Expr) -> Result<Expr, ParseError> {
+    cursor.next();
+    let index = parse_expr(cursor)?;
+    expect_token(cursor, &TokenKind::RBracket, "esperado `]`")?;
+    Ok(Expr::Index {
+        base: Box::new(base),
+        index: Box::new(index),
+    })
+}
+
+/// Corpo do sufixo `(args)` isolado pelo mesmo motivo acima.
+#[inline(never)]
+fn parse_call_suffix(cursor: &mut Cursor<'_>, callee: Expr) -> Result<Expr, ParseError> {
+    let args = parse_call_args(cursor)?;
+    Ok(match callee {
+        // `f(x)` direto preserva o caminho classico (builtins).
+        Expr::Var(name) => Expr::Call { name, args },
+        callee => Expr::CallValue {
+            callee: Box::new(callee),
+            args,
+        },
+    })
 }
 
 fn parse_primary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
@@ -1024,23 +1098,18 @@ fn parse_primary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         TokenKind::Ident(name) => {
             let name = name.clone();
             if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
-                cursor.next();
-                let mut args = Vec::new();
-                if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RParen)) {
-                    loop {
-                        args.push(parse_expr(cursor)?);
-                        if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
-                            cursor.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                expect_token(cursor, &TokenKind::RParen, "esperado `)` apos argumentos")?;
+                let args = parse_call_args(cursor)?;
                 Ok(Expr::Call { name, args })
             } else {
                 Ok(Expr::Var(name))
             }
+        }
+        TokenKind::Fn => {
+            // `tok` ja consumiu `fn`; `(` vem a seguir ou e erro claro.
+            let params =
+                parse_params_list(cursor, "apos `fn` (funcao anonima usa `fn (args) { }`)")?;
+            let body = parse_block(cursor)?;
+            Ok(Expr::Closure(Box::new(ClosureData { params, body })))
         }
         TokenKind::LParen => {
             let expr = parse_expr(cursor)?;
@@ -1419,6 +1488,54 @@ mod tests {
         assert_eq!(program.statements.len(), 2);
         assert!(matches!(program.statements[0], Stmt::FnDef { .. }));
         assert!(matches!(program.statements[1], Stmt::Echo { .. }));
+    }
+
+    #[test]
+    fn parses_anonymous_fn_and_general_calls() {
+        // `let f = fn (x) { return x; };`
+        let program = lex_and_parse("let f = fn (x) { return x; };").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Let {
+                init: Some(Expr::Closure(_)),
+                ..
+            }
+        ));
+        // Chamada direta de literal: IIFE.
+        let program = lex_and_parse("echo (fn (x) { return x; })(41);").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::CallValue { .. }
+            }
+        ));
+        // `f(x)` direto continua `Call` (precedencia de builtins).
+        let program = lex_and_parse("echo soma(1);").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::Call { .. }
+            }
+        ));
+        // Chamada encadeada e por indice: `CallValue`.
+        let program = lex_and_parse("echo f(1)(2);").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::CallValue { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_named_fn_in_expression() {
+        // `fn nome` so existe como instrucao; em expressao exige `(`.
+        let err = lex_and_parse("let f = fn g(x) { return x; };").expect_err("deve falhar");
+        assert!(
+            err.message.contains("esperado `(`"),
+            "obteve: {}",
+            err.message
+        );
     }
 
     #[test]

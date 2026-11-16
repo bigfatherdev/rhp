@@ -62,10 +62,12 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
   (  `changes/2026-11-15-feat-json.md`).
 - [ ] Pendente (ordem tecnica; o resto do lote imediato saiu nas Fases
   A–C): `switch`, `sort`/`filter` com callback (exige primeira-classe),
-  args default/variadicos, destructuring; depois closures,
-  namespaces/exports (restante: re-export), pacotes, tipos, OO,
+  args default/variadicos, destructuring; depois namespaces/exports
+  (restante: re-export), pacotes, tipos, OO,
   async/DBs (restante: Redis), LSP/debugger completos (todos exigem
   RFC/ADR e gates, cf. auditoria §21).
+- [x] Closures de primeira classe (RFC 0003 aceita e implementada:
+  `fn (params) { }`, captura por valor, `MakeFunc`, `CallValue`).
 
 ## Fases A–D — RHP para sites/sistemas (plano aprovado, em andamento)
 

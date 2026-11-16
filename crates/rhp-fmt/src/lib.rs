@@ -327,6 +327,18 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             let inner: Vec<String> = args.iter().map(|arg| fmt_expr(arg, 0)).collect();
             format!("{name}({})", inner.join(", "))
         }
+        Expr::CallValue { callee, args } => {
+            let inner: Vec<String> = args.iter().map(|arg| fmt_expr(arg, 0)).collect();
+            format!("{}({})", fmt_atom(callee), inner.join(", "))
+        }
+        Expr::Closure(data) => {
+            // Multilinha com indentacao relativa: estavel e reparsavel
+            // (idempotencia garantida; closures aninhadas nao herdam o
+            // nivel absoluto — aceito nesta etapa, ver RFC 0003 §7).
+            let mut body = String::new();
+            fmt_block(&data.body, 1, &mut body);
+            format!("fn ({}) {{\n{body}}}", data.params.join(", "))
+        }
     }
 }
 
@@ -351,6 +363,8 @@ fn fmt_atom(expr: &Expr) -> String {
     match expr {
         Expr::Var(_)
         | Expr::Call { .. }
+        | Expr::CallValue { .. }
+        | Expr::Closure(_)
         | Expr::Index { .. }
         | Expr::Array(_)
         | Expr::Map(_)
@@ -396,6 +410,18 @@ mod tests {
         assert_eq!(fmt("echo 10 - (4 - 3);"), "echo 10 - (4 - 3);\n");
         assert_eq!(fmt("echo -(1 + 2);"), "echo -(1 + 2);\n");
         assert_eq!(fmt("echo !true;"), "echo !true;\n");
+    }
+
+    #[test]
+    fn formats_closures_and_general_calls() {
+        assert_eq!(
+            fmt("let f=fn(x){return x+1;};"),
+            "let f = fn (x) {\n  return x + 1;\n};\n"
+        );
+        // IIFE dispa parenteses externos redundantes, mantem os da chamada.
+        check_idempotent("echo (fn (x) { return x * 2; })(21);");
+        check_idempotent("let f = fn (x) { return fn (y) { return x + y; }; };");
+        check_idempotent("echo f(40)(2);");
     }
 
     #[test]
