@@ -4,7 +4,7 @@
 //! globais compartilhadas. O bytecode e tratado como entrada potencialmente
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
-use rhp_bytecode::{builtin_arity, Builtin, Chunk, FuncDef, FuncValue, Op, Value};
+use rhp_bytecode::{builtin_arity, Builtin, Chunk, FuncDef, FuncValue, Op, Value, MAX_VALUE_DEPTH};
 use rhp_parser::Program;
 use std::collections::HashMap;
 use std::fmt;
@@ -31,12 +31,15 @@ pub const MAX_CALL_DEPTH: usize = 512;
 /// Preserva compatibilidade: sem limites configurados o comportamento e o
 /// mesmo de antes. `max_steps` aborta loops; `max_stack_depth` limita a
 /// pilha de operandos por frame; `max_collection_len` limita tamanho em
-/// bytes (strings) ou elementos (arrays/mapas) de cada valor empilhado.
+/// bytes (strings) ou elementos (arrays/mapas) de cada valor empilhado;
+/// `max_heap_bytes` limita a soma estimada (bytes do modelo, RFC 0015)
+/// da heap viva — `None` = ilimitado.
 #[derive(Debug, Clone, Default)]
 pub struct VmLimits {
     pub max_steps: Option<u64>,
     pub max_stack_depth: Option<usize>,
     pub max_collection_len: Option<usize>,
+    pub max_heap_bytes: Option<u64>,
 }
 
 /// Erro de runtime da VM.
@@ -167,6 +170,9 @@ pub struct Vm {
     /// poucas definicoes usam `static`, busca linear e suficiente).
     /// Compartilhado entre chamadas e instancias da mesma definicao.
     statics: Vec<(Rc<FuncDef>, HashMap<String, Value>)>,
+    /// Bytes estimados empilhados desde a ultima varredura da heap
+    /// (teto amortizado O(1), RFC 0015; zerado em `set_limits`).
+    heap_since_check: u64,
 }
 
 /// Conexoes de banco da VM (B2: SQLite; B3: +PostgreSQL).
@@ -210,6 +216,7 @@ impl Vm {
             db: DbHandles::default(),
             statics: Vec::new(),
             rng: seed_rng(),
+            heap_since_check: 0,
         }
     }
 
@@ -221,6 +228,7 @@ impl Vm {
     /// Define limites opcionais de execucao (ver [`VmLimits`]).
     pub fn set_limits(&mut self, limits: VmLimits) {
         self.limits = limits;
+        self.heap_since_check = 0;
     }
 
     /// Define o programa-fonte para recompilacao por thread (`http_serve`).
@@ -715,8 +723,47 @@ impl Vm {
 
     fn push_checked(&mut self, idx: usize, value: Value) -> Result<(), VmError> {
         self.check_collection(&value)?;
+        self.check_heap_growth(&value)?;
         self.frames[idx].stack.push(value);
         Ok(())
+    }
+
+    /// Teto de heap amortizado O(1) (RFC 0015): soma a estimativa de cada
+    /// valor empilhado; ao cruzar o gatilho (`max/16`, minimo 64 bytes),
+    /// varre a heap viva e reancora o contador no valor real — `pop`s
+    /// liberam orcamento, entao aloca-e-libera cabe em teto pequeno.
+    fn check_heap_growth(&mut self, value: &Value) -> Result<(), VmError> {
+        let Some(max) = self.limits.max_heap_bytes else {
+            return Ok(());
+        };
+        self.heap_since_check = self.heap_since_check.saturating_add(heap_size_of(value, 0));
+        if self.heap_since_check >= (max / 16).max(64) {
+            let live = self.heap_bytes();
+            self.heap_since_check = live;
+            if live > max {
+                return Err(VmError::new(format!("heap excedeu o limite ({max} bytes)")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Varredura completa da heap viva: pilhas + escopos de cada frame,
+    /// globais e statics.
+    fn heap_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for frame in &self.frames {
+            for value in &frame.stack {
+                total = total.saturating_add(heap_size_of(value, 0));
+            }
+            for scope in &frame.scopes {
+                total = total.saturating_add(heap_size_of_entries(scope, 0));
+            }
+        }
+        total = total.saturating_add(heap_size_of_entries(&self.globals, 0));
+        for (_, vars) in &self.statics {
+            total = total.saturating_add(heap_size_of_entries(vars, 0));
+        }
+        total
     }
 
     fn check_collection(&self, value: &Value) -> Result<(), VmError> {
@@ -1358,6 +1405,41 @@ fn collection_len(value: &Value) -> usize {
         Value::Map(entries) => entries.len(),
         _ => 0,
     }
+}
+
+/// Estimativa da heap viva para fins de teto (bytes do modelo, RFC 0015):
+/// escalar = 0; `Str` = `len`; `Array` = 8 por elemento + recursao;
+/// `Map`/`Func.env` = `key.len` + 8 por entrada + recursao. Nao mede o
+/// alocador real (overhead de `Vec`/`HashMap` fora; direcao documentada
+/// na spec). Alem de `MAX_VALUE_DEPTH`, conta so o nivel imediato.
+fn heap_size_of(value: &Value, depth: usize) -> u64 {
+    match value {
+        Value::Str(s) => s.len() as u64,
+        Value::Array(items) => {
+            let mut total = (items.len() as u64).saturating_mul(8);
+            if depth <= MAX_VALUE_DEPTH {
+                for item in items {
+                    total = total.saturating_add(heap_size_of(item, depth + 1));
+                }
+            }
+            total
+        }
+        Value::Map(entries) => heap_size_of_entries(entries, depth),
+        Value::Func(f) => heap_size_of_entries(&f.env, depth),
+        _ => 0,
+    }
+}
+
+/// Soma de um mapa `nome -> valor` (escopo, global, statics, env).
+fn heap_size_of_entries(entries: &HashMap<String, Value>, depth: usize) -> u64 {
+    let mut total = 0u64;
+    for (k, v) in entries {
+        total = total.saturating_add(k.len() as u64).saturating_add(8);
+        if depth <= MAX_VALUE_DEPTH {
+            total = total.saturating_add(heap_size_of(v, depth + 1));
+        }
+    }
+    total
 }
 
 fn type_name(value: &Value) -> &'static str {
@@ -2709,6 +2791,7 @@ mod tests {
             max_steps: Some(500),
             max_stack_depth: Some(16),
             max_collection_len: Some(32),
+            ..Default::default()
         });
         let mut out = Vec::new();
         let _ = vm.run(chunk, &mut out);
@@ -2828,6 +2911,40 @@ mod tests {
         // Sem limite, programa finito passa normalmente.
         let out = run_src("let i = 0; while i < 3 { i = i + 1; } echo i;").expect("ok");
         assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn respects_heap_byte_limit() {
+        // ~10 strings de 100 bytes retidas: ~1 KB vivo > teto de 512.
+        let src = "let a = []; let i = 0; while i < 10 { a = push(a, \"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\"); i = i + 1; } echo len(a);";
+        let chunk = compile_src(src);
+        let mut vm = Vm::new();
+        vm.set_limits(VmLimits {
+            max_heap_bytes: Some(512),
+            ..Default::default()
+        });
+        let err = vm.run_to_string(&chunk).expect_err("deve falhar");
+        assert!(err.message.contains("heap excedeu o limite"));
+        // Teto folgado passa; sem teto passa (compatibilidade).
+        let mut vm_ok = Vm::new();
+        vm_ok.set_limits(VmLimits {
+            max_heap_bytes: Some(1 << 20),
+            ..Default::default()
+        });
+        let out = vm_ok.run_to_string(&chunk).expect("teto folgado passa");
+        assert_eq!(out, "10\n");
+        let out = run_src(src).expect("sem teto passa");
+        assert_eq!(out, "10\n");
+        // Aloca-e-libera cabe em teto pequeno (varredura reseta o contador).
+        let transiente = "let i = 0; while i < 50 { let t = \"0123456789\"; i = i + 1; } echo i;";
+        let chunk_t = compile_src(transiente);
+        let mut vm_t = Vm::new();
+        vm_t.set_limits(VmLimits {
+            max_heap_bytes: Some(2048),
+            ..Default::default()
+        });
+        let out = vm_t.run_to_string(&chunk_t).expect("transiente passa");
+        assert_eq!(out, "50\n");
     }
 
     #[test]

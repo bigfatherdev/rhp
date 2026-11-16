@@ -14,6 +14,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- Teto de heap opt-in (RFC 0015, Etapa 3): `VmLimits.max_heap_bytes` +
+  `rhp run --max-heap-bytes N`, estimador do modelo com enforcement O(1)
+  amortizado, erro `heap excedeu o limite` (E3012). Padrão ilimitado.
+  Registro: `changes/2026-11-16-feat-heap-limit.md`.
 - Fuzz determinístico std-only em CI (Etapa 3): lexer (5000 entradas),
   parser (5000 sequências), VM/validador (8000 chunks hostis + 600
   mutações de programas válidos). Sem novas dependências. Registro:

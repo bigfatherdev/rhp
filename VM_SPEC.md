@@ -41,8 +41,10 @@
   resto = erro.
 - Limites de execucao opt-in (`VmLimits`, padrao ilimitado): `max_steps`
   (instrucoes), `max_stack_depth` (pilha de operandos por frame),
-  `max_collection_len` (bytes de strings/elementos por valor empilhado).
-  CLI: `rhp run --max-steps N`. Runtime separado em
+  `max_collection_len` (bytes de strings/elementos por valor empilhado),
+  `max_heap_bytes` (soma estimada da heap viva; RFC 0015 — mede o modelo,
+  nao o alocador). CLI: `rhp run --max-steps N`,
+  `rhp run --max-heap-bytes N` (inteiro > 0). Runtime separado em
   `rhp-vm/src/builtins.rs` (builtins e I/O) do nucleo de execucao
   (`Vm::step`, pilha e frames).
 - `VmError { message }` (+ `exit_code()` interno para `exit()`): sem
@@ -62,6 +64,6 @@
 
 ## 4. Nao especificado ainda
 
-Limites de operandos/heap, chamada em cauda, closures, excecoes, GC,
+Limites de operandos, chamada em cauda, closures, excecoes, GC,
 threads/async, debug/introspeccao, formato serializado, compatibilidade
 entre versoes.
