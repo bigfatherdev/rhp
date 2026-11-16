@@ -74,6 +74,10 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
   defaults constantes dobrados, `...rest`).
 - [x] Destructuring raso (RFC 0007 aceita e implementada: `let [a, b]` /
   `let {x}` / `let {k: v}` + `const`).
+- [x] Chamadas mistas (RFC 0009 aceita e implementada: nomeados + spread).
+- [x] `static` em funcao (RFC 0010 aceita e implementada: estado por definicao).
+- [x] Re-export seletivo (RFC 0011 aceita e implementada: transitivo, sem `export *`).
+- [x] Builtins `rand`/`rand_range`/`fs_list` (RFC 0012 aceita e implementada).
 - [x] Closures de primeira classe (RFC 0003 aceita e implementada:
   `fn (params) { }`, captura por valor, `MakeFunc`, `CallValue`).
 

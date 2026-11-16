@@ -12,7 +12,7 @@
 
 use rhp_bytecode::{compile, Value};
 use rhp_parser::Program as AstProgram;
-use rhp_parser::{Expr, Program, Stmt};
+use rhp_parser::{CallArg, Expr, Program, Stmt};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -342,7 +342,7 @@ fn synthetic_program(
     statements.push(Stmt::ExprStmt {
         expr: Expr::Call {
             name: handler.to_string(),
-            args: vec![expr_from_value(request)?],
+            args: vec![CallArg::Pos(expr_from_value(request)?)],
         },
     });
     Ok(Program { statements })
