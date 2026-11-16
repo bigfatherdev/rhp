@@ -480,6 +480,15 @@ pub(super) fn call_builtin(
             }
         }
         Builtin::HttpServe => super::http_server::serve_builtin(args, program),
+        Builtin::Template => match (&args[0], &args[1]) {
+            (Value::Str(template), Value::Map(values)) => {
+                Ok(Value::Str(render_template(template, values)?))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`template` exige (texto, mapa), encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)
@@ -982,6 +991,55 @@ fn db_conn(db: &mut DbHandles, handle: i64) -> Result<&mut DbConn, VmError> {
         .ok_or_else(|| VmError::new(format!("`db`: handle {handle} invalido ou ja fechado")))
 }
 
+/// Interpola `{{chave}}` com escape HTML (Fase C3). Chave ausente,
+/// `}}` sem par ou valor nao escalonavel = erro. Sem lacos/condicionais
+/// por desenho (logica fica no RHP, apresentacao aqui).
+fn render_template(
+    template: &str,
+    values: &std::collections::HashMap<String, Value>,
+) -> Result<String, VmError> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    loop {
+        let Some(open) = rest.find("{{") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            return Err(VmError::new(
+                "`template`: `{{` sem `}}` de fechamento".to_string(),
+            ));
+        };
+        let key = after[..close].trim();
+        if key.is_empty() {
+            return Err(VmError::new("`template`: chave vazia".to_string()));
+        }
+        let Some(value) = values.get(key) else {
+            return Err(VmError::new(format!("`template`: chave ausente `{key}`")));
+        };
+        out.push_str(&escape_html(&value.to_string()));
+        rest = &after[close + 2..];
+    }
+    Ok(out)
+}
+
+/// Escapa texto para HTML (`&` primeiro; aspas incluidas).
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
 /// Converte params RHP para parametros PG (texto; `?` nao existe no PG,
 /// use `$1`, `$2`... no SQL).
 fn pg_params(params: &[super::sqlite::SqlValue]) -> Result<Vec<super::pg::PgParam>, VmError> {

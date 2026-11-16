@@ -351,6 +351,7 @@ struct HttpRequest {
     path: String,
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
+    cookies: HashMap<String, String>,
     body: String,
 }
 
@@ -429,13 +430,38 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     }
     body.truncate(want.min(body.len()));
     let body = String::from_utf8(body).map_err(|_| "corpo nao UTF-8".to_string())?;
+    let cookies = parse_cookies(headers.get("cookie").map(String::as_str).unwrap_or(""));
     Ok(HttpRequest {
         method,
         path,
         query,
         headers,
+        cookies,
         body,
     })
+}
+
+/// Parseia `Cookie: a=1; b="x y"` (nomes/valores aparados; um par de
+/// aspas externas e removido).
+fn parse_cookies(header: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for pair in header.split(';') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, mut value) = match pair.split_once('=') {
+            Some((k, v)) => (k.trim().to_string(), v.trim().to_string()),
+            None => (pair.to_string(), String::new()),
+        };
+        if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+            value = value[1..value.len() - 1].to_string();
+        }
+        if !name.is_empty() {
+            out.insert(name, value);
+        }
+    }
+    out
 }
 
 /// Decodifica `%XX` e `+` (query); invalido = mantem literal.
@@ -512,6 +538,16 @@ fn run_handler(
         Value::Map(
             request
                 .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
+                .collect(),
+        ),
+    );
+    entries.insert(
+        "cookies".to_string(),
+        Value::Map(
+            request
+                .cookies
                 .iter()
                 .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
                 .collect(),

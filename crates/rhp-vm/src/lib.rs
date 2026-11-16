@@ -1668,6 +1668,30 @@ mod tests {
     }
 
     #[test]
+    fn runs_template_builtin() {
+        assert_eq!(
+            run_src("echo template(\"ola, {{nome}}!\", {\"nome\": \"mundo\"});").expect("ok"),
+            "ola, mundo!\n"
+        );
+        // Escapa HTML (& primeiro); tipos viram texto.
+        assert_eq!(
+            run_src("echo template(\"{{a}}|{{b}}|{{c}}\", {\"a\": \"<b>&\\\"'\", \"b\": 42, \"c\": true});").expect("ok"),
+            "&lt;b&gt;&amp;&quot;&#39;|42|true\n"
+        );
+        // Sem placeholder: passa direto; chave faltando/aberta = erro.
+        assert_eq!(
+            run_src("echo template(\"sem nada\", {});").expect("ok"),
+            "sem nada\n"
+        );
+        let err = run_err("echo template(\"oi {{x}}\", {});");
+        assert!(err.contains("ausente"), "obteve: {err}");
+        let err = run_err("echo template(\"oi {{x\", {\"x\": 1});");
+        assert!(err.contains("fechamento"), "obteve: {err}");
+        let err = run_err("echo template(42, {});");
+        assert!(err.contains("texto"), "obteve: {err}");
+    }
+
+    #[test]
     fn rejects_bad_pg_conninfo() {
         // Sem servidor: formato invalido, porta invalida, recusa rapida.
         for bad in [

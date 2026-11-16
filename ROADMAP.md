@@ -78,9 +78,8 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
   **Fase B concluída** (persistência).
 - [x] C1: RFC 0002 — concorrência + servidor.
 - [x] C2: `http_serve` (thread por conexão, handler stateless, 500 sem vazar).
-- [ ] C3: middleware, cookies/sessões, templates.
-- [ ] Fase D: produção (TLS via ADR, pacotes v0, `rhp build`, auth,
-  limites, release `0.y.0`).
+- [x] C3: cookies, `template()` com escape, padrão sessão-via-banco.
+- [ ] Fase D: produção (TLS via ADR, pacotes v0, `rhp build`, auth, limites, release `0.y.0`).
 
 ## Fase 1 — Fundacao (concluida em 2026-11-14)
 

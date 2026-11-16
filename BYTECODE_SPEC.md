@@ -50,7 +50,7 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 | `TryEnd` | Remove o handler (caminho normal). Sem handler = erro. |
 | `Throw` | Desempilha valor e inicia unwinding (frame atual para a base). |
 | `Rethrow` | Relanca o erro em propagacao (fim de `finally` sem `catch`). |
-| `CallBuiltin(id)` | Executa builtin de id 0–48 com aridade fixa (tabela §4). |
+| `CallBuiltin(id)` | Executa builtin de id 0–49 com aridade fixa (tabela §4). |
 
 ## 3. Compilacao (Marco 2 + Fases 3–4)
 

@@ -299,6 +299,27 @@ impl ServerChild {
         )
     }
 
+    /// GET cru com cabecalhos extras (ex.: `Cookie`).
+    fn get_with(&self, path: &str, extra: &str) -> String {
+        Self::roundtrip(
+            self.port,
+            &format!("GET {path} HTTP/1.0\r\nHost: x\r\n{extra}\r\nConnection: close\r\n\r\n"),
+        )
+    }
+
+    /// POST cru com corpo e cabecalhos extras.
+    fn post_raw(&self, path: &str, body: &str, headers: &[(&str, &str)]) -> String {
+        let mut request = format!("POST {path} HTTP/1.0\r\nHost: x\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        Self::roundtrip(self.port, &request)
+    }
+
     fn roundtrip(port: u16, request: &str) -> String {
         use std::io::{Read, Write};
         let mut stream =
@@ -390,6 +411,45 @@ fn rhp_run_http_serve_exit_encerra() {
         out.status.code(),
         Some(3),
         "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_http_sessao_com_banco() {
+    // Sessao = cookie + linha no SQLite (stateless por design; handler
+    // abre o banco por request). XSS sai escapado pelo `template`.
+    let dir = std::env::temp_dir().join(format!("rhp-sessao-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir temporario");
+    let db = dir.join("sess.rhp.db");
+    let db_path = db.to_string_lossy().into_owned();
+    let source = "fn app(req) {\n  let h = db_open(\"@DB@\");\n  echo db_exec(h, \"CREATE TABLE IF NOT EXISTS sessoes (id text, usuario text)\", []);\n  if req[\"caminho\"] == \"/login\" {\n    let sid = \"s-\" + req[\"query\"][\"u\"];\n    echo db_exec(h, \"DELETE FROM sessoes WHERE id = ?\", [sid]);\n    echo db_exec(h, \"INSERT INTO sessoes VALUES (?, ?)\", [sid, req[\"query\"][\"u\"]]);\n    let saida = {status: 200, cabecalhos: {\"set-cookie\": \"sid=\" + sid}, corpo: template(\"logado como {{u}}!\", {\"u\": req[\"query\"][\"u\"]})};\n    echo db_close(h);\n    return saida;\n  }\n  if req[\"caminho\"] == \"/eu\" {\n    let quem = \"anonimo\";\n    let c = req[\"cookies\"];\n    if has(c, \"sid\") {\n      let r = db_query(h, \"SELECT usuario FROM sessoes WHERE id = ?\", [c[\"sid\"]]);\n      if len(r) == 1 { quem = r[0][\"usuario\"]; }\n    }\n    let pagina = template(\"<h1>ola, {{quem}}!</h1>\", {\"quem\": quem});\n    echo db_close(h);\n    return pagina;\n  }\n  echo db_close(h);\n  return \"nada\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 4});\n"
+        .replace("@DB@", &db_path);
+    let server = ServerChild::spawn("sessao.rhp", &source);
+    // Login com nome malicioso (XSS tenta passar pelo template).
+    let r1 = server.post_raw("/login?u=<b>ana</b>", "", &[("Cookie", "x=1")]);
+    assert!(r1.contains("200 OK"), "obteve: {r1}");
+    assert!(
+        r1.contains("logado como &lt;b&gt;ana&lt;/b&gt;!"),
+        "obteve: {r1}"
+    );
+    assert!(!r1.contains("<b>ana</b>!"), "vazou sem escape: {r1}");
+    assert!(r1.contains("set-cookie: sid="), "obteve: {r1}");
+    // Perfil com o cookie: nome escapado.
+    let r2 = server.get_with("/eu", "Cookie: sid=s-<b>ana</b>");
+    assert!(
+        r2.ends_with("<h1>ola, &lt;b&gt;ana&lt;/b&gt;!</h1>"),
+        "obteve: {r2}"
+    );
+    // Sem cookie: anonimo. Cookie desconhecido: anonimo.
+    let r3 = server.get("/eu");
+    assert!(r3.ends_with("<h1>ola, anonimo!</h1>"), "obteve: {r3}");
+    let r4 = server.get_with("/eu", "Cookie: sid=s-ninguem");
+    assert!(r4.ends_with("<h1>ola, anonimo!</h1>"), "obteve: {r4}");
+    let out = server.wait();
+    assert!(
+        out.status.success(),
+        "servidor falhou: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
