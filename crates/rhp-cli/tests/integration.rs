@@ -240,6 +240,231 @@ fn rhp_run_time_builtins() {
     assert_eq!(output.stdout, b"1970-01-01T00:00:00Z\nint\nnull\n");
 }
 
+/// Servidor `http_serve` como processo filho; porta lida da primeira
+/// linha do stdout (`rhp: ouvindo em 127.0.0.1:PORTA`). Mata ao sair.
+struct ServerChild {
+    child: Option<std::process::Child>,
+    port: u16,
+}
+
+impl ServerChild {
+    fn spawn(name: &str, source: &str) -> Self {
+        use std::io::BufRead;
+        let dir = std::env::temp_dir().join(format!("rhp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+        let file = dir.join(name);
+        std::fs::write(&file, source).expect("nao foi possivel escrever servidor temporario");
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rhp"))
+            .args(["run", &file.to_string_lossy()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("falha ao iniciar o servidor");
+        let stdout = child.stdout.take().expect("stdout do servidor");
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let first = lines
+            .next()
+            .expect("servidor fechou stdout sem anunciar")
+            .expect("leitura do anuncio falhou");
+        let port: u16 = first
+            .rsplit(':')
+            .next()
+            .expect("anuncio sem porta")
+            .trim()
+            .parse()
+            .expect("porta do anuncio invalida");
+        // Devolve o stdout restante? Nao preciso: descarta o leitor.
+        Self {
+            child: Some(child),
+            port,
+        }
+    }
+
+    /// GET cru e resposta crua.
+    fn get(&self, path: &str) -> String {
+        Self::roundtrip(
+            self.port,
+            &format!("GET {path} HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n"),
+        )
+    }
+
+    /// POST cru com corpo.
+    fn post(&self, path: &str, body: &str) -> String {
+        Self::roundtrip(
+            self.port,
+            &format!(
+                "POST {path} HTTP/1.0\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    /// GET cru com cabecalhos extras (ex.: `Cookie`).
+    fn get_with(&self, path: &str, extra: &str) -> String {
+        Self::roundtrip(
+            self.port,
+            &format!("GET {path} HTTP/1.0\r\nHost: x\r\n{extra}\r\nConnection: close\r\n\r\n"),
+        )
+    }
+
+    /// POST cru com corpo e cabecalhos extras.
+    fn post_raw(&self, path: &str, body: &str, headers: &[(&str, &str)]) -> String {
+        let mut request = format!("POST {path} HTTP/1.0\r\nHost: x\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        Self::roundtrip(self.port, &request)
+    }
+
+    fn roundtrip(port: u16, request: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("conectar no servidor");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        stream
+            .write_all(request.as_bytes())
+            .expect("enviar request");
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).expect("ler resposta");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn wait(mut self) -> std::process::Output {
+        self.child
+            .take()
+            .expect("servidor ja consumido")
+            .wait_with_output()
+            .expect("esperar servidor")
+    }
+}
+
+impl Drop for ServerChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn rhp_run_http_serve_basic() {
+    let server = ServerChild::spawn(
+        "srv.rhp",
+        "fn app(req) {\n  if req[\"caminho\"] == \"/criar\" {\n    return {status: 201, cabecalhos: {\"x_feita\": \"sim\"}, corpo: \"criado \" + req[\"corpo\"]};\n  }\n  return \"ola \" + req[\"query\"][\"nome\"];\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 3});\n",
+    );
+    let r1 = server.get("/oi?nome=mundo&x=1");
+    assert!(r1.contains("200 OK"), "obteve: {r1}");
+    assert!(r1.ends_with("ola mundo"), "obteve: {r1}");
+    let r2 = server.post("/criar", "abc");
+    assert!(r2.contains("201 Created"), "obteve: {r2}");
+    assert!(r2.contains("x_feita: sim"), "obteve: {r2}");
+    assert!(r2.ends_with("criado abc"), "obteve: {r2}");
+    // Query decodificada (%20) e header de request visivel ao handler.
+    let r3 = server.get("/q?nome=ola%20mundo");
+    assert!(r3.ends_with("ola ola mundo"), "obteve: {r3}");
+    let out = server.wait();
+    assert!(
+        out.status.success(),
+        "servidor falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_http_serve_500_sem_vazar() {
+    let server = ServerChild::spawn(
+        "srv500.rhp",
+        "fn app(req) {\n  if req[\"caminho\"] == \"/ruim\" {\n    throw \"segredo interno\";\n  }\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 2});\n",
+    );
+    let bad = server.get("/ruim");
+    assert!(bad.contains("500"), "obteve: {bad}");
+    assert!(bad.ends_with("erro interno"), "obteve: {bad}");
+    assert!(!bad.contains("segredo"), "vazou detalhe: {bad}");
+    // Servidor segue vivo apos o erro.
+    let ok = server.get("/ok");
+    assert!(ok.ends_with("ok"), "obteve: {ok}");
+    let out = server.wait();
+    assert!(
+        out.status.success(),
+        "servidor falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_http_serve_exit_encerra() {
+    // `exit` no handler termina o servidor com o codigo (sem resposta).
+    let server = ServerChild::spawn(
+        "srvsai.rhp",
+        "fn app(req) {\n  exit(3);\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 5});\n",
+    );
+    let _ = server.get("/sair");
+    let out = server.wait();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_http_sessao_com_banco() {
+    // Sessao = cookie + linha no SQLite (stateless por design; handler
+    // abre o banco por request). XSS sai escapado pelo `template`.
+    let dir = std::env::temp_dir().join(format!("rhp-sessao-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir temporario");
+    let db = dir.join("sess.rhp.db");
+    let db_path = db.to_string_lossy().into_owned();
+    let source = "fn app(req) {\n  let h = db_open(\"@DB@\");\n  echo db_exec(h, \"CREATE TABLE IF NOT EXISTS sessoes (id text, usuario text)\", []);\n  if req[\"caminho\"] == \"/login\" {\n    let sid = \"s-\" + req[\"query\"][\"u\"];\n    echo db_exec(h, \"DELETE FROM sessoes WHERE id = ?\", [sid]);\n    echo db_exec(h, \"INSERT INTO sessoes VALUES (?, ?)\", [sid, req[\"query\"][\"u\"]]);\n    let saida = {status: 200, cabecalhos: {\"set-cookie\": \"sid=\" + sid}, corpo: template(\"logado como {{u}}!\", {\"u\": req[\"query\"][\"u\"]})};\n    echo db_close(h);\n    return saida;\n  }\n  if req[\"caminho\"] == \"/eu\" {\n    let quem = \"anonimo\";\n    let c = req[\"cookies\"];\n    if has(c, \"sid\") {\n      let r = db_query(h, \"SELECT usuario FROM sessoes WHERE id = ?\", [c[\"sid\"]]);\n      if len(r) == 1 { quem = r[0][\"usuario\"]; }\n    }\n    let pagina = template(\"<h1>ola, {{quem}}!</h1>\", {\"quem\": quem});\n    echo db_close(h);\n    return pagina;\n  }\n  echo db_close(h);\n  return \"nada\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 4});\n"
+        .replace("@DB@", &db_path);
+    let server = ServerChild::spawn("sessao.rhp", &source);
+    // Login com nome malicioso (XSS tenta passar pelo template).
+    let r1 = server.post_raw("/login?u=<b>ana</b>", "", &[("Cookie", "x=1")]);
+    assert!(r1.contains("200 OK"), "obteve: {r1}");
+    assert!(
+        r1.contains("logado como &lt;b&gt;ana&lt;/b&gt;!"),
+        "obteve: {r1}"
+    );
+    assert!(!r1.contains("<b>ana</b>!"), "vazou sem escape: {r1}");
+    assert!(r1.contains("set-cookie: sid="), "obteve: {r1}");
+    // Perfil com o cookie: nome escapado.
+    let r2 = server.get_with("/eu", "Cookie: sid=s-<b>ana</b>");
+    assert!(
+        r2.ends_with("<h1>ola, &lt;b&gt;ana&lt;/b&gt;!</h1>"),
+        "obteve: {r2}"
+    );
+    // Sem cookie: anonimo. Cookie desconhecido: anonimo.
+    let r3 = server.get("/eu");
+    assert!(r3.ends_with("<h1>ola, anonimo!</h1>"), "obteve: {r3}");
+    let r4 = server.get_with("/eu", "Cookie: sid=s-ninguem");
+    assert!(r4.ends_with("<h1>ola, anonimo!</h1>"), "obteve: {r4}");
+    let out = server.wait();
+    assert!(
+        out.status.success(),
+        "servidor falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_http_serve_rejeita_handler_desconhecido() {
+    let output = run_temp_source("srvbad.rhp", "http_serve(0, \"inexistente\", {});\n");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nao definido"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn rhp_run_http_fetch_follows_redirects() {
     use std::io::{Read, Write};
@@ -719,6 +944,7 @@ fn vscode_grammar_covers_language() {
         "db_exec",
         "db_query",
         "db_close",
+        "http_serve",
     ] {
         assert!(
             text.contains(builtin),

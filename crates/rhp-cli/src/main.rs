@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt};
 
@@ -444,6 +445,7 @@ fn run_program(
     let mut vm = rhp_vm::Vm::new();
     vm.set_limits(limits);
     vm.set_argv(args.to_vec());
+    vm.set_program(Arc::new(program.clone()));
     vm.run(&chunk, output).map_err(|e| match e.exit_code() {
         Some(code) => Fail::Exit(code),
         None => {

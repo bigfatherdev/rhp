@@ -133,6 +133,10 @@ pub enum Builtin {
     DbQuery,
     /// `db_close(h)` — fecha handle (invalida para reuso).
     DbClose,
+    /// `http_serve(porta, handler, opts)` — servidor HTTP (Fase C).
+    HttpServe,
+    /// `template(texto, valores)` — interpola `{{chave}}` com escape HTML.
+    Template,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -187,6 +191,8 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "db_exec" => Some(Builtin::DbExec),
         "db_query" => Some(Builtin::DbQuery),
         "db_close" => Some(Builtin::DbClose),
+        "http_serve" => Some(Builtin::HttpServe),
+        "template" => Some(Builtin::Template),
         _ => None,
     }
 }
@@ -237,8 +243,9 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Has
         | Builtin::FsWrite
         | Builtin::FsAppend
-        | Builtin::HttpFetch => 2,
-        Builtin::DbExec | Builtin::DbQuery => 3,
+        | Builtin::HttpFetch
+        | Builtin::Template => 2,
+        Builtin::DbExec | Builtin::DbQuery | Builtin::HttpServe => 3,
         Builtin::Replace => 3,
     }
 }
@@ -380,6 +387,8 @@ impl BuiltinId {
             45 => Ok(Builtin::DbExec),
             46 => Ok(Builtin::DbQuery),
             47 => Ok(Builtin::DbClose),
+            48 => Ok(Builtin::HttpServe),
+            49 => Ok(Builtin::Template),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -436,6 +445,8 @@ impl From<Builtin> for BuiltinId {
             Builtin::DbExec => 45,
             Builtin::DbQuery => 46,
             Builtin::DbClose => 47,
+            Builtin::HttpServe => 48,
+            Builtin::Template => 49,
         };
         Self(id)
     }
@@ -1898,6 +1909,8 @@ mod tests {
             Builtin::DbExec,
             Builtin::DbQuery,
             Builtin::DbClose,
+            Builtin::HttpServe,
+            Builtin::Template,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);
