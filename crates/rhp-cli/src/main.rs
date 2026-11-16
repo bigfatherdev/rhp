@@ -1099,17 +1099,35 @@ impl Renamer<'_> {
                     cases,
                 }
             }
-            Stmt::FnDef { name, params, body } => {
+            Stmt::FnDef {
+                name,
+                params,
+                variadic,
+                body,
+            } => {
                 let renamed = self.declare(name);
+                // Defaults sao constantes (sem Vars validos); renomeia no
+                // escopo externo antes de vincular os params (como `let`).
+                let params = params
+                    .iter()
+                    .map(|p| rhp_parser::Param {
+                        name: p.name.clone(),
+                        default: p.default.as_ref().map(|e| self.expr(e)),
+                    })
+                    .collect::<Vec<_>>();
                 self.scopes.push(HashSet::new());
-                for param in params {
-                    self.declare(param);
+                for param in &params {
+                    self.declare(&param.name);
+                }
+                if let Some(rest) = variadic {
+                    self.declare(rest);
                 }
                 let body = body.iter().map(|s| self.stmt(s)).collect();
                 self.scopes.pop();
                 Stmt::FnDef {
                     name: renamed,
-                    params: params.clone(),
+                    params,
+                    variadic: variadic.clone(),
                     body,
                 }
             }
@@ -1209,14 +1227,26 @@ impl Renamer<'_> {
                 args: args.iter().map(|e| self.expr(e)).collect(),
             },
             Expr::Closure(data) => {
+                let params = data
+                    .params
+                    .iter()
+                    .map(|p| rhp_parser::Param {
+                        name: p.name.clone(),
+                        default: p.default.as_ref().map(|e| self.expr(e)),
+                    })
+                    .collect::<Vec<_>>();
                 self.scopes.push(HashSet::new());
-                for param in &data.params {
-                    self.declare(param);
+                for param in &params {
+                    self.declare(&param.name);
+                }
+                if let Some(rest) = &data.variadic {
+                    self.declare(rest);
                 }
                 let body = data.body.iter().map(|s| self.stmt(s)).collect();
                 self.scopes.pop();
                 Expr::Closure(Box::new(rhp_parser::ClosureData {
-                    params: data.params.clone(),
+                    params,
+                    variadic: data.variadic.clone(),
                     body,
                 }))
             }
@@ -1365,8 +1395,15 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
                     check_block_imports(finally_body, "em `finally`")?;
                 }
             }
-            Stmt::FnDef { body, name, .. } => {
+            Stmt::FnDef {
+                body, name, params, ..
+            } => {
                 check_block_imports(body, &format!("na funcao `{name}`"))?;
+                for param in params {
+                    if let Some(default) = &param.default {
+                        check_expr_imports(default)?;
+                    }
+                }
             }
             Stmt::Block(body) => check_block_imports(body, "em bloco")?,
             // Closure e o unico caminho de `import` aninhado via expressao
@@ -1592,7 +1629,10 @@ mod tests {
         match &renamed[1] {
             Stmt::FnDef { name, params, .. } => {
                 assert_eq!(name, "__rhp_mod0__f");
-                assert_eq!(params, &["x".to_string()]);
+                assert_eq!(
+                    params.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    ["x".to_string()]
+                );
             }
             other => panic!("esperado FnDef, obteve {other:?}"),
         }
@@ -1628,6 +1668,34 @@ mod tests {
         )
         .expect("deve passar");
         assert_eq!(buf, b"d\nb\n");
+    }
+
+    #[test]
+    fn runs_defaults_and_variadic_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "fn f(a, b = 2, ...rest) { echo a + b; echo rest; } f(1); f(10, 20, 30);",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"3\n[]\n30\n[30]\n");
+    }
+
+    #[test]
+    fn rejects_import_inside_default() {
+        // Default com closure contendo `import`: mesmo erro claro.
+        let dir = temp_dir("default-import");
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "fn f(a = (fn () { import \"outro.rhp\"; return 1; })()) { return a; }\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nivel superior"), "obteve: {err}");
     }
 
     #[test]
@@ -1704,7 +1772,13 @@ mod tests {
                 init: Some(expr), ..
             } => match expr {
                 rhp_parser::Expr::Closure(data) => {
-                    assert_eq!(data.params, &["x".to_string()]);
+                    assert_eq!(
+                        data.params
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect::<Vec<_>>(),
+                        ["x".to_string()]
+                    );
                     assert!(matches!(&data.body[0],
                         Stmt::Return { expr: Some(rhp_parser::Expr::Var(name)) }
                         if name == "x"));

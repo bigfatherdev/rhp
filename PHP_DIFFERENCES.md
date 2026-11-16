@@ -40,6 +40,14 @@ a semantica for especificada e implementada.
 - `filter` exige retorno `Bool` (erro senão); PHP usa truthiness (RHP não tem).
 - `usort` é estável (insertion sort); comparador deve retornar `Int`.
 
+## Defaults e `...rest` (RFC 0006, Fase 2)
+
+- Mesma sintaxe do PHP (`f(a, b = 2, ...rest)`); `...` sem conflito léxico
+  (RHP não usa `.` para nada).
+- Defaults restritos a expressões constantes (literais, operações entre
+  constantes, compostos de constantes), como no PHP; avaliados em compilação.
+- Sem spread em chamada, sem named arguments (fases futuras).
+
 - Sintaxe comparada (`echo`, `;`, strings) apos ampliacao da linguagem.
 - Sistema de tipos e conversoes.
 - Semantica de `echo`/`print` vs PHP.

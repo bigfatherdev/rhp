@@ -808,11 +808,23 @@ impl Vm {
     /// as seguintes retomam do `Return` com o `ip` ja posicionado).
     /// Usado por `Call` e pelo protocolo de HOFs (RFC 0005).
     fn push_call_frame(&mut self, func: FuncValue, args: Vec<Value>) -> Result<(), VmError> {
-        if func.def.params.len() != args.len() {
+        // Aridade flexivel (RFC 0006): `required` = iniciais sem padrao
+        // (parse garante: opcionais so no fim); excedentes vao para `...rest`.
+        let total = func.def.params.len();
+        let required =
+            func.def.params.len() - func.def.defaults.iter().filter(|d| d.is_some()).count();
+        if args.len() < required {
+            return Err(VmError::new(format!(
+                "funcao `{}` espera ao menos {required} argumentos, recebeu {}",
+                func.def.name,
+                args.len()
+            )));
+        }
+        if args.len() > total && func.def.variadic.is_none() {
             return Err(VmError::new(format!(
                 "funcao `{}` espera {} argumentos, recebeu {}",
                 func.def.name,
-                func.def.params.len(),
+                total,
                 args.len()
             )));
         }
@@ -823,10 +835,29 @@ impl Vm {
         }
         // Escopo unico da ativacao: ambiente capturado + parametros por
         // cima (parametro sombreia variavel capturada com o mesmo nome).
+        // Posicoes ausentes usam o padrao compilado (`null` explicito e valor,
+        // nao aciona padrao); excedentes vao para `...rest` (`[]` se nenhum).
         // Guarda de `ExitScope` preservada: base continua com 1 escopo.
         let mut scope = func.env.clone();
-        for (param, arg) in func.def.params.iter().zip(args) {
-            scope.insert(param.clone(), arg);
+        for (i, name) in func.def.params.iter().enumerate() {
+            if i < args.len() {
+                scope.insert(name.clone(), args[i].clone());
+            } else if let Some(default) = &func.def.defaults[i] {
+                scope.insert(name.clone(), default.clone());
+            } else {
+                return Err(VmError::new(format!(
+                    "funcao `{}` sem valor para `{name}` (bug interno: padrao ausente)",
+                    func.def.name
+                )));
+            }
+        }
+        if let Some(rest) = &func.def.variadic {
+            let extra = if args.len() > total {
+                args[total..].to_vec()
+            } else {
+                Vec::new()
+            };
+            scope.insert(rest.clone(), Value::Array(extra));
         }
         self.frames.push(Frame {
             code: func.def.body.code.clone(),
@@ -1593,7 +1624,7 @@ mod tests {
         // Erros claros: tipos e aridade do callback.
         assert!(run_err("echo map(1, fn (x) { return x; });").contains("array, funcao"));
         assert!(run_err("echo map([1], 42);").contains("array, funcao"));
-        assert!(run_err("echo map([1], fn (a, b) { return a; });").contains("espera 2"));
+        assert!(run_err("echo map([1], fn (a, b) { return a; });").contains("ao menos 2"));
         // `throw` no callback propaga (estado pendente descartado com o frame).
         assert_eq!(
             run_src("try { echo map([1], fn (x) { throw \"boom\"; }); } catch e { echo e; }")
@@ -1643,6 +1674,50 @@ mod tests {
         // Comparador deve retornar int.
         assert!(run_err("echo usort([2, 1], fn (a, b) { return true; });").contains("int"));
         assert!(run_err("echo usort(1, fn (a, b) { return 0; });").contains("array, funcao"));
+    }
+
+    #[test]
+    fn runs_default_and_variadic_args() {
+        // Default aplicado; expressao constante dobrada em compilacao.
+        assert_eq!(
+            run_src("fn f(a, b = 2, c = 1 + 2) { return a + b + c; } echo f(10);").expect("ok"),
+            "15\n"
+        );
+        // `null` explicito e valor (nao aciona default).
+        assert_eq!(
+            run_src(
+                "fn f(a = 1) { if a == null { return \"nulo\"; } return \"cheio\"; } echo f(null);"
+            )
+            .expect("ok"),
+            "nulo\n"
+        );
+        // `...rest` coleta excedentes (`[]` se nenhum).
+        assert_eq!(
+            run_src("fn f(a, ...rest) { return rest; } echo f(1); echo f(1, 2, 3);").expect("ok"),
+            "[]\n[2, 3]\n"
+        );
+        // Combinado: default + variadico; `...rest` sombreia captura.
+        assert_eq!(
+            run_src("let rest = 99; let f = fn (a, b = 20, ...rest) { return a + b + rest[0]; }; echo f(1, 2, 3); echo rest;")
+                .expect("ok"),
+            "6\n99\n"
+        );
+        // Callback com default funciona via HOF (mesmo caminho de chamada).
+        assert_eq!(
+            run_src("echo map([1], fn (x, y = 10) { return x + y; });").expect("ok"),
+            "[11]\n"
+        );
+        // Erros: abaixo do minimo, acima do maximo sem `...`, default nao-const.
+        assert!(run_err("fn f(a, b = 1) { return a; } echo f();").contains("ao menos 1"));
+        assert!(run_err("fn f(a) { return a; } echo f(1, 2);").contains("espera 1"));
+    }
+
+    #[test]
+    fn rejects_second_variadic_at_parse() {
+        // `...` so um e por ultimo: o segundo nao e aceito no parse.
+        let err = parse_source("fn f(a, ...r, ...s) { return a; }")
+            .expect_err("segundo `...` deve falhar");
+        assert!(err.contains("`)`"), "obteve: {err}");
     }
 
     #[test]

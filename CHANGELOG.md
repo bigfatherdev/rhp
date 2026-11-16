@@ -17,6 +17,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - HOFs com callback (RFC 0005, Fase 2): `map`/`filter`/`usort` via
   protocolo de chamada pendente na VM (`usort` estável).
   Registro: `changes/2026-11-16-feat-hofs-callback.md`.
+- Parâmetros default e variádicos (RFC 0006, Fase 2): `b = expr-const`
+  dobrado em compilação, `...rest` coletando excedentes.
+  Registro: `changes/2026-11-16-feat-args-default-variadicos.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 

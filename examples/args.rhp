@@ -1,0 +1,12 @@
+// Exemplos de parametros default e variadicos (RFC 0006).
+fn soma(a, b = 2, c = 1 + 2) { return a + b + c; }
+echo soma(10);
+echo soma(10, 20);
+
+fn mostra(primeiro, ...rest) { echo primeiro; echo rest; }
+mostra(1);
+mostra(1, 2, 3);
+
+let dobra = fn (x, fator = 2) { return x * fator; };
+echo dobra(21);
+echo map([1, 2], fn (x, passo = 10) { return x + passo; });

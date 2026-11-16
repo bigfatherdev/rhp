@@ -71,6 +71,8 @@ pub enum TokenKind {
     Semicolon,
     Comma,
     Colon,
+    /// `...` (resto de parametros, RFC 0006). `.` isolado e erro lexico.
+    Ellipsis,
     LParen,
     RParen,
     LBrace,
@@ -157,6 +159,26 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 tokens.push(Token::new(TokenKind::Colon, line, col));
                 chars.next();
                 col += 1;
+            }
+            '.' => {
+                // `...` (RFC 0006); `.`/`..` sao erro claro (RHP nao tem
+                // ponto flutuante lider nem acesso por ponto).
+                let start_col = col;
+                let mut dots = 0;
+                while chars.peek().copied().is_some_and(|(_, c)| c == '.') && dots < 3 {
+                    chars.next();
+                    dots += 1;
+                }
+                col += dots;
+                if dots == 3 {
+                    tokens.push(Token::new(TokenKind::Ellipsis, line, start_col));
+                } else {
+                    return Err(LexError::new(
+                        "esperado `...` (resto de parametros)".to_string(),
+                        line,
+                        start_col,
+                    ));
+                }
             }
             '(' => {
                 tokens.push(Token::new(TokenKind::LParen, line, col));
@@ -768,6 +790,12 @@ mod tests {
                 TokenKind::RBracket,
             ]
         );
+        assert_eq!(
+            kinds("...rest"),
+            vec![TokenKind::Ellipsis, TokenKind::Ident("rest".to_string())]
+        );
+        let err = lex("fn f(a, ..b) { }").expect_err("`..` deve falhar");
+        assert!(err.to_string().contains("..."), "obteve: {err}");
     }
 
     #[test]

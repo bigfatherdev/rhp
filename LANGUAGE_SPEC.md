@@ -68,7 +68,8 @@ TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
 ThrowStmt  := "throw" Expr ";"
 BreakStmt  := "break" ";"
 ContinueStmt := "continue" ";"
-FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
+FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" Block
+Param      := Ident ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
 ReturnStmt := "return" Expr? ";"
 ImportStmt := "import" String ";"
 ExprStmt   := Expr ";"
@@ -115,7 +116,11 @@ ExprStmt   := Expr ";"
   (inclusive `NOME[i] = v`) e erro de compilacao.
 - `fn nome(params) { ... }` declara funcao no escopo atual. Chamada
   `nome(args)` avalia callee e argumentos da esquerda para a direita;
-  aridade deve coincidir. `return e;` sai da funcao com o valor (`return;`
+  aridade: sem defaults/`...`, exata; com defaults, ao menos os
+  obrigatorios (iniciais; obrigatorio apos opcional e erro de parse);
+  `...rest` (no maximo um, por ultimo) coleta excedentes em `Array`
+  (`[]` se nenhum). Ausentes usam o padrao compilado (`null` explicito
+  e valor, nao aciona padrao). `return e;` sai da funcao com o valor (`return;`
   retorna `null`); fim do corpo sem `return` tambem retorna `null`.
   `return` fora de funcao e erro de compilacao. Recursao permitida ate
   `MAX_CALL_DEPTH = 512` (erro apos o limite). Funcoes enxergam parametros,

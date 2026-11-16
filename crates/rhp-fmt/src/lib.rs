@@ -5,7 +5,7 @@
 //! exatamente uma quebra de linha. O formatador e idempotente:
 //! `format(parse(format(p))) == format(p)`.
 
-use rhp_parser::{AssignTarget, BinOp, Expr, Program, Stmt, UnaryOp};
+use rhp_parser::{AssignTarget, BinOp, Expr, Param, Program, Stmt, UnaryOp};
 use std::fmt::Write as _;
 
 /// Formata o programa no estilo canonico.
@@ -168,9 +168,18 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str("}\n");
         }
-        Stmt::FnDef { name, params, body } => {
+        Stmt::FnDef {
+            name,
+            params,
+            variadic,
+            body,
+        } => {
             indent(level, out);
-            let _ = writeln!(out, "fn {name}({}) {{", params.join(", "));
+            let _ = writeln!(
+                out,
+                "fn {name}({}) {{",
+                fmt_params(params, variadic.as_deref())
+            );
             fmt_block(body, level + 1, out);
             indent(level, out);
             out.push_str("}\n");
@@ -227,6 +236,21 @@ fn fmt_block(stmts: &[Stmt], level: usize, out: &mut String) {
     for stmt in stmts {
         fmt_stmt(stmt, level, out);
     }
+}
+
+/// Lista de parametros canonica: `a, b = <expr>, ...rest` (RFC 0006).
+fn fmt_params(params: &[Param], variadic: Option<&str>) -> String {
+    let mut parts: Vec<String> = params
+        .iter()
+        .map(|p| match &p.default {
+            Some(d) => format!("{} = {}", p.name, fmt_expr(d, 0)),
+            None => p.name.clone(),
+        })
+        .collect();
+    if let Some(rest) = variadic {
+        parts.push(format!("...{rest}"));
+    }
+    parts.join(", ")
 }
 
 /// Precedencia para parenteses minimos (maior = liga mais forte).
@@ -358,7 +382,10 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             // nivel absoluto — aceito nesta etapa, ver RFC 0003 §7).
             let mut body = String::new();
             fmt_block(&data.body, 1, &mut body);
-            format!("fn ({}) {{\n{body}}}", data.params.join(", "))
+            format!(
+                "fn ({}) {{\n{body}}}",
+                fmt_params(&data.params, data.variadic.as_deref())
+            )
         }
     }
 }
@@ -446,6 +473,16 @@ mod tests {
         check_idempotent(
             "while i < 3 { switch i { case 2 { continue; } default { echo i; break; } } }",
         );
+    }
+
+    #[test]
+    fn formats_defaults_and_variadic() {
+        assert_eq!(
+            fmt("fn f(a,b=2,...rest){return a;}"),
+            "fn f(a, b = 2, ...rest) {\n  return a;\n}\n"
+        );
+        check_idempotent("let g = fn (a = 1 + 2, ...r) { return a; };");
+        check_idempotent("fn f(a = [1, 2], b = {x: 1}) { return a; }");
     }
 
     #[test]

@@ -73,6 +73,10 @@ impl fmt::Display for Value {
 pub struct FuncDef {
     pub name: String,
     pub params: Vec<String>,
+    /// Padrao por posicao (`None` = obrigatorio; RFC 0006). Alinhado a `params`.
+    pub defaults: Vec<Option<Value>>,
+    /// `...rest` (no maximo um, por ultimo; RFC 0006).
+    pub variadic: Option<String>,
     pub body: Chunk,
 }
 
@@ -852,6 +856,160 @@ enum ConstKey {
     Null,
 }
 
+/// Avalia expressao constante (defaults de parametros, RFC 0006) para
+/// `Value` em tempo de compilacao. Espelha as regras de `LANGUAGE_SPEC`
+/// §4 para os casos suportados; resto (variaveis, chamadas, closures,
+/// indice, ternario) e erro: padrao deve ser constante.
+fn eval_const_expr(expr: &Expr) -> Result<Value, CompileError> {
+    let not_const = || {
+        CompileError::new(
+            "padrao de parametro deve ser expressao constante (literal, operacao entre constantes ou composto de constantes)".to_string(),
+        )
+    };
+    match expr {
+        Expr::StringLiteral(s) => Ok(Value::Str(s.clone())),
+        Expr::Int(n) => Ok(Value::Int(*n)),
+        Expr::Float(x) => Ok(Value::Float(*x)),
+        Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Null => Ok(Value::Null),
+        Expr::Array(items) => items
+            .iter()
+            .map(eval_const_expr)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Expr::Map(entries) => entries
+            .iter()
+            .map(|(k, v)| eval_const_expr(v).map(|folded| (k.clone(), folded)))
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()
+            .map(Value::Map),
+        Expr::Unary { op, expr } => {
+            let v = eval_const_expr(expr)?;
+            match (op, v) {
+                (UnaryOp::Neg, Value::Int(n)) => n.checked_neg().map(Value::Int).ok_or_else(|| {
+                    CompileError::new("estouro de `Int` em expressao constante".to_string())
+                }),
+                (UnaryOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
+                (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+                (UnaryOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
+                _ => Err(CompileError::new(
+                    "operacao unaria invalida em expressao constante".to_string(),
+                )),
+            }
+        }
+        Expr::Binary { op, left, right } => {
+            let l = eval_const_expr(left)?;
+            let r = eval_const_expr(right)?;
+            eval_const_binary(*op, l, r)
+        }
+        _ => Err(not_const()),
+    }
+}
+
+/// Aplica operador binario a valores constantes (regras de `LANGUAGE_SPEC` §4).
+fn eval_const_binary(op: BinOp, l: Value, r: Value) -> Result<Value, CompileError> {
+    use Value::{Bool as B, Float as F, Int as I, Str as S};
+    let invalid = || {
+        CompileError::new(
+            "operacao invalida em expressao constante (tipos incompativeis)".to_string(),
+        )
+    };
+    match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+            let num_err =
+                || CompileError::new("aritmetica em expressao constante exige numeros".to_string());
+            match (l, r) {
+                (I(a), I(b)) => {
+                    let res = match op {
+                        BinOp::Add => a.checked_add(b),
+                        BinOp::Sub => a.checked_sub(b),
+                        BinOp::Mul => a.checked_mul(b),
+                        BinOp::Div => (b != 0).then(|| a / b),
+                        _ => (b != 0).then(|| a % b),
+                    };
+                    res.map(I).ok_or_else(|| {
+                        CompileError::new(
+                            "estouro de `Int` ou divisao por zero em expressao constante"
+                                .to_string(),
+                        )
+                    })
+                }
+                (F(a), F(b)) => {
+                    if matches!(op, BinOp::Div | BinOp::Mod) && b == 0.0 {
+                        return Err(CompileError::new(
+                            "divisao por zero em expressao constante".to_string(),
+                        ));
+                    }
+                    let res = match op {
+                        BinOp::Add => a + b,
+                        BinOp::Sub => a - b,
+                        BinOp::Mul => a * b,
+                        BinOp::Div => a / b,
+                        _ => a % b,
+                    };
+                    Ok(F(res))
+                }
+                (I(a), F(b)) => eval_const_binary(op, F(a as f64), F(b)),
+                (F(a), I(b)) => eval_const_binary(op, F(a), F(b as f64)),
+                (S(a), S(b)) if matches!(op, BinOp::Add) => Ok(S(a + &b)),
+                _ => Err(num_err()),
+            }
+        }
+        BinOp::Eq => Ok(B(const_eq(&l, &r))),
+        BinOp::Ne => Ok(B(!const_eq(&l, &r))),
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            let ord = match (&l, &r) {
+                (I(a), I(b)) => a.partial_cmp(b),
+                (F(a), F(b)) => a.partial_cmp(b),
+                (I(a), F(b)) => (*a as f64).partial_cmp(b),
+                (F(a), I(b)) => a.partial_cmp(&(*b as f64)),
+                (S(a), S(b)) => Some(a.cmp(b)),
+                _ => None,
+            };
+            match ord {
+                Some(o) => Ok(B(match op {
+                    BinOp::Lt => o.is_lt(),
+                    BinOp::Le => o.is_le(),
+                    BinOp::Gt => o.is_gt(),
+                    _ => o.is_ge(),
+                })),
+                None => Err(invalid()),
+            }
+        }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => match (l, r) {
+            (I(a), I(b)) => Ok(I(match op {
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                _ => a ^ b,
+            })),
+            _ => Err(invalid()),
+        },
+        BinOp::Shl | BinOp::Shr => match (l, r) {
+            (I(a), I(b)) if (0..64).contains(&b) => Ok(I(match op {
+                BinOp::Shl => a << b,
+                _ => a >> b,
+            })),
+            _ => Err(CompileError::new(
+                "deslocamento invalido em expressao constante (0-63)".to_string(),
+            )),
+        },
+        BinOp::NullCoalesce => Ok(match l {
+            Value::Null => r,
+            v => v,
+        }),
+    }
+}
+
+/// Igualdade de constantes: numeros com promocao, resto por tipo/valor.
+fn const_eq(l: &Value, r: &Value) -> bool {
+    match (l, r) {
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Int(a), Value::Float(b)) => *a as f64 == *b,
+        (Value::Float(a), Value::Int(b)) => *a == *b as f64,
+        _ => l == r,
+    }
+}
+
 impl Compiler {
     fn new(in_function: bool) -> Self {
         Self {
@@ -962,17 +1120,31 @@ impl Compiler {
 
     /// Compila o corpo de uma funcao (nomeada ou closure) em compilador
     /// aninhado, registra o `FuncDef` na tabela e devolve o indice.
-    /// Usado por `Stmt::FnDef` e `Expr::Closure` (RFC 0003).
+    /// Usado por `Stmt::FnDef` e `Expr::Closure` (RFC 0003); defaults e
+    /// `...rest` pela RFC 0006 (defaults dobrados para `Value` aqui).
     fn compile_func_body(
         &mut self,
         name: &str,
-        params: &[String],
+        params: &[rhp_parser::Param],
+        variadic: Option<&str>,
         body: &[Stmt],
     ) -> Result<u32, CompileError> {
         let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::with_capacity(params.len());
+        let mut defaults = Vec::with_capacity(params.len());
         for param in params {
-            if !seen.insert(param) {
-                return Err(CompileError::new(format!("parametro duplicado: {param}")));
+            if !seen.insert(param.name.clone()) {
+                return Err(CompileError::new(format!(
+                    "parametro duplicado: {}",
+                    param.name
+                )));
+            }
+            names.push(param.name.clone());
+            defaults.push(param.default.as_ref().map(eval_const_expr).transpose()?);
+        }
+        if let Some(rest) = variadic {
+            if !seen.insert(rest.to_string()) {
+                return Err(CompileError::new(format!("parametro duplicado: {rest}")));
             }
         }
         let mut fn_compiler = Compiler::new(true);
@@ -988,7 +1160,9 @@ impl Compiler {
         }
         self.chunk.funcs.push(FuncDef {
             name: name.to_string(),
-            params: params.to_vec(),
+            params: names,
+            defaults,
+            variadic: variadic.map(str::to_string),
             body: body_chunk,
         });
         Ok((self.chunk.funcs.len() - 1) as u32)
@@ -1488,8 +1662,13 @@ impl Compiler {
             } => {
                 self.compile_switch(discriminant, cases)?;
             }
-            Stmt::FnDef { name, params, body } => {
-                let func_idx = self.compile_func_body(name, params, body)?;
+            Stmt::FnDef {
+                name,
+                params,
+                variadic,
+                body,
+            } => {
+                let func_idx = self.compile_func_body(name, params, variadic.as_deref(), body)?;
                 self.intern_name(name)?;
                 self.emit(Op::DefineFunc(func_idx));
             }
@@ -1712,7 +1891,12 @@ impl Compiler {
                 }
             }
             Expr::Closure(data) => {
-                let func_idx = self.compile_func_body("{closure}", &data.params, &data.body)?;
+                let func_idx = self.compile_func_body(
+                    "{closure}",
+                    &data.params,
+                    data.variadic.as_deref(),
+                    &data.body,
+                )?;
                 self.emit(Op::MakeFunc(func_idx));
             }
         }
@@ -1843,6 +2027,37 @@ mod tests {
         let program = parse_source("echo map([1]);").expect("parse deve passar");
         let err = compile(&program).expect_err("aridade deve falhar");
         assert!(err.message.contains("espera 2"));
+    }
+
+    #[test]
+    fn compiles_defaults_and_variadic() {
+        // Defaults dobrados para `Value`; `...rest` registrado.
+        let chunk = compile_src("fn f(a, b = 2, c = 1 + 2, ...rest) { return a; }");
+        assert_eq!(chunk.funcs.len(), 1);
+        let def = &chunk.funcs[0];
+        assert_eq!(
+            def.params,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            def.defaults,
+            vec![None, Some(Value::Int(2)), Some(Value::Int(3))]
+        );
+        assert_eq!(def.variadic, Some("rest".to_string()));
+        // Nao-constante rejeitada; divisao por zero em constante tambem.
+        let program = parse_source("fn f(a = b) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("default nao-const deve falhar");
+        assert!(err.message.contains("constante"));
+        let program = parse_source("fn f(a = 1 / 0) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("divisao por zero deve falhar");
+        assert!(err.message.contains("divisao por zero"));
+        // Duplicata (incluindo `...rest` repetindo param) rejeitada.
+        let program = parse_source("fn f(a, a) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("duplicata deve falhar");
+        assert!(err.message.contains("duplicado"));
+        let program = parse_source("fn f(a, ...a) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("rest duplicado deve falhar");
+        assert!(err.message.contains("duplicado"));
     }
 
     #[test]
@@ -2236,6 +2451,8 @@ mod tests {
         let func = Rc::new(FuncDef {
             name: "f".to_string(),
             params: vec![],
+            defaults: vec![],
+            variadic: None,
             body: Chunk::new(),
         });
         assert_eq!(

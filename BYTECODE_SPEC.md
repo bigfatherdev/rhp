@@ -6,7 +6,7 @@
 pub enum Value { Null, Bool(bool), Int(i64), Float(f64), Str(String),
                  Array(Vec<Value>), Map(HashMap<String, Value>), Func(FuncValue) }
 pub struct FuncValue { pub def: Rc<FuncDef>, pub env: HashMap<String, Value> }
-pub struct FuncDef { pub name: String, pub params: Vec<String>, pub body: Chunk }
+pub struct FuncDef { pub name: String, pub params: Vec<String>, pub defaults: Vec<Option<Value>>, pub variadic: Option<String>, pub body: Chunk }
 pub struct Chunk {
     pub constants: Vec<Value>, // pool indexado por u32
     pub names: Vec<String>,    // pool de nomes de variaveis/funcoes

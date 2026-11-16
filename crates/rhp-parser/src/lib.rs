@@ -124,7 +124,9 @@ pub enum Stmt {
     },
     FnDef {
         name: String,
-        params: Vec<String>,
+        params: Vec<Param>,
+        /// `...rest` (no maximo um, por ultimo; RFC 0006).
+        variadic: Option<String>,
         body: Vec<Stmt>,
     },
     Return {
@@ -157,6 +159,14 @@ pub enum Stmt {
 pub struct ImportName {
     pub name: String,
     pub alias: Option<String>,
+}
+
+/// Parametro de funcao/closure: nome + padrao opcional (constante, RFC 0006).
+/// O `...rest` (variadico, por ultimo) vai em `variadic`, nao aqui.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub default: Option<Expr>,
 }
 
 /// Ramo de `switch`: `cond: None` e o `default` (unico, posicao livre).
@@ -223,7 +233,9 @@ pub enum Expr {
 /// Corpo de closure, sempre heap-alocado (ver `Expr::Closure`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClosureData {
-    pub params: Vec<String>,
+    pub params: Vec<Param>,
+    /// `...rest` (no maximo um, por ultimo; RFC 0006).
+    pub variadic: Option<String>,
     pub body: Vec<Stmt>,
 }
 
@@ -686,31 +698,82 @@ fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
     let name = expect_ident(cursor)?;
-    let params = parse_params_list(cursor, "apos nome da funcao")?;
+    let (params, variadic) = parse_params_list(cursor, "apos nome da funcao")?;
     let body = parse_block(cursor)?;
-    Ok(Stmt::FnDef { name, params, body })
+    Ok(Stmt::FnDef {
+        name,
+        params,
+        variadic,
+        body,
+    })
 }
 
-/// Lista de parametros `(a, b, ...)`: `(` ja deve ser o proximo token.
-fn parse_params_list(cursor: &mut Cursor<'_>, context: &str) -> Result<Vec<String>, ParseError> {
+/// Lista de parametros `(a, b = expr, ...rest)`: `(` ja deve ser o proximo.
+/// Retorna `(params, variadic)`. Regras (RFC 0006): `...rest` so por ultimo;
+/// obrigatorio apos opcional e erro; duplicatas sao checadas na compilacao.
+fn parse_params_list(
+    cursor: &mut Cursor<'_>,
+    context: &str,
+) -> Result<(Vec<Param>, Option<String>), ParseError> {
     expect_token(
         cursor,
         &TokenKind::LParen,
         &format!("esperado `(` {context}"),
     )?;
     let mut params = Vec::new();
+    let mut variadic = None;
+    let mut seen_optional = false;
     if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RParen)) {
         loop {
-            params.push(expect_ident(cursor)?);
+            if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Ellipsis)) {
+                cursor.next();
+                let name_tok = cursor.next().ok_or_else(|| {
+                    let (line, col) = cursor.end_pos();
+                    ParseError::new("esperado nome apos `...` (resto de parametros)", line, col)
+                })?;
+                match &name_tok.kind {
+                    TokenKind::Ident(name) => {
+                        variadic = Some(name.clone());
+                    }
+                    other => {
+                        return Err(ParseError::new(
+                            format!("esperado nome apos `...`, encontrado {}", describe(other)),
+                            name_tok.line,
+                            name_tok.col,
+                        ));
+                    }
+                }
+                break;
+            }
+            let name = expect_ident(cursor)?;
+            let default = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Assign)) {
+                cursor.next();
+                seen_optional = true;
+                Some(parse_expr(cursor)?)
+            } else {
+                if seen_optional {
+                    let (line, col) = cursor.end_pos();
+                    return Err(ParseError::new(
+                        "parametro obrigatorio apos opcional (reordene: opcionais por ultimo)"
+                            .to_string(),
+                        line,
+                        col,
+                    ));
+                }
+                None
+            };
+            params.push(Param { name, default });
             if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
                 cursor.next();
+                // `, ...rest` ou `, )`: continua o laco (o `...`/`)` decide).
+                continue;
             } else {
                 break;
             }
         }
     }
     expect_token(cursor, &TokenKind::RParen, "esperado `)` apos parametros")?;
-    Ok(params)
+    Ok((params, variadic))
 }
 
 /// Argumentos de chamada `(a, b, ...)`: `(` ja deve ser o proximo token.
@@ -1195,10 +1258,14 @@ fn parse_primary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         }
         TokenKind::Fn => {
             // `tok` ja consumiu `fn`; `(` vem a seguir ou e erro claro.
-            let params =
+            let (params, variadic) =
                 parse_params_list(cursor, "apos `fn` (funcao anonima usa `fn (args) { }`)")?;
             let body = parse_block(cursor)?;
-            Ok(Expr::Closure(Box::new(ClosureData { params, body })))
+            Ok(Expr::Closure(Box::new(ClosureData {
+                params,
+                variadic,
+                body,
+            })))
         }
         TokenKind::LParen => {
             let expr = parse_expr(cursor)?;
@@ -1327,6 +1394,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Else => "`else`".to_string(),
         TokenKind::While => "`while`".to_string(),
         TokenKind::For => "`for`".to_string(),
+        TokenKind::Ellipsis => "`...`".to_string(),
         TokenKind::Switch => "`switch`".to_string(),
         TokenKind::Case => "`case`".to_string(),
         TokenKind::Default => "`default`".to_string(),
@@ -1594,6 +1662,66 @@ mod tests {
         assert!(err.to_string().contains("`case`"), "obteve: {err}");
         // `default` fora de `switch` tambem nao.
         lex_and_parse("default { echo 1; }").expect_err("default solto deve falhar");
+    }
+
+    #[test]
+    fn parses_params_with_defaults_and_variadic() {
+        let program = lex_and_parse("fn f(a, b = 2, c = 1 + 2, ...rest) { return a; }")
+            .expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::FnDef {
+                name: "f".to_string(),
+                params: vec![
+                    Param {
+                        name: "a".to_string(),
+                        default: None,
+                    },
+                    Param {
+                        name: "b".to_string(),
+                        default: Some(Expr::Int(2)),
+                    },
+                    Param {
+                        name: "c".to_string(),
+                        default: Some(Expr::Binary {
+                            op: BinOp::Add,
+                            left: Box::new(Expr::Int(1)),
+                            right: Box::new(Expr::Int(2)),
+                        }),
+                    },
+                ],
+                variadic: Some("rest".to_string()),
+                body: vec![Stmt::Return {
+                    expr: Some(Expr::Var("a".to_string())),
+                }],
+            }]
+        );
+        // Closure aceita a mesma forma.
+        let program =
+            lex_and_parse("let f = fn (a = \"x\") { return a; };").expect("parse deve passar");
+        match &program.statements[0] {
+            Stmt::Let {
+                init: Some(Expr::Closure(data)),
+                ..
+            } => {
+                assert_eq!(data.params.len(), 1);
+                assert!(data.params[0].default.is_some());
+                assert_eq!(data.variadic, None);
+            }
+            other => panic!("esperado closure, obteve {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_param_forms() {
+        // Obrigatorio apos opcional.
+        let err = lex_and_parse("fn f(a = 1, b) { }").expect_err("deve falhar");
+        assert!(err.to_string().contains("apos opcional"), "obteve: {err}");
+        // `...` no meio.
+        let err = lex_and_parse("fn f(...r, b) { }").expect_err("deve falhar");
+        assert!(err.to_string().contains("`)`"), "obteve: {err}");
+        // `...` sem nome.
+        lex_and_parse("fn f(...) { }").expect_err("`...` sem nome deve falhar");
     }
 
     #[test]
