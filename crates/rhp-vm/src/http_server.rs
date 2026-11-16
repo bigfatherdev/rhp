@@ -30,6 +30,8 @@ const MAX_BODY: usize = 1024 * 1024;
 const MAX_HEADERS: usize = 64 * 1024;
 /// Teto de conexoes simultaneas permitido em `max_conexoes`.
 const MAX_CONNS_HARD: u64 = 1024;
+/// Teto de IPs rastreados no rate limit (eviccao grosseira: limpa tudo).
+const MAX_TRACKED_IPS: usize = 4096;
 
 /// Opcoes de `http_serve` (tudo opcional).
 #[derive(Debug, Clone)]
@@ -37,6 +39,8 @@ pub struct ServeOpts {
     pub max_conexoes: u64,
     /// 0 = servir para sempre; N = servir N requests e retornar.
     pub max_requisicoes: u64,
+    /// Teto de requests/segundo por IP (0 = sem limite).
+    pub limite_taxa: u64,
 }
 
 impl Default for ServeOpts {
@@ -44,8 +48,41 @@ impl Default for ServeOpts {
         Self {
             max_conexoes: 32,
             max_requisicoes: 0,
+            limite_taxa: 0,
         }
     }
+}
+
+/// Decisao de rate limit (janela fixa de 1 s por IP; `agora` em segundos).
+/// Pura para teste deterministico; o servidor passa o relogio real.
+fn permite(
+    contadores: &mut HashMap<std::net::IpAddr, (u64, u32)>,
+    ip: std::net::IpAddr,
+    agora: u64,
+    limite: u64,
+) -> bool {
+    if limite == 0 {
+        return true;
+    }
+    if contadores.len() >= MAX_TRACKED_IPS {
+        contadores.clear();
+    }
+    let slot = contadores.entry(ip).or_insert((agora, 0));
+    if slot.0 != agora {
+        *slot = (agora, 0);
+    }
+    if u64::from(slot.1) >= limite {
+        return false;
+    }
+    slot.1 += 1;
+    true
+}
+
+fn agora_segundos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Controle compartilhado entre accept-loop e workers.
@@ -98,7 +135,7 @@ pub(super) fn serve_builtin(
     serve(port, &handler, &opts, &program)
 }
 
-/// Valida o mapa de `opts` (`max_conexoes`, `max_requisicoes`).
+/// Valida o mapa de `opts` (`max_conexoes`, `max_requisicoes`, `limite_taxa`).
 fn parse_serve_opts(opts: &HashMap<String, Value>) -> Result<ServeOpts, VmError> {
     let mut parsed = ServeOpts::default();
     for (key, value) in opts {
@@ -125,9 +162,20 @@ fn parse_serve_opts(opts: &HashMap<String, Value>) -> Result<ServeOpts, VmError>
                     )));
                 }
             },
+            "limite_taxa" => match value {
+                Value::Int(n) if *n >= 0 => {
+                    parsed.limite_taxa = *n as u64;
+                }
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_serve`: `limite_taxa` exige >= 0, encontrado {}",
+                        type_name(other)
+                    )));
+                }
+            },
             unknown => {
                 return Err(VmError::new(format!(
-                    "`http_serve`: opcao desconhecida `{unknown}` (use `max_conexoes`, `max_requisicoes`)"
+                    "`http_serve`: opcao desconhecida `{unknown}` (use `max_conexoes`, `max_requisicoes`, `limite_taxa`)"
                 )));
             }
         }
@@ -174,6 +222,8 @@ pub fn serve(
         concluidos: AtomicU64::new(0),
     });
     let max_req = opts.max_requisicoes;
+    let limite = opts.limite_taxa;
+    let mut taxas: HashMap<std::net::IpAddr, (u64, u32)> = HashMap::new();
     loop {
         if ctl.done.load(Ordering::SeqCst) {
             break;
@@ -196,6 +246,21 @@ pub fn serve(
                 ctl.done.store(true, Ordering::SeqCst);
             }
             continue;
+        }
+        if limite > 0 {
+            let ip = stream.peer_addr().map(|a| a.ip());
+            let ok = match ip {
+                Ok(ip) => permite(&mut taxas, ip, agora_segundos(), limite),
+                Err(_) => true,
+            };
+            if !ok {
+                let _ = respond_429(&stream);
+                ctl.concluidos.fetch_add(1, Ordering::SeqCst);
+                if max_req > 0 && ctl.concluidos.load(Ordering::SeqCst) >= max_req {
+                    ctl.done.store(true, Ordering::SeqCst);
+                }
+                continue;
+            }
         }
         ctl.ativas.fetch_add(1, Ordering::SeqCst);
         let worker_ctl = Arc::clone(&ctl);
@@ -711,6 +776,23 @@ fn respond_503(stream: &TcpStream) -> Result<(), String> {
     )
 }
 
+fn respond_429(stream: &TcpStream) -> Result<(), String> {
+    write_response(
+        stream,
+        &HttpResponse {
+            status: 429,
+            headers: vec![
+                (
+                    "content-type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                ),
+                ("retry-after".to_string(), "1".to_string()),
+            ],
+            body: b"limite de requisicoes excedido".to_vec(),
+        },
+    )
+}
+
 /// Resposta 500 generica (sem vazar detalhe) + log em stderr.
 fn respond_500(stream: &TcpStream) -> Result<(), String> {
     write_response(
@@ -724,4 +806,43 @@ fn respond_500(stream: &TcpStream) -> Result<(), String> {
             body: b"erro interno".to_vec(),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, n))
+    }
+
+    #[test]
+    fn rate_limit_allows_burst_then_blocks() {
+        let mut contadores = HashMap::new();
+        // limite 2/s: 2 passam, 3o bloqueia, proximo segundo reseta.
+        assert!(permite(&mut contadores, ip(1), 100, 2));
+        assert!(permite(&mut contadores, ip(1), 100, 2));
+        assert!(!permite(&mut contadores, ip(1), 100, 2));
+        assert!(permite(&mut contadores, ip(1), 101, 2));
+        // IPs independentes; 0 = sem limite.
+        assert!(permite(&mut contadores, ip(2), 101, 2));
+        assert!(permite(&mut contadores, ip(1), 101, 0));
+    }
+
+    #[test]
+    fn rejects_bad_serve_opts() {
+        let bad: HashMap<String, Value> =
+            [("teto".to_string(), Value::Int(1))].into_iter().collect();
+        assert!(parse_serve_opts(&bad).is_err());
+        let bad: HashMap<String, Value> = [("limite_taxa".to_string(), Value::Int(-1))]
+            .into_iter()
+            .collect();
+        assert!(parse_serve_opts(&bad).is_err());
+        let ok: HashMap<String, Value> = [("limite_taxa".to_string(), Value::Int(10))]
+            .into_iter()
+            .collect();
+        let opts = parse_serve_opts(&ok).expect("opts validos");
+        assert_eq!(opts.limite_taxa, 10);
+    }
 }

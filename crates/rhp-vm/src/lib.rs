@@ -21,6 +21,7 @@ mod json;
 mod pg;
 mod sqlite;
 mod time;
+mod tls;
 
 /// Profundidade maxima da pilha de chamadas (protecao contra estouro).
 pub const MAX_CALL_DEPTH: usize = 512;
@@ -1752,9 +1753,9 @@ mod tests {
             let err = run_err(bad);
             assert!(err.contains("http_fetch"), "obteve: {err} em {bad}");
         }
-        // `https://` rejeitado (sem TLS nesta fase).
-        let err = run_err("echo http_fetch(\"https://x/\", {});");
-        assert!(err.contains("http://"), "obteve: {err}");
+        // `https://` aceito como esquema (falha so na conexao, nao no parse).
+        let err = run_err("echo http_fetch(\"https://127.0.0.1:1/\", {});");
+        assert!(err.contains("conectar"), "obteve: {err}");
         // `http_get` estrito nao mudou (redirect = erro `retornou status`).
     }
 

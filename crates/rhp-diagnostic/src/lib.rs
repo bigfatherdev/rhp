@@ -297,7 +297,7 @@ pub fn runtime_code(message: &str) -> (&'static str, Option<&'static str>) {
             "E3010",
             Some("aumente o teto ou reduza o trabalho (ver --max-steps)"),
         )
-    } else if message.contains("http_get") {
+    } else if message.contains("http_get") || message.contains("http_fetch") {
         ("E3011", Some("use http://, 2xx e corpo UTF-8 ate 1 MiB"))
     } else {
         ("E3000", None)

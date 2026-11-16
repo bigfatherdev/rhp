@@ -16,10 +16,11 @@
 - [x] CP7 Seguranca: limites documentados/testados, sem sandbox ficticia.
 - [x] CP8 Performance: harness + baseline; nenhuma otimizacao sem prova.
 - [x] CP9 Documentacao: specs/ADRs/README/CHANGELOG consistentes.
-- [ ] Pendente (requer aprovacao): RFC de tipos, exports/gerenciador de
-  pacotes, PG/Redis com servidores reais, async (runtime), classes/generics,
-  LSP, `rhp fmt` preservando comentarios e linhas em branco, otimizacoes com
-  protocolo antes/depois.
+- [ ] Pendente (requer aprovacao): RFC de tipos, re-export/gerenciador de
+  pacotes (Fase D cobre pacotes v0), Redis com servidor real, async
+  (runtime), classes/generics, LSP, `rhp fmt` preservando comentarios e
+  linhas em branco, otimizacoes com protocolo antes/depois. (Concluído
+  desde então: exports base, PG com servidor real.)
 
 - [x] CHECKPOINT 1: `reports/AUDIT_MASTER.md` (1 P0, 5 P1, 13 P2, 10 P3, 7 P4).
 - [x] CHECKPOINT 3: P0/P1 corrigidos (teto de profundidade 128, fmt roundtrip,
@@ -33,9 +34,10 @@
 - [x] CHECKPOINT 2: README reestruturado + `docs/` + `CONTRIBUTING.md` +
   `SECURITY.md`.
 - [ ] Pendente (requer aprovação/planejamento): P2 restantes de baixo risco,
-  RFC de tipos, exports/gerenciador de pacotes, PG/Redis com servidores reais,
-  async (runtime), classes/generics, LSP, otimizações com protocolo
-  antes/depois.
+  RFC de tipos, re-export/gerenciador de pacotes (Fase D cobre pacotes v0),
+  Redis com servidor real, async (runtime), classes/generics, LSP,
+  otimizações com protocolo antes/depois. (Concluído desde então: exports
+  base, PG com servidor real, `rhp fmt` idempotente atual.)
 
 ## Fase 7 — Paridade PHP, lote imediato (em andamento, 2026-11-15)
 
@@ -58,11 +60,12 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 - [x] JSON std-only: `json_parse`/`json_stringify` sem dependencias, com
   teto de 128 niveis e erros com posicao
   (  `changes/2026-11-15-feat-json.md`).
-- [ ] Pendente (ordem tecnica): datas/horas, `switch`,
-  `sort`/`filter` com callback (exige primeira-classe), args
-  default/variadicos, destructuring; depois excecoes, closures,
-  namespaces/exports, pacotes, rede v2, tipos, OO, async/DBs/servidor
-  (todos exigem RFC/ADR e gates, cf. auditoria §21).
+- [ ] Pendente (ordem tecnica; o resto do lote imediato saiu nas Fases
+  A–C): `switch`, `sort`/`filter` com callback (exige primeira-classe),
+  args default/variadicos, destructuring; depois closures,
+  namespaces/exports (restante: re-export), pacotes, tipos, OO,
+  async/DBs (restante: Redis), LSP/debugger completos (todos exigem
+  RFC/ADR e gates, cf. auditoria §21).
 
 ## Fases A–D — RHP para sites/sistemas (plano aprovado, em andamento)
 
@@ -79,7 +82,13 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 - [x] C1: RFC 0002 — concorrência + servidor.
 - [x] C2: `http_serve` (thread por conexão, handler stateless, 500 sem vazar).
 - [x] C3: cookies, `template()` com escape, padrão sessão-via-banco.
-- [ ] Fase D: produção (TLS via ADR, pacotes v0, `rhp build`, auth, limites, release `0.y.0`).
+- [x] D1: ADR 0012 — TLS (rustls puro + raízes embutidas).
+- [x] D2: `https://` no `http_fetch` (upgrade seguido, downgrade recusado,
+  `RHP_CA_BUNDLE`).
+- [x] D3: pacotes v0 (`rhp init`, `rhp pkg add/install [--check]`,
+  `pacotes/` + `rhp.lock`).
+- [x] D4: `rhp build` (bundle autocontido) + limite de taxa no servidor.
+- [ ] D5: release `0.1.0` (changelog consolidado + tag).
 
 ## Fase 1 — Fundacao (concluida em 2026-11-14)
 

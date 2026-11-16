@@ -4,6 +4,8 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ## [unreleased]
 
+## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
+
 ### Added
 
 - Primeira fatia vertical do RHP: `hello.rhp`, lexer, parser/AST, geracao de
@@ -76,6 +78,15 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - Sessões e templates: cookies em `req`, `template()` com escape HTML,
   padrão sessão-via-banco documentado.
   Registro: `changes/2026-11-15-feat-sessao-template.md`.
+- HTTPS: `http_fetch` com TLS verificado (rustls + raízes embutidas +
+  `RHP_CA_BUNDLE`; ADR 0012). Fase D iniciada.
+  Registro: `changes/2026-11-15-feat-https.md`.
+- Pacotes v0: `rhp init`, `rhp pkg add/install [--check]`, `pacotes/` +
+  `rhp.lock` com hash por arquivo.
+  Registro: `changes/2026-11-15-feat-pacotes.md`.
+- `rhp build` (bundle autocontido para deploy) + `limite_taxa` no
+  servidor (429 com `Retry-After`).
+  Registro: `changes/2026-11-15-feat-build-ratelimit.md`.
 - Fase 6 (rede minima): builtin `http_get` std-only (so `http://`, 5s, 2xx)
   verificado contra servidor local; fronteira honesta para PostgreSQL/Redis,
   async, classes/generics (ADR 0004, planejados e NAO implementados).
