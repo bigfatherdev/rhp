@@ -16,7 +16,8 @@ posição, `break` saindo do `switch`.
 
 Objetivo: `switch expr { case expr { ... } default { ... } }` com a
 comparacao `==` do RHP (fatia): fallthrough, `default` unico em qualquer
-posicao, `break` no `switch`, `continue` atravessando para o laco externo.
+posicao, `break` no `switch`, `continue` com semantica PHP (em `switch`
+age como `break`; `continue N` conta niveis incluindo `switch`).
 
 Não-objetivos: `break N` (RHP não tem `break` com argumento em lugar nenhum),
 `endswitch` (RHP não tem sintaxe alternativa), `match` estrito (fase futura),
@@ -37,9 +38,10 @@ múltiplos `default` (erro), tipos restritos de discriminante (qualquer `==`).
   (preguiçoso — efeitos colaterais só até o match, como PHP).
 - Fallthrough: sem `break`, o controle cai no próximo case/default.
 - `break` liga ao `switch` mais interno (registrado como contexto
-  "breakable"); `continue` **ignora** contextos `switch` e mira o laço mais
-  interno (`continue` sem laço externo = erro, como hoje). `return`/`throw`
-  seguem as regras vigentes (saem da ativação / unwinding com `finally`).
+  "breakable"); `continue`/`continue 1` em `switch` equivalem a `break`
+  dele (gotcha documentado do PHP); `continue N` conta N breakables para
+  fora (laco ou `switch`; RFC 0008). `return`/`throw` seguem as regras
+  vigentes (saem da ativacao / unwinding com `finally`).
 - **Escopo por case** (`EnterScope`/`ExitScope`): `let` repetido em cases
   distintos não colide. Diferença deliberada vs PHP (escopo único) —
   coerente com blocos RHP; documentada em `PHP_DIFFERENCES.md`.

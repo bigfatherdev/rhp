@@ -27,6 +27,7 @@ pub enum TokenKind {
     Switch,
     Case,
     Default,
+    Match,
     Break,
     Continue,
     Try,
@@ -62,6 +63,8 @@ pub enum TokenKind {
     QuestionQuestion,
     Assign,
     EqEq,
+    /// `=>` (braco de `match`, arrow `fn`; RFC 0008).
+    FatArrow,
     BangEq,
     Lt,
     LtEq,
@@ -283,12 +286,19 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 let start_col = col;
                 chars.next();
                 col += 1;
-                if chars.peek().copied().is_some_and(|(_, c)| c == '=') {
-                    chars.next();
-                    col += 1;
-                    tokens.push(Token::new(TokenKind::EqEq, line, start_col));
-                } else {
-                    tokens.push(Token::new(TokenKind::Assign, line, start_col));
+                match chars.peek().copied() {
+                    Some((_, '=')) => {
+                        chars.next();
+                        col += 1;
+                        tokens.push(Token::new(TokenKind::EqEq, line, start_col));
+                    }
+                    // `=>` (RFC 0008); `=` sozinho continua `Assign`.
+                    Some((_, '>')) => {
+                        chars.next();
+                        col += 1;
+                        tokens.push(Token::new(TokenKind::FatArrow, line, start_col));
+                    }
+                    _ => tokens.push(Token::new(TokenKind::Assign, line, start_col)),
                 }
             }
             '!' => {
@@ -593,6 +603,7 @@ fn lex_ident_or_keyword(
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
         "for" => TokenKind::For,
+        "match" => TokenKind::Match,
         "switch" => TokenKind::Switch,
         "case" => TokenKind::Case,
         "default" => TokenKind::Default,
@@ -726,6 +737,16 @@ mod tests {
                 TokenKind::Export,
             ]
         );
+        // `switch`/`case`/`default` (RFC 0004), `match` (RFC 0008).
+        assert_eq!(
+            kinds("switch case default match"),
+            vec![
+                TokenKind::Switch,
+                TokenKind::Case,
+                TokenKind::Default,
+                TokenKind::Match,
+            ]
+        );
         // `in` e contextual (do `for x in ...`): continua identificador.
         assert_eq!(kinds("in"), vec![TokenKind::Ident("in".to_string())]);
         assert_eq!(
@@ -759,7 +780,7 @@ mod tests {
     #[test]
     fn lexes_operators() {
         assert_eq!(
-            kinds("+ - * / % ! = == != < <= > >="),
+            kinds("+ - * / % ! = == => != < <= > >="),
             vec![
                 TokenKind::Plus,
                 TokenKind::Minus,
@@ -769,6 +790,7 @@ mod tests {
                 TokenKind::Bang,
                 TokenKind::Assign,
                 TokenKind::EqEq,
+                TokenKind::FatArrow,
                 TokenKind::BangEq,
                 TokenKind::Lt,
                 TokenKind::LtEq,

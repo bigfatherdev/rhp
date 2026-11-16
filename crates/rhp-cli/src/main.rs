@@ -1051,7 +1051,9 @@ impl Renamer<'_> {
                 }
             }
             Stmt::Break => Stmt::Break,
+            Stmt::BreakN(n) => Stmt::BreakN(*n),
             Stmt::Continue => Stmt::Continue,
+            Stmt::ContinueN(n) => Stmt::ContinueN(*n),
             Stmt::Assign { target, expr } => {
                 let renamed_target = match target {
                     AssignTarget::Var(name) => AssignTarget::Var(self.reference(name)),
@@ -1102,6 +1104,29 @@ impl Renamer<'_> {
                 Stmt::For {
                     var: renamed_var,
                     iter,
+                    body,
+                }
+            }
+            Stmt::ForC {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                // Um escopo para init+cond+passo (paridade com a VM);
+                // corpo em escopo aninhado.
+                self.scopes.push(HashSet::new());
+                let init = init.as_ref().map(|s| Box::new(self.stmt(s)));
+                let cond = cond.as_ref().map(|e| self.expr(e));
+                self.scopes.push(HashSet::new());
+                let body = body.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                let step = step.as_ref().map(|s| Box::new(self.stmt(s)));
+                self.scopes.pop();
+                Stmt::ForC {
+                    init,
+                    cond,
+                    step,
                     body,
                 }
             }
@@ -1253,6 +1278,16 @@ impl Renamer<'_> {
                 callee: Box::new(self.expr(callee)),
                 args: args.iter().map(|e| self.expr(e)).collect(),
             },
+            Expr::Match { subject, arms } => Expr::Match {
+                subject: Box::new(self.expr(subject)),
+                arms: arms
+                    .iter()
+                    .map(|arm| rhp_parser::MatchArm {
+                        cond: arm.cond.as_ref().map(|e| self.expr(e)),
+                        value: self.expr(&arm.value),
+                    })
+                    .collect(),
+            },
             Expr::Closure(data) => {
                 let params = data
                     .params
@@ -1354,6 +1389,16 @@ fn check_expr_imports(expr: &rhp_parser::Expr) -> Result<(), LoadError> {
             }
             Ok(())
         }
+        E::Match { subject, arms } => {
+            check_expr_imports(subject)?;
+            for arm in arms {
+                if let Some(cond) = &arm.cond {
+                    check_expr_imports(cond)?;
+                }
+                check_expr_imports(&arm.value)?;
+            }
+            Ok(())
+        }
         E::Array(items) | E::Call { args: items, .. } => {
             for item in items {
                 check_expr_imports(item)?;
@@ -1404,6 +1449,25 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
             }
             Stmt::While { body, .. } => check_block_imports(body, "em `while`")?,
             Stmt::For { body, .. } => check_block_imports(body, "em `for`")?,
+            Stmt::ForC {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                // `init`/`step` sao `let`/`const`/atribuicao/expressao:
+                // reutiliza o varredor de expressoes.
+                if let Some(init) = init {
+                    check_stmt_expr_imports(init)?;
+                }
+                if let Some(cond) = cond {
+                    check_expr_imports(cond)?;
+                }
+                if let Some(step) = step {
+                    check_stmt_expr_imports(step)?;
+                }
+                check_block_imports(body, "em `for`")?;
+            }
             Stmt::Switch { cases, .. } => {
                 for case in cases {
                     check_block_imports(&case.body, "em `switch`")?;
@@ -1720,6 +1784,51 @@ mod tests {
         )
         .expect("deve passar");
         assert_eq!(buf, b"3\n42\n");
+    }
+
+    #[test]
+    fn runs_nucleo2_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "echo match 2 { 1 => \"um\", 2 => \"dois\" }; let f = fn (x) => x * 2; echo f(21); for let i = 0; i < 2; i = i + 1 { echo i; }",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"dois\n42\n0\n1\n");
+    }
+
+    #[test]
+    fn rejects_import_inside_match_arm() {
+        let dir = temp_dir("match-import");
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "echo match 1 { 1 => (fn () { import \"outro.rhp\"; return 1; })(), default => 0 };\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nivel superior"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rename_forc_declares_init() {
+        use std::collections::HashSet as Set;
+        let stmts =
+            rhp_parser::parse_source("let t = 3;\nfor let i = 0; i < t; i = i + 1 { echo i; }\n")
+                .expect("parse deve passar")
+                .statements;
+        let top: Set<String> = ["t".to_string()].into_iter().collect();
+        let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
+        match &renamed[1] {
+            Stmt::ForC { init, .. } => match init.as_deref() {
+                Some(Stmt::Let { name, .. }) => assert_eq!(name, "i"),
+                other => panic!("esperado Let no init, obteve {other:?}"),
+            },
+            other => panic!("esperado ForC, obteve {other:?}"),
+        }
     }
 
     #[test]

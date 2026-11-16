@@ -52,7 +52,12 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 | `TryEnd` | Remove o handler (caminho normal). Sem handler = erro. |
 | `Throw` | Desempilha valor e inicia unwinding (frame atual para a base). |
 | `Rethrow` | Relanca o erro em propagacao (fim de `finally` sem `catch`). |
-| `CallBuiltin(id)` | Executa builtin de id 0–52 com aridade fixa (tabela §4). |
+| `CallBuiltin(id)` | Executa builtin de id 0–52 com aridade fixa (tabela §4).
+  HOFs com callback (`Map`/`Filter`/`Usort`, RFC 0005) nao passam pelo
+  `call_builtin` sincrono: o `step` intercepta, guarda `PendingHof` no frame
+  e empilha ativacoes; o `Return` retoma (`advance_hof`). |
+| `StrictEq` | `pop` 2 valores; empilha `Bool` (igualdade estrita: mesmo tipo;
+  `Int`/`Float` comparam numericamente). Usado pelo `match` (RFC 0008). |
 
 ## 3. Compilacao (Marco 2 + Fases 3–4)
 
@@ -94,10 +99,19 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 - `switch` (RFC 0004) = discriminante + por case com teste
   `Dup + case + Eq + JumpIfFalse proximo` (`default` = `Jump` incondicional)
   e corpos em sequencia com `EnterScope`/`ExitScope` por case (fallthrough);
-  `break` com `Pop` proprio remendado para o fim, `continue` com `Pop` por
-  `switch` cruzado mirando o laco externo; `Pop` final dispensa o
-  discriminante no caminho sem-match/fallthrough. `LoopCtx.is_loop`
-  distingue laco (alvo de `continue`) de `switch`.
+  `break` com `Pop` proprio remendado para o fim, `continue` por `switch`
+  cruzado com `Pop` mirando o laco externo (ou quebrando o `switch`, RFC 0008);
+  `Pop` final dispensa o discriminante no caminho sem-match/fallthrough.
+  `LoopCtx.is_loop` distingue laco de `switch`.
+- `match` (RFC 0008) = sujeito + por braco `Dup + braco + StrictEq +
+  JumpIfFalse proximo` (`default` = `Jump` incondicional) e corpos-expressao
+  em sequencia (cada um: `Pop` + valor + `Jump` fim; sem fallthrough);
+  sem-match sem `default` = `Pop` + `Throw` da mensagem (terminal).
+- `for init; cond; passo` (RFC 0008) espelha `compile_for` (escopo proprio,
+  `continue` remendado ao passo, `break` a saida).
+- `break [N]`/`continue [N]` (RFC 0008): N-esimo breakable/laco de dentro
+  para fora (`LoopCtx.is_loop` + contagem; `continue` em `switch` = `break`
+  dele); `Pop` por `switch` cruzado; remendo no dono do contexto.
 - `Stmt::Import` e consumido pelo carregador de modulos; a compilacao direta
   o ignora (programa deve chegar resolvido).
 

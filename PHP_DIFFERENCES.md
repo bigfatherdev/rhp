@@ -28,7 +28,21 @@ a semantica for especificada e implementada.
 - Cada ramo tem escopo proprio (`let` repetido em ramos distintos nao
   colide); no PHP o `switch` inteiro compartilha um escopo.
 - Sem `break N` (RHP nao tem `break` com argumento); `break` sai do
-  `switch` mais interno, `continue` mira o laco externo.
+  `switch` mais interno, `continue` em `switch` equivale a `break` dele
+  (gotcha do PHP, mesma semantica), `continue N` conta `switch` como nivel.
+
+## Lote nucleo-2 (RFC 0008, Fase 3)
+
+- `match` estrito (mesmo tipo; `Int`/`Float` promovem): como o PHP (`===`),
+  divergindo do `switch`/ `==` frouxos do RHP. Sem-match sem `default` =
+  erro (capturavel; no PHP e `UnhandledMatchError`).
+- Elvis `?:` = `??` (só `null` aciona; sem truthiness — RHP não tem em
+  nenhum lugar; no PHP, falsy aciona).
+- Arrow `fn (x) => expr` = closure; fmt normaliza para bloco.
+- `for init; cond; passo` igual ao PHP (partes opcionais); `continue` roda
+  o passo; `let` do `init` nao vaza.
+- `break N` / `continue N` como no PHP (N literal; `switch` conta como nivel
+  e `continue` nele age como `break`).
 
 ## `map`/`filter`/`usort` (RFC 0005, Fase 2)
 

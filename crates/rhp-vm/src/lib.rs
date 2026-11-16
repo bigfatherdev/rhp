@@ -380,6 +380,9 @@ impl Vm {
             Op::Eq => self.binary(idx, "comparacao", |a, b| {
                 Ok(Value::Bool(values_equal(a, b)))
             })?,
+            Op::StrictEq => self.binary(idx, "comparacao", |a, b| {
+                Ok(Value::Bool(strict_equal(a, b)))
+            })?,
             Op::Ne => {
                 self.binary(idx, "comparacao", |a, b| {
                     Ok(Value::Bool(!values_equal(a, b)))
@@ -1258,6 +1261,21 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+/// Igualdade estrita (RFC 0008, `match`): mesmo tipo + valor; `Int`/`Float`
+/// cruzam numericamente (como no `==`); resto exige a mesma variante.
+fn strict_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Int(a), Value::Float(b)) => *a as f64 == *b,
+        (Value::Float(a), Value::Int(b)) => *a == *b as f64,
+        _ => {
+            std::mem::discriminant(left) == std::mem::discriminant(right)
+                && values_equal(left, right)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ordering {
     Less,
@@ -1758,6 +1776,112 @@ mod tests {
     }
 
     #[test]
+    fn runs_match_expression() {
+        // Valor retornado; primeiro match vence; sem fallthrough.
+        assert_eq!(
+            run_src("echo match 2 { 1 => \"a\", 2 => \"b\", default => \"d\" };").expect("ok"),
+            "b\n"
+        );
+        // Estrito: `1` casa com `1.0`, mas `"1"` e `true` nao casam com `1`.
+        assert_eq!(
+            run_src("echo match 1 { 1.0 => \"num\", default => \"outro\" };").expect("ok"),
+            "num\n"
+        );
+        assert_eq!(
+            run_src("echo match \"1\" { 1 => \"int\", default => \"outro\" };").expect("ok"),
+            "outro\n"
+        );
+        assert_eq!(
+            run_src("echo match true { 1 => \"um\", default => \"outro\" };").expect("ok"),
+            "outro\n"
+        );
+        // `default` no meio casa por ordem (sem fallthrough no `match`:
+        // casou, terminou — como no PHP).
+        assert_eq!(
+            run_src("echo match 2 { 1 => \"a\", default => \"d\", 2 => \"b\" };").expect("ok"),
+            "d\n"
+        );
+        // Como expressao: em `let`, com chamada direta e aninhado.
+        assert_eq!(
+            run_src("let x = match 1 { 1 => 40 + 2 }; echo x;").expect("ok"),
+            "42\n"
+        );
+        assert_eq!(
+            run_src("echo (match 2 { 1 => \"a\", 2 => \"b\" });").expect("ok"),
+            "b\n"
+        );
+        // Sem match e sem `default`: erro de runtime (capturavel).
+        assert_eq!(
+            run_src("try { echo match 99 { 1 => \"a\" }; } catch e { echo e; }").expect("ok"),
+            "match sem braco correspondente\n"
+        );
+    }
+
+    #[test]
+    fn runs_elvis_arrow_forc_and_break_levels() {
+        // Elvis: `null` aciona; valor passa; avalia 1x.
+        assert_eq!(
+            run_src(
+                "let n = 0; fn prox() { n = n + 1; return null; } echo prox() ?: \"d\"; echo n;"
+            )
+            .expect("ok"),
+            "d\n1\n"
+        );
+        assert_eq!(run_src("echo 5 ?: \"d\";").expect("ok"), "5\n");
+        // Arrow: valor, captura e chamada direta.
+        assert_eq!(
+            run_src("let k = 10; echo map([1], fn (x) => x + k); echo (fn (a) => a * 2)(21);")
+                .expect("ok"),
+            "[11]\n42\n"
+        );
+        // For-C: classico, condicao ausente com `break`, passo roda no `continue`.
+        assert_eq!(
+            run_src("for let i = 0; i < 3; i = i + 1 { echo i; }").expect("ok"),
+            "0\n1\n2\n"
+        );
+        assert_eq!(
+            run_src("for ;; { echo \"uma\"; break; }").expect("ok"),
+            "uma\n"
+        );
+        assert_eq!(
+            run_src("for let j = 0; j < 3; j = j + 1 { if j == 1 { continue; } echo j; }")
+                .expect("ok"),
+            "0\n2\n"
+        );
+        // `for` com init `let` nao vaza.
+        assert!(
+            run_err("for let i = 0; i < 1; i = i + 1 { echo i; } echo i;").contains("nao definida")
+        );
+        // `break 2` sai do `switch` e do laco; `continue 2` pula o `switch`.
+        assert_eq!(
+            run_src("let i = 0; while i < 3 { i = i + 1; switch i { case 1 { echo \"um\"; break 2; } default { echo i; } } echo \"depois\"; } echo \"fim\";")
+                .expect("ok"),
+            "um\nfim\n"
+        );
+        assert_eq!(
+            run_src("for let j = 0; j < 3; j = j + 1 { switch j { case 1 { continue 2; } default { echo j; } } echo \"x\"; }")
+                .expect("ok"),
+            "0\nx\n2\nx\n"
+        );
+        // Niveis alem do aninhamento: erro de compilacao.
+        let program = parse_source("while true { break 2; }").expect("parse deve passar");
+        let err = rhp_bytecode::compile(&program).expect_err("deve falhar");
+        assert!(
+            err.message.contains("alem do aninhamento"),
+            "obteve: {}",
+            err.message
+        );
+        let program =
+            parse_source("switch 1 { case 1 { continue 2; } }").expect("parse deve passar");
+        let err = rhp_bytecode::compile(&program).expect_err("deve falhar");
+        assert!(
+            err.message.contains("alem do aninhamento"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn runs_switch_statement() {
         // Match + break (sem fallthrough).
         assert_eq!(
@@ -1819,11 +1943,14 @@ mod tests {
                 .expect("ok"),
             "dentro\nfora\n"
         );
-        // `switch` em laco: `continue` mira o laco, `break` sai do `switch`.
+        // `switch` em laco: `continue` em `switch` equivale a `break`
+        // dele (gotcha documentado do PHP); `break` sai do `switch`.
+        // i=1: default+`f`; i=2: `continue` sai do `switch`+`f`;
+        // i=3: default+`f` (nao ha `case 3`).
         assert_eq!(
             run_src("let i = 0; while i < 3 { i = i + 1; switch i { case 2 { continue; } default { echo i; } } echo \"f\"; }")
                 .expect("ok"),
-            "1\nf\n3\nf\n"
+            "1\nf\nf\n3\nf\n"
         );
         // Laco em case: `break` sai do laco (mais interno).
         assert_eq!(

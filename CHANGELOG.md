@@ -23,6 +23,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - Destructuring raso (RFC 0007, Fase 2): `let [a, b]` / `let {x}` /
   `let {k: v}` (+ `const`), erros herdados, sem `null` silencioso.
   Registro: `changes/2026-11-16-feat-destructuring.md`.
+- Lote nucleo-2 (RFC 0008, Fase 3): `match` estrito, Elvis `?:`, arrow
+  `=>`, `for(;;)`, `break`/`continue N` (`match` vira keyword).
+  Registro: `changes/2026-11-16-feat-lote-nucleo-2.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 
