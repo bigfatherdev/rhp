@@ -10,10 +10,10 @@ Familiar como o PHP na sintaxe. Própria na semântica, no compilador e na máqu
 
 [![Linguagem Rust](https://img.shields.io/badge/linguagem-Rust_2021-orange)](https://www.rust-lang.org)
 [![Licença](https://img.shields.io/badge/licen%C3%A7a-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
-[![Zero dependências](https://img.shields.io/badge/depend%C3%AAncias-zero-success)](#)
-[![Testes](https://img.shields.io/badge/testes-133_verdes-success)](#testes-e-validacoes)
+[![Dependências](https://img.shields.io/badge/depend%C3%AAncias-rustls_para_TLS-blue)](#)
+[![Testes](https://img.shields.io/badge/testes-216_verdes-success)](#testes-e-validacoes)
 
-> **Estado:** núcleo imperativo, stdlib, módulos, formatador, diagnósticos e rede mínima implementados e testados. PostgreSQL/Redis, async, classes e generics seguem **planejados** — ver [Roadmap](#roadmap).
+> **Estado:** núcleo imperativo, stdlib, módulos v2, exceções, JSON, datas/horas, rede (`http_get`/`http_fetch` com TLS) e persistência (SQLite/PostgreSQL) implementados e testados. TLS no servidor, pacotes, `rhp build` e tipos seguem **planejados** — ver [Roadmap](#roadmap).
 
 ## Índice
 
@@ -89,7 +89,7 @@ cargo build
 
 ## Instalação
 
-Pré-requisitos: [toolchain Rust stable](https://rustup.rs) recente (verificado com 1.100.0). Nenhuma dependência externa.
+Pré-requisitos: [toolchain Rust stable](https://rustup.rs) recente (verificado com 1.100.0). Dependências de crates só para TLS (`rustls` + `webpki-roots` + `rustls-pemfile`; resto é workspace puro).
 
 ```bash
 git clone https://github.com/bigfatherdev/rhp.git
@@ -176,7 +176,7 @@ help: toda instrucao termina com `;`
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 195 testes, 0 falhas
+cargo test --workspace          # 216 testes, 0 falhas
 cargo build --workspace
 ./target/debug/rhp run examples/fib.rhp          # 55
 ./target/debug/rhp fmt --check hello.rhp examples/*.rhp
@@ -209,7 +209,7 @@ rhp-lexer -> rhp-parser -> rhp-bytecode -> rhp-vm -> rhp-cli (+rhp-fmt, +rhp-dia
 
 ## Segurança
 
-Garantido e testado: sem `unsafe`; bytecode validado antes de executar; aritmética inteira checada; profundidade sintática limitada (128); imports confinados à árvore do programa com teto de 8 MiB/arquivo; `http_get` só `http://`, timeouts de 5 s, teto de corpo de 1 MiB (estrito, sem redirects); `http_fetch` segue redirects (teto 10), com headers e timeout configuráveis. `VmLimits` opt-in. Explicitamente **não** garantido: isolamento de SO, HTTPS/TLS, heap sem teto medido, DNS com timeout próprio. Detalhes e reporte em [`SECURITY.md`](SECURITY.md).
+Garantido e testado: sem `unsafe`; bytecode validado antes de executar; aritmética inteira checada; profundidade sintática limitada (128); imports confinados à árvore do programa com teto de 8 MiB/arquivo; `http_get` só `http://`, timeouts de 5 s, teto de corpo de 1 MiB (estrito, sem redirects); `http_fetch` segue redirects (teto 10), com headers e timeout configuráveis, e fala `https://` verificado (raízes embutidas + `RHP_CA_BUNDLE`). `VmLimits` opt-in. Explicitamente **não** garantido: isolamento de SO, TLS no servidor, heap sem teto medido, DNS com timeout próprio. Detalhes e reporte em [`SECURITY.md`](SECURITY.md).
 
 ## Roadmap
 

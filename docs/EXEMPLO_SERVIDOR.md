@@ -27,12 +27,16 @@ curl http://127.0.0.1:8080/nao-existe         # erro interno (500, sem vazar)
 
 Regras que valem:
 
-- `req` = `{metodo, caminho, query, cabecalhos, corpo}` (chaves de
-  cabecalho em minusculas; query decodificada).
+- `req` = `{metodo, caminho, query, cabecalhos, cookies, corpo}`
+  (chaves de cabecalho em minusculas; query decodificada).
 - Erro no handler = 500 `erro interno` (detalhe so no stderr do servidor);
   servidor segue atendendo.
 - `exit(codigo)` no handler termina o SERVIDOR com o codigo.
 - Handlers nao tem estado: cada request compila e executa isolado
   (abra `db_*` por request).
 - `{"max_requisicoes": N}` serve N requests e sai (util em testes);
-  `{"max_conexoes": N}` responde 503 acima do teto.
+  `{"max_conexoes": N}` responde 503 acima do teto; `{"limite_taxa": N}`
+  limita a N requests/segundo por IP (429 acima disso; 0 = sem limite).
+- `req` tambem traz `cookies` (mapa ja parseado); para HTML use
+  `template()` (sempre com escape). Exemplo de sessao: cookie + linha
+  no banco (ver teste `rhp_run_http_sessao_com_banco`).

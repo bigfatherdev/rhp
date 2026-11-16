@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt};
 
-const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> [args] | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor";
+mod pkg;
+
+const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> [args] | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -107,6 +109,106 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        [_, cmd] if cmd == "init" => match pkg::cmd_init(Path::new(".")) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                ExitCode::from(1)
+            }
+        },
+        [_, cmd, dir] if cmd == "init" => match pkg::cmd_init(Path::new(dir)) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                ExitCode::from(1)
+            }
+        },
+        [_, cmd, sub, name, origem] if cmd == "pkg" && sub == "add" => {
+            match pkg::cmd_add(Path::new("."), name, origem) {
+                Ok(message) => {
+                    println!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        [_, cmd, sub] if cmd == "pkg" && sub == "install" => {
+            match pkg::cmd_install(Path::new("."), false) {
+                Ok(message) => {
+                    println!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        [_, cmd, sub, flag] if cmd == "pkg" && sub == "install" && flag == "--check" => {
+            match pkg::cmd_install(Path::new("."), true) {
+                Ok(message) => {
+                    println!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        [_, cmd, sub, dir, flag] if cmd == "pkg" && sub == "install" && flag == "--check" => {
+            match pkg::cmd_install(Path::new(dir), true) {
+                Ok(message) => {
+                    println!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        [_, cmd, sub, dir] if cmd == "pkg" && sub == "install" => {
+            match pkg::cmd_install(Path::new(dir), false) {
+                Ok(message) => {
+                    println!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        [_, cmd, path] if cmd == "build" => match build_bundle(path, None) {
+            Ok(out) => {
+                println!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                ExitCode::from(1)
+            }
+        },
+        [_, cmd, path, out] if cmd == "build" => match build_bundle(path, Some(out)) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                ExitCode::from(1)
+            }
+        },
         [_, flag] if flag == "--version" || flag == "-V" => {
             println!("rhp {}", env!("CARGO_PKG_VERSION"));
             ExitCode::from(0)
@@ -144,6 +246,42 @@ fn fmt_file(path: &str, check: bool) -> Result<(), String> {
             .map_err(|e| format!("nao foi possivel escrever `{path}`: {e}"))?;
         Ok(())
     }
+}
+
+/// `rhp build <arquivo> [saida]`: resolve imports, funde num programa so
+/// (via linker) e escreve formatado — bundle autocontido para deploy
+/// (sem `import`s; executa igual ao original). Padrao:
+/// `<base>.bundle.rhp` ao lado da entrada.
+fn build_bundle(entry: &str, out: Option<&str>) -> Result<String, String> {
+    let program = load_program(entry).map_err(|e| e.human())?;
+    // Validacao completa antes de escrever (mesmos gates do `run`).
+    rhp_bytecode::compile(&program).map_err(|e| {
+        let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
+        with_code(code, help, &format!("{entry}: erro de compilacao: {e}"))
+    })?;
+    let bundled = format!(
+        "// bundle gerado por `rhp build {entry}` — nao edite\n{}",
+        rhp_fmt::format(&program)
+    );
+    let dest = match out {
+        Some(path) => path.to_string(),
+        None => {
+            let stem = Path::new(entry)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("saida");
+            match Path::new(entry).parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent
+                    .join(format!("{stem}.bundle.rhp"))
+                    .display()
+                    .to_string(),
+                _ => format!("{stem}.bundle.rhp"),
+            }
+        }
+    };
+    std::fs::write(&dest, bundled)
+        .map_err(|e| format!("nao foi possivel escrever `{dest}`: {e}"))?;
+    Ok(format!("bundle escrito em `{dest}`"))
 }
 
 /// Erro de carregamento: diagnostico estruturado (lex/parse) ou texto.
@@ -626,8 +764,9 @@ fn collect_module(
 ///
 /// - Ordem de execucao = pos-ordem DFS (dependencias antes, como antes).
 /// - Modulos importados tem nomes de nivel superior renomeados com prefixo
-///   contendo NUL (irrepresentavel no fonte; sem colisao entre modulos).
-///   O entry mantem nomes simples (globais do programa).
+///   reservado `__rhp_mod{N}__` (identificador valido, mas proibido no
+///   fonte do usuario; bundle segue reparseavel). O entry mantem nomes
+///   simples (globais do programa).
 /// - Cada `import`/`import from` vira `let`s de alias no inicio da secao
 ///   do importador (nunca reexecuta o modulo): bare vincula todos os nomes
 ///   (legado); seletivo so exportados (privacidade real).
@@ -663,6 +802,12 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
                 _ => None,
             };
             if let Some(name) = def_name {
+                if name.starts_with(RESERVED_PREFIX) {
+                    return Err(format!(
+                        "nome reservado ao linker `{name}` em `{}` (renomeie)",
+                        module.shown
+                    ));
+                }
                 // Duplicatas passam adiante: o `DeclareName` acusa em
                 // runtime, como no merge legado.
                 tops[idx].push(name);
@@ -693,7 +838,7 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
     for (idx, module) in modules.iter().enumerate() {
         let is_entry = idx + 1 == modules.len();
         if !is_entry {
-            let prefix = format!("\0m{idx}#");
+            let prefix = hidden_prefix(idx);
             for name in &tops[idx] {
                 mangled[idx].insert(name.clone(), format!("{prefix}{name}"));
             }
@@ -766,7 +911,7 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
             out.extend(own);
         } else {
             let top_set: HashSet<String> = tops[idx].iter().cloned().collect();
-            out.extend(rename_module(&own, &top_set, &format!("\0m{idx}#")));
+            out.extend(rename_module(&own, &top_set, &hidden_prefix(idx)));
         }
     }
     Ok(out)
@@ -788,8 +933,19 @@ fn alias_let(visible: &str, origin: &str) -> Stmt {
     }
 }
 
+/// Prefixo de isolamento entre modulos: identificador valido (para o
+/// bundle continuar legivel e reparseavel), mas RESERVADO — nenhum nome
+/// de nivel superior (em qualquer modulo, inclusive o entry) pode comecar
+/// com ele; o linker rejeita com erro claro.
+fn hidden_prefix(idx: usize) -> String {
+    format!("__rhp_mod{idx}__")
+}
+
+/// Prefixo reservado ao linker (ver `hidden_prefix`).
+const RESERVED_PREFIX: &str = "__rhp_mod_";
+
 /// Renomeia os nomes de nivel superior (`top`) de um modulo com `prefix`
-/// (isolamento; prefixo com NUL e irrepresentavel no fonte).
+/// (isolamento; ver `hidden_prefix`).
 ///
 /// Espelha as regras de escopo do compilador: referencias que resolvem
 /// para o topo sao renomeadas; sombras lexicas (`let` interno, params,
@@ -1299,11 +1455,11 @@ mod tests {
             .expect("parse deve passar")
             .statements;
         let top: Set<String> = ["x".to_string(), "f".to_string()].into_iter().collect();
-        let renamed = rename_module(&stmts, &top, "\0m0#");
+        let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
         // `fn f(x)` vira `fn M#f(M#x)`? Nao: param `x` e sombra (simples).
         match &renamed[1] {
             Stmt::FnDef { name, params, .. } => {
-                assert_eq!(name, "\0m0#f");
+                assert_eq!(name, "__rhp_mod0__f");
                 assert_eq!(params, &["x".to_string()]);
             }
             other => panic!("esperado FnDef, obteve {other:?}"),
@@ -1311,7 +1467,7 @@ mod tests {
         // `echo x` no topo vira `echo M#x`.
         match &renamed[2] {
             Stmt::Echo { expr } => match expr {
-                rhp_parser::Expr::Var(name) => assert_eq!(name, "\0m0#x"),
+                rhp_parser::Expr::Var(name) => assert_eq!(name, "__rhp_mod0__x"),
                 other => panic!("esperado Var, obteve {other:?}"),
             },
             other => panic!("esperado Echo, obteve {other:?}"),

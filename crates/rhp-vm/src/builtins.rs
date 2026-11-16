@@ -10,6 +10,9 @@ use std::sync::Arc;
 /// Corpo maximo aceito por `http_get` (protecao contra exaustao de memoria).
 pub const MAX_HTTP_BODY: usize = 1024 * 1024;
 
+/// Teto de cabecalhos por resposta (bytes; antes de achar `\r\n\r\n`).
+const MAX_HEADERS: usize = 64 * 1024;
+
 /// Teto de leitura de `fs_read` (protecao contra exaustao de memoria).
 pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -771,9 +774,15 @@ fn do_request(url: &str, opts: &FetchOpts) -> Result<HttpResponse, VmError> {
     use std::io::{Read, Write as _};
     use std::net::{TcpStream, ToSocketAddrs};
 
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| VmError::new("`http_get` suporta apenas urls `http://`".to_string()))?;
+    let (tls, rest, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest, 80)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest, 443)
+    } else {
+        return Err(VmError::new(
+            "`http_fetch` suporta apenas urls `http://` ou `https://`".to_string(),
+        ));
+    };
     let (authority, path) = match rest.find('/') {
         Some(pos) => (&rest[..pos], &rest[pos..]),
         None => (rest, "/"),
@@ -788,21 +797,27 @@ fn do_request(url: &str, opts: &FetchOpts) -> Result<HttpResponse, VmError> {
                 .map_err(|_| VmError::new(format!("`http_get` com porta invalida: {port_text}")))?;
             (host, port)
         }
-        _ => (authority, 80),
+        _ => (authority, default_port),
     };
     let addr = (host, port)
         .to_socket_addrs()
         .map_err(|e| VmError::new(format!("`http_get` falhou ao resolver {host}: {e}")))?
         .next()
         .ok_or_else(|| VmError::new(format!("`http_get` sem endereco para {host}")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, opts.timeout).map_err(|e| {
+    let socket = TcpStream::connect_timeout(&addr, opts.timeout).map_err(|e| {
         VmError::new(format!(
             "`http_get` falhou ao conectar em {host}:{port}: {e}"
         ))
     })?;
-    stream
+    socket
         .set_read_timeout(Some(opts.timeout))
+        .and_then(|()| socket.set_write_timeout(Some(opts.timeout)))
         .map_err(|e| VmError::new(format!("`http_get` falhou ao configurar timeout: {e}")))?;
+    let mut stream = if tls {
+        super::tls::connect_tls(socket, host).map_err(VmError::new)?
+    } else {
+        super::tls::Transport::Plain(socket)
+    };
     let mut request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n");
     for (name, item) in &opts.headers {
         request.push_str(&format!("{name}: {item}\r\n"));
@@ -811,17 +826,27 @@ fn do_request(url: &str, opts: &FetchOpts) -> Result<HttpResponse, VmError> {
     stream
         .write_all(request.as_bytes())
         .map_err(|e| VmError::new(format!("`http_get` falhou ao enviar requisicao: {e}")))?;
+    // Le ate o fim dos cabecalhos; depois, corpo pelo Content-Length
+    // quando presente (nao espera o close: necessario no TLS, onde o par
+    // pode fechar sem `close_notify`). Sem Content-Length, le ate EOF
+    // limpo (TLS sem `close_notify` = erro, documentado).
     let mut raw: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
-    loop {
+    let header_end = loop {
         match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => break None,
             Ok(n) => {
                 raw.extend_from_slice(&chunk[..n]);
-                if raw.len() > MAX_HTTP_BODY {
+                if raw.len() > MAX_HTTP_BODY + MAX_HEADERS {
                     return Err(VmError::new(format!(
                         "`http_get` excedeu o limite de corpo ({MAX_HTTP_BODY} bytes)"
                     )));
+                }
+                if let Some(pos) = raw
+                    .windows(b"\r\n\r\n".len())
+                    .position(|window| window == b"\r\n\r\n")
+                {
+                    break Some(pos);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -832,10 +857,7 @@ fn do_request(url: &str, opts: &FetchOpts) -> Result<HttpResponse, VmError> {
             }
         }
     }
-    let header_end = raw
-        .windows(b"\r\n\r\n".len())
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| VmError::new("`http_get` com resposta sem cabecalhos".to_string()))?;
+    .ok_or_else(|| VmError::new("`http_get` com resposta sem cabecalhos".to_string()))?;
     let header = String::from_utf8_lossy(&raw[..header_end]);
     let mut lines = header.lines();
     let status_line = lines.next().unwrap_or("");
@@ -856,7 +878,61 @@ fn do_request(url: &str, opts: &FetchOpts) -> Result<HttpResponse, VmError> {
             entry.push_str(item.trim());
         }
     }
-    let body = raw[header_end + 4..].to_vec();
+    // Corpo: Content-Length manda (para ao completar, sem esperar o
+    // close); sem ele, le ate EOF limpo.
+    let mut body = raw[header_end + 4..].to_vec();
+    if let Some(expected) = headers
+        .get("content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        if expected > MAX_HTTP_BODY {
+            return Err(VmError::new(format!(
+                "`http_get` excedeu o limite de corpo ({MAX_HTTP_BODY} bytes)"
+            )));
+        }
+        while body.len() < expected {
+            match stream.read(&mut chunk) {
+                Ok(0) => {
+                    return Err(VmError::new("`http_get` com resposta truncada".to_string()));
+                }
+                Ok(n) => {
+                    body.extend_from_slice(&chunk[..n]);
+                    if body.len() > MAX_HTTP_BODY {
+                        return Err(VmError::new(format!(
+                            "`http_get` excedeu o limite de corpo ({MAX_HTTP_BODY} bytes)"
+                        )));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(VmError::new(format!(
+                        "`http_get` falhou ao ler resposta: {e}"
+                    )));
+                }
+            }
+        }
+        body.truncate(expected);
+    } else {
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    body.extend_from_slice(&chunk[..n]);
+                    if body.len() > MAX_HTTP_BODY {
+                        return Err(VmError::new(format!(
+                            "`http_get` excedeu o limite de corpo ({MAX_HTTP_BODY} bytes)"
+                        )));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(VmError::new(format!(
+                        "`http_get` falhou ao ler resposta: {e}"
+                    )));
+                }
+            }
+        }
+    }
     Ok(HttpResponse {
         status: code,
         headers,
@@ -864,22 +940,31 @@ fn do_request(url: &str, opts: &FetchOpts) -> Result<HttpResponse, VmError> {
     })
 }
 
-/// Resolve `Location` contra a URL base (absoluto, raiz ou relativo).
+/// Resolve `Location` contra a URL base (absoluta, raiz ou relativa).
+/// Upgrades `http://` -> `https://` sao seguidos; downgrades `https://` ->
+/// `http://` sao recusados; esquema preservado em relativos.
 fn resolve_location(base: &str, location: &str) -> Result<String, VmError> {
     let location = location.trim();
-    if location.starts_with("http://") {
-        return Ok(location.to_string());
-    }
-    if location.starts_with("https://") {
+    let base_https = base.starts_with("https://");
+    let loc_https = location.starts_with("https://");
+    let loc_http = location.starts_with("http://");
+    if loc_http && base_https {
         return Err(VmError::new(
-            "`http_fetch`: redirect para `https://` nao suportado (sem TLS)".to_string(),
+            "`http_fetch`: redirect de `https://` para `http://` recusado (downgrade)".to_string(),
         ));
     }
-    let after_scheme = base.strip_prefix("http://").unwrap_or(base);
+    if loc_http || loc_https {
+        return Ok(location.to_string());
+    }
+    let scheme = if base_https { "https" } else { "http" };
+    let after_scheme = base
+        .strip_prefix("http://")
+        .or_else(|| base.strip_prefix("https://"))
+        .unwrap_or(base);
     let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
     if location.starts_with('/') {
-        return Ok(format!("http://{authority}{location}"));
+        return Ok(format!("{scheme}://{authority}{location}"));
     }
     if location.is_empty() {
         return Err(VmError::new(
@@ -891,7 +976,7 @@ fn resolve_location(base: &str, location: &str) -> Result<String, VmError> {
         Some(pos) => &base_path[..=pos],
         None => "/",
     };
-    Ok(format!("http://{authority}{base_dir}{location}"))
+    Ok(format!("{scheme}://{authority}{base_dir}{location}"))
 }
 
 /// `http_fetch(url, opts)`: GET com redirects/headers/timeout; devolve
@@ -1062,6 +1147,12 @@ fn pg_params(params: &[super::sqlite::SqlValue]) -> Result<Vec<super::pg::PgPara
 /// Erros sao `VmError` com mensagem (sem panics). Comportamento identico
 /// ao da Fase 6 (congelado; evolucao vai em `http_fetch`).
 pub(super) fn http_get_body(url: &str) -> Result<String, VmError> {
+    // Mensagem historica preservada byte a byte (Fase 6 congelada).
+    if !url.starts_with("http://") {
+        return Err(VmError::new(
+            "`http_get` suporta apenas urls `http://`".to_string(),
+        ));
+    }
     let opts = FetchOpts {
         follow: false,
         max_redirects: 0,

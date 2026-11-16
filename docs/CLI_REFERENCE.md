@@ -23,6 +23,12 @@ rhp run hello.rhp
 rhp run --max-steps 1000 loop.rhp
 ```
 
+## Variaveis de ambiente
+
+| Variavel | Efeito |
+|---|---|
+| `RHP_CA_BUNDLE` | Caminho de PEM com certificados extras aceitos pelo `http_fetch` em `https://` (somado as raizes embutidas; ex.: CA corporativa de proxy). Ausente ou vazio = so raizes embutidas. |
+
 ## `rhp fmt [--check] <arquivo.rhp>`
 
 Reescreve no formato canonico (2 espacos, `;` sempre, parenteses minimos,
@@ -41,6 +47,25 @@ o corredor). Sem argumento, usa o diretorio atual.
 Diagnostico do ambiente: versao do `rhp`, versoes de `rustc`/`cargo` (ou
 "nao encontrado no PATH") e autoteste em memoria (`6 * 7 == 42`). Exit 0
 se o autoteste passa.
+
+## `rhp init [dir]` e `rhp pkg ...` (pacotes v0, locais)
+
+```bash
+rhp init meuapp                # cria rhp.toml
+rhp pkg add tempo ../tempo     # registra dependencia (caminho local)
+rhp pkg install                # vendoriza em pacotes/ + grava rhp.lock
+rhp pkg install --check        # verifica pacotes/ contra o lock (CI)
+```
+
+`import "pacotes/tempo/mod.rhp"` usa o codigo vendorizado. Sem rede,
+sem registro, sem resolucao de versoes (declarado como v0). Lockfile com
+hash por arquivo detecta adulteracao; `--check` falha com exit 1.
+
+## `rhp build <arquivo.rhp> [saida]` (bundle para deploy)
+
+Resolve `import`s, valida e escreve um `.rhp` unico autocontido (padrao:
+`<base>.bundle.rhp` ao lado da entrada). O bundle executa identico ao
+original e nao precisa dos modulos na maquina de destino.
 
 ## `rhp check [--json] <arquivo.rhp>`
 

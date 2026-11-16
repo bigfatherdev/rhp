@@ -227,6 +227,80 @@ fn rhp_run_postgres_end_to_end() {
 }
 
 #[test]
+fn rhp_pkg_init_add_install_e_check() {
+    use std::process::Command;
+    let rhp = env!("CARGO_BIN_EXE_rhp");
+    let dir = std::env::temp_dir().join(format!("rhp-pkgcli-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let lib = dir.join("libtempo");
+    std::fs::create_dir(&lib).expect("libdir");
+    std::fs::write(
+        lib.join("mat.rhp"),
+        "export fn dobro(x) {\n  return x + x;\n}\n",
+    )
+    .expect("lib");
+    let app = dir.join("app");
+    std::fs::create_dir_all(&app).expect("appdir");
+    let run = |args: &[&str]| -> std::process::Output {
+        Command::new(rhp)
+            .args(args)
+            .current_dir(&app)
+            .output()
+            .expect("rodar rhp")
+    };
+    let out = run(&["init"]);
+    assert!(
+        out.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(app.join("rhp.toml").is_file());
+    let out = run(&["pkg", "add", "tempo", "../libtempo"]);
+    assert!(
+        out.status.success(),
+        "add: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(&["pkg", "install"]);
+    assert!(
+        out.status.success(),
+        "install: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(app.join("pacotes/tempo/mat.rhp").is_file());
+    assert!(app.join("rhp.lock").is_file());
+    // Programa usa o pacote instalado.
+    std::fs::write(
+        app.join("main.rhp"),
+        "import \"pacotes/tempo/mat.rhp\";\necho dobro(21);\n",
+    )
+    .expect("main");
+    let out = run(&["run", "main.rhp"]);
+    assert!(
+        out.status.success(),
+        "run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"42\n");
+    // Check passa; apos adulterar, falha.
+    let out = run(&["pkg", "install", "--check"]);
+    assert!(
+        out.status.success(),
+        "check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(app.join("pacotes/tempo/mat.rhp"), "adulterado\n").expect("adulterar");
+    let out = run(&["pkg", "install", "--check"]);
+    assert!(!out.status.success(), "adulteracao deveria falhar");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("alterado"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn rhp_run_time_builtins() {
     let output = run_temp_source(
         "hora.rhp",
@@ -455,6 +529,80 @@ fn rhp_run_http_sessao_com_banco() {
 }
 
 #[test]
+fn rhp_run_http_serve_respeita_limite_taxa() {
+    // Limite generoso: 3 rapidas passam (fiação nao quebra o fluxo).
+    let server = ServerChild::spawn(
+        "srvlim.rhp",
+        "fn app(req) {\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 3, \"limite_taxa\": 1000});\n",
+    );
+    for _ in 0..3 {
+        let r = server.get("/x");
+        assert!(r.contains("200 OK"), "obteve: {r}");
+    }
+    let out = server.wait();
+    assert!(
+        out.status.success(),
+        "servidor falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn rhp_build_gera_bundle_equivalente() {
+    let dir = std::env::temp_dir().join(format!("rhp-build-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("lib.rhp"),
+        "export fn dobro(x) {\n  return x + x;\n}\n",
+    )
+    .expect("lib");
+    let main = dir.join("main.rhp");
+    std::fs::write(
+        &main,
+        "import { dobro } from \"lib.rhp\";\necho dobro(21);\n",
+    )
+    .expect("main");
+    let rhp = env!("CARGO_BIN_EXE_rhp");
+    let out = std::process::Command::new(rhp)
+        .args(["build", &main.to_string_lossy()])
+        .output()
+        .expect("rhp build");
+    assert!(
+        out.status.success(),
+        "build falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bundle = dir.join("main.bundle.rhp");
+    assert!(bundle.is_file(), "bundle nao criado");
+    let src = std::fs::read_to_string(&bundle).expect("ler bundle");
+    assert!(!src.contains("import "), "bundle nao deve ter import");
+    // Bundle executa igual ao original.
+    let orig = std::process::Command::new(rhp)
+        .args(["run", &main.to_string_lossy()])
+        .output()
+        .expect("run orig");
+    let bund = std::process::Command::new(rhp)
+        .args(["run", &bundle.to_string_lossy()])
+        .output()
+        .expect("run bundle");
+    assert_eq!(orig.stdout, bund.stdout);
+    assert_eq!(orig.stdout, b"42\n");
+    // Destino explicito + idempotencia do formato.
+    let alt = dir.join("out.rhp");
+    let out = std::process::Command::new(rhp)
+        .args(["build", &main.to_string_lossy(), &alt.to_string_lossy()])
+        .output()
+        .expect("rhp build -o");
+    assert!(
+        out.status.success(),
+        "build -o falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(alt.is_file());
+}
+
+#[test]
 fn rhp_run_http_serve_rejeita_handler_desconhecido() {
     let output = run_temp_source("srvbad.rhp", "http_serve(0, \"inexistente\", {});\n");
     assert!(!output.status.success());
@@ -637,6 +785,254 @@ fn rhp_run_http_fetch_enforces_limits() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Servidor HTTPS local (Python stdlib + `openssl`): PKI de teste (CA
+/// propria + cert de servidor assinado), validada via `RHP_CA_BUNDLE`.
+/// Pre-requisitos (como o Docker do PG): `python3` com `ssl` + `openssl`.
+struct TlsServer {
+    child: Option<std::process::Child>,
+    port: u16,
+    bundle: std::path::PathBuf,
+}
+
+impl TlsServer {
+    fn start(name: &str) -> Self {
+        use std::io::BufRead;
+        let dir = std::env::temp_dir().join(format!("rhp-tls-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir temporario");
+        // PKI de teste: CA propria + certificado de servidor assinado
+        // (SAN IP:127.0.0.1, sem CA:TRUE — verificacao real de cadeia).
+        let ca_key = dir.join("ca.key");
+        let ca_crt = dir.join("ca.crt");
+        let srv_key = dir.join("srv.key");
+        let srv_csr = dir.join("srv.csr");
+        let srv_crt = dir.join("srv.crt");
+        let cfg = dir.join("openssl.cnf");
+        std::fs::write(
+            &cfg,
+            "[req]\ndistinguished_name = dn\n[dn]\n[v3]\nsubjectAltName = IP:127.0.0.1\nbasicConstraints = CA:FALSE\n",
+        )
+        .expect("openssl.cnf");
+        let openssl = |args: &[&str]| {
+            let out = std::process::Command::new("openssl")
+                .args(args)
+                .output()
+                .expect("openssl ausente? instale openssl + python3 com ssl");
+            assert!(
+                out.status.success(),
+                "openssl falhou ({}): {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            &ca_key.to_string_lossy(),
+            "-out",
+            &ca_crt.to_string_lossy(),
+            "-days",
+            "2",
+            "-nodes",
+            "-subj",
+            "/CN=teste-rhp-CA",
+        ]);
+        openssl(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            &srv_key.to_string_lossy(),
+            "-out",
+            &srv_csr.to_string_lossy(),
+            "-nodes",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-config",
+            &cfg.to_string_lossy(),
+        ]);
+        openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            &srv_csr.to_string_lossy(),
+            "-CA",
+            &ca_crt.to_string_lossy(),
+            "-CAkey",
+            &ca_key.to_string_lossy(),
+            "-CAcreateserial",
+            "-out",
+            &srv_crt.to_string_lossy(),
+            "-days",
+            "2",
+            "-extensions",
+            "v3",
+            "-extfile",
+            &cfg.to_string_lossy(),
+        ]);
+        let script = dir.join("srv.py");
+        std::fs::write(
+            &script,
+            "import http.server, socketserver, ssl, sys\ncert, key, port = sys.argv[1], sys.argv[2], int(sys.argv[3])\nclass H(http.server.BaseHTTPRequestHandler):\n    def log_message(self, *a): pass\n    def end_ok(self, body):\n        self.send_response(200)\n        self.send_header(\"Content-Length\", str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\n    def do_GET(self):\n        if self.path == \"/seguro\":\n            self.end_ok(b\"via tls\")\n        elif self.path == \"/redireciona\":\n            p = self.server.server_address[1]\n            self.send_response(302)\n            self.send_header(\"Location\", f\"https://127.0.0.1:{p}/alvo\")\n            self.send_header(\"Content-Length\", \"0\")\n            self.end_headers()\n        elif self.path == \"/alvo\":\n            self.end_ok(b\"alvo tls\")\n        elif self.path == \"/desce\":\n            self.send_response(302)\n            self.send_header(\"Location\", \"http://127.0.0.1:9/plano\")\n            self.send_header(\"Content-Length\", \"0\")\n            self.end_headers()\n        else:\n            self.send_response(404)\n            self.send_header(\"Content-Length\", \"0\")\n            self.end_headers()\n    do_POST = do_GET\nclass S(socketserver.ThreadingMixIn, http.server.HTTPServer):\n    daemon_threads = True\nsrv = S((\"127.0.0.1\", port), H)\nctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\nctx.load_cert_chain(cert, key)\nsrv.socket = ctx.wrap_socket(srv.socket, server_side=True)\nprint(srv.server_address[1], flush=True)\nsrv.serve_forever()\n",
+        )
+        .expect("escrever servidor tls");
+        let mut child = std::process::Command::new("python3")
+            .args([
+                script.to_string_lossy().as_ref(),
+                &srv_crt.to_string_lossy(),
+                &srv_key.to_string_lossy(),
+                "0",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("falha ao iniciar servidor tls (python3 + ssl?)");
+        let stdout = child.stdout.take().expect("stdout do servidor tls");
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let first = lines
+            .next()
+            .expect("servidor tls fechou stdout")
+            .expect("leitura da porta tls");
+        let port: u16 = first.trim().parse().expect("porta tls invalida");
+        Self {
+            child: Some(child),
+            port,
+            bundle: ca_crt,
+        }
+    }
+
+    /// Roda `fonte` com `RHP_CA_BUNDLE` apontando para o cert do servidor.
+    fn run_rhp(&self, name: &str, source: &str) -> std::process::Output {
+        let dir = self
+            .bundle
+            .parent()
+            .expect("bundle tem diretorio pai")
+            .to_path_buf();
+        let file = dir.join(name);
+        std::fs::write(&file, source).expect("escrever programa de teste");
+        std::process::Command::new(env!("CARGO_BIN_EXE_rhp"))
+            .args(["run", &file.to_string_lossy()])
+            .env("RHP_CA_BUNDLE", &self.bundle)
+            .output()
+            .expect("executar rhp")
+    }
+}
+
+impl Drop for TlsServer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn rhp_run_http_fetch_https_ok() {
+    let server = TlsServer::start("ok");
+    let output = server.run_rhp(
+        "t.rhp",
+        &format!(
+            "let r = http_fetch(\"https://127.0.0.1:{}/seguro\", {{}});\necho r[\"status\"];\necho r[\"corpo\"];\n",
+            server.port
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "fetch https falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"200\nvia tls\n");
+}
+
+#[test]
+fn rhp_run_http_fetch_upgrade_e_recusa_downgrade() {
+    // http -> https: redirecionador simples em thread + TLS real.
+    let tls = TlsServer::start("up");
+    let tls_port = tls.port;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let plain_port = listener.local_addr().expect("addr").port();
+    let redirector = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = vec![0u8; 1024];
+        let _ = stream.read(&mut request);
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{tls_port}/seguro\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(response.as_bytes()).expect("write");
+    });
+    let output = tls.run_rhp(
+        "t2.rhp",
+        &format!("let r = http_fetch(\"http://127.0.0.1:{plain_port}/a\", {{}});\necho r[\"status\"];\necho r[\"corpo\"];\n"),
+    );
+    redirector.join().expect("redirecionador deve terminar");
+    assert!(
+        output.status.success(),
+        "upgrade falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"200\nvia tls\n");
+    // Downgrade https -> http: recusado sem conectar.
+    let output = tls.run_rhp(
+        "t3.rhp",
+        &format!(
+            "echo http_fetch(\"https://127.0.0.1:{}/desce\", {{}});\n",
+            tls.port
+        ),
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("downgrade"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // CA errada: verificacao falha.
+    let dir = tls
+        .bundle
+        .parent()
+        .expect("bundle tem diretorio pai")
+        .to_path_buf();
+    let outra = dir.join("outra.crt");
+    let out = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            "/dev/null",
+            "-out",
+            &outra.to_string_lossy(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=outra",
+        ])
+        .output()
+        .expect("openssl");
+    assert!(out.status.success());
+    let file = dir.join("t4.rhp");
+    std::fs::write(
+        &file,
+        format!(
+            "echo http_fetch(\"https://127.0.0.1:{}/seguro\", {{}});\n",
+            tls.port
+        ),
+    )
+    .expect("escrever");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .args(["run", &file.to_string_lossy()])
+        .env("RHP_CA_BUNDLE", &outra)
+        .output()
+        .expect("executar rhp");
+    assert!(!output.status.success(), "CA errada deveria falhar");
 }
 
 #[test]
@@ -1033,9 +1429,8 @@ fn rhp_run_http_get_rejects_huge_body() {
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{big}",
             big.len()
         );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write deve passar");
+        // Cliente certo para de ler ao ver o teto; EPIPE aqui e esperado.
+        let _ = stream.write_all(response.as_bytes());
     });
     let output = run_temp_source(
         "http-big.rhp",
