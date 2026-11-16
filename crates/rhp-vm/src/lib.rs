@@ -4,7 +4,7 @@
 //! globais compartilhadas. O bytecode e tratado como entrada potencialmente
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
-use rhp_bytecode::{builtin_arity, Chunk, FuncDef, Op, Value};
+use rhp_bytecode::{builtin_arity, Builtin, Chunk, FuncDef, FuncValue, Op, Value};
 use rhp_parser::Program;
 use std::collections::HashMap;
 use std::fmt;
@@ -94,6 +94,39 @@ struct Frame {
     scopes: Vec<HashMap<String, Value>>,
     /// Pilha de handlers de `try` (RFC 0001); o mais interno por ultimo.
     handlers: Vec<Handler>,
+    /// HOF com callback em voo (RFC 0005): progresso da iteracao enquanto
+    /// as ativacoes do callback executam e retornam. `None` no comum.
+    pending: Option<PendingHof>,
+}
+
+/// Estado de `map`/`filter`/`usort` entre chamadas do callback (RFC 0005).
+/// O frame chamador guarda o progresso; cada retorno do callback avanca
+/// (`advance_hof`) ate finalizar com o resultado empilhado.
+#[derive(Debug, Clone)]
+enum PendingHof {
+    /// `map`: aplica `func` a cada item, acumulando resultados.
+    Map {
+        func: FuncValue,
+        items: Vec<Value>,
+        /// Indice do item cuja chamada esta em voo.
+        next: usize,
+        acc: Vec<Value>,
+    },
+    /// `filter`: como `map`, mas so acumula quando o retorno e `Bool(true)`.
+    Filter {
+        func: FuncValue,
+        items: Vec<Value>,
+        next: usize,
+        acc: Vec<Value>,
+    },
+    /// `usort`: insertion sort estavel dirigido por comparacoes.
+    Sort {
+        func: FuncValue,
+        sorted: Vec<Value>,
+        /// Proximo par a comparar: `(sorted[j], sorted[j-1])`, `j = max(1, ..)`.
+        i: usize,
+        j: usize,
+    },
 }
 
 /// Handler de `try`: para onde saltar e com que escopos/pilha.
@@ -229,6 +262,7 @@ impl Vm {
             stack: Vec::new(),
             scopes: vec![HashMap::new()],
             handlers: Vec::new(),
+            pending: None,
         });
     }
 
@@ -438,7 +472,22 @@ impl Vm {
                     .cloned()
                     .ok_or_else(|| VmError::new(format!("funcao {func_idx} inexistente")))?;
                 let name = func.name.clone();
-                self.declare(idx, &name, Value::Func(func))?;
+                // Semantica uniforme (RFC 0003): funcao nomeada aninhada
+                // tambem fecha sobre o ambiente de definicao.
+                let env = self.capture_env(idx);
+                self.declare(idx, &name, Value::Func(FuncValue { def: func, env }))?;
+                self.frames[idx].ip += 1;
+            }
+            Op::MakeFunc(func_idx) => {
+                let def = self.frames[idx]
+                    .funcs
+                    .get(func_idx as usize)
+                    .cloned()
+                    .ok_or_else(|| VmError::new(format!("funcao {func_idx} inexistente")))?;
+                let env = self.capture_env(idx);
+                self.frames[idx]
+                    .stack
+                    .push(Value::Func(FuncValue { def, env }));
                 self.frames[idx].ip += 1;
             }
             Op::Call(arity) => {
@@ -451,7 +500,13 @@ impl Vm {
                 }
                 self.frames.pop();
                 let caller = self.frames.len() - 1;
-                self.push_checked(caller, value)?;
+                // Retomada de HOF (RFC 0005): o valor e o retorno do callback;
+                // sem HOF pendente, entrega normal ao chamador.
+                if let Some(pending) = self.frames[caller].pending.take() {
+                    self.advance_hof(caller, pending, value)?;
+                } else {
+                    self.push_checked(caller, value)?;
+                }
             }
             Op::Pop => {
                 self.pop(idx, "descarte de valor")?;
@@ -582,15 +637,21 @@ impl Vm {
                     }
                 }
                 args.reverse();
-                let result = call_builtin(
-                    builtin,
-                    &args,
-                    &self.argv,
-                    &mut self.db,
-                    self.program.clone(),
-                )?;
-                self.push_checked(idx, result)?;
-                self.frames[idx].ip += 1;
+                // HOFs com callback (RFC 0005): protocolo de chamada pendente
+                // (nunca passam pelo `call_builtin` sincrono).
+                if matches!(builtin, Builtin::Map | Builtin::Filter | Builtin::Usort) {
+                    self.hof_begin(idx, builtin, args)?;
+                } else {
+                    let result = call_builtin(
+                        builtin,
+                        &args,
+                        &self.argv,
+                        &mut self.db,
+                        self.program.clone(),
+                    )?;
+                    self.push_checked(idx, result)?;
+                    self.frames[idx].ip += 1;
+                }
             }
         }
         self.check_stack_depth(idx)?;
@@ -678,6 +739,18 @@ impl Vm {
         false
     }
 
+    /// Fotografa o ambiente atual por valor (RFC 0003): funde os escopos
+    /// do mais externo ao mais interno, de modo que o interno sombreie.
+    fn capture_env(&self, idx: usize) -> std::collections::HashMap<String, Value> {
+        let mut env = std::collections::HashMap::new();
+        for scope in self.frames[idx].scopes.iter() {
+            for (k, v) in scope {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+        env
+    }
+
     /// Declara no escopo atual (ou globais, no topo do programa principal).
     fn declare(&mut self, idx: usize, name: &str, value: Value) -> Result<(), VmError> {
         if self.frames.len() == 1 && self.frames[idx].scopes.len() == 1 {
@@ -724,12 +797,35 @@ impl Vm {
                 )));
             }
         };
-        if func.params.len() != arity {
+        self.push_call_frame(func, args)?;
+        self.frames[idx].ip += 1;
+        Ok(())
+    }
+
+    /// Empilha a ativacao de `func` com `args` (checa aridade e profundidade;
+    /// escopo unico = clone do env + params). NAO avanca o `ip` do chamador:
+    /// quem chama avanca exatamente uma vez (no HOF, so na primeira chamada;
+    /// as seguintes retomam do `Return` com o `ip` ja posicionado).
+    /// Usado por `Call` e pelo protocolo de HOFs (RFC 0005).
+    fn push_call_frame(&mut self, func: FuncValue, args: Vec<Value>) -> Result<(), VmError> {
+        // Aridade flexivel (RFC 0006): `required` = iniciais sem padrao
+        // (parse garante: opcionais so no fim); excedentes vao para `...rest`.
+        let total = func.def.params.len();
+        let required =
+            func.def.params.len() - func.def.defaults.iter().filter(|d| d.is_some()).count();
+        if args.len() < required {
+            return Err(VmError::new(format!(
+                "funcao `{}` espera ao menos {required} argumentos, recebeu {}",
+                func.def.name,
+                args.len()
+            )));
+        }
+        if args.len() > total && func.def.variadic.is_none() {
             return Err(VmError::new(format!(
                 "funcao `{}` espera {} argumentos, recebeu {}",
-                func.name,
-                func.params.len(),
-                arity
+                func.def.name,
+                total,
+                args.len()
             )));
         }
         if self.frames.len() >= MAX_CALL_DEPTH {
@@ -737,22 +833,219 @@ impl Vm {
                 "limite de chamadas excedido (recursao muito profunda?)",
             ));
         }
-        let mut scope = HashMap::with_capacity(func.params.len());
-        for (param, arg) in func.params.iter().zip(args) {
-            scope.insert(param.clone(), arg);
+        // Escopo unico da ativacao: ambiente capturado + parametros por
+        // cima (parametro sombreia variavel capturada com o mesmo nome).
+        // Posicoes ausentes usam o padrao compilado (`null` explicito e valor,
+        // nao aciona padrao); excedentes vao para `...rest` (`[]` se nenhum).
+        // Guarda de `ExitScope` preservada: base continua com 1 escopo.
+        let mut scope = func.env.clone();
+        for (i, name) in func.def.params.iter().enumerate() {
+            if i < args.len() {
+                scope.insert(name.clone(), args[i].clone());
+            } else if let Some(default) = &func.def.defaults[i] {
+                scope.insert(name.clone(), default.clone());
+            } else {
+                return Err(VmError::new(format!(
+                    "funcao `{}` sem valor para `{name}` (bug interno: padrao ausente)",
+                    func.def.name
+                )));
+            }
         }
-        self.frames[idx].ip += 1;
+        if let Some(rest) = &func.def.variadic {
+            let extra = if args.len() > total {
+                args[total..].to_vec()
+            } else {
+                Vec::new()
+            };
+            scope.insert(rest.clone(), Value::Array(extra));
+        }
         self.frames.push(Frame {
-            code: func.body.code.clone(),
-            constants: func.body.constants.clone(),
-            names: func.body.names.clone(),
-            funcs: func.body.funcs.iter().map(|f| Rc::new(f.clone())).collect(),
+            code: func.def.body.code.clone(),
+            constants: func.def.body.constants.clone(),
+            names: func.def.body.names.clone(),
+            funcs: func
+                .def
+                .body
+                .funcs
+                .iter()
+                .map(|f| Rc::new(f.clone()))
+                .collect(),
             ip: 0,
             stack: Vec::new(),
             scopes: vec![scope],
             handlers: Vec::new(),
+            pending: None,
         });
         Ok(())
+    }
+
+    /// Inicia `map`/`filter`/`usort` (RFC 0005): valida `(colecao, funcao)`,
+    /// guarda o progresso em `pending` e empilha a primeira ativacao do
+    /// callback. Array vazio finaliza sem chamar.
+    fn hof_begin(&mut self, idx: usize, builtin: Builtin, args: Vec<Value>) -> Result<(), VmError> {
+        let name = match builtin {
+            Builtin::Map => "map",
+            Builtin::Filter => "filter",
+            _ => "usort",
+        };
+        let (func, items) = match (&args[0], &args[1]) {
+            (Value::Array(items), Value::Func(func)) => (func.clone(), items.clone()),
+            (arr, f) => {
+                return Err(VmError::new(format!(
+                    "`{name}` exige (array, funcao), encontrado ({}, {})",
+                    type_name(arr),
+                    type_name(f)
+                )));
+            }
+        };
+        if items.is_empty() {
+            self.push_checked(idx, Value::Array(Vec::new()))?;
+            self.frames[idx].ip += 1;
+            return Ok(());
+        }
+        match builtin {
+            Builtin::Map | Builtin::Filter => {
+                let first = items[0].clone();
+                let pending = if matches!(builtin, Builtin::Map) {
+                    PendingHof::Map {
+                        func: func.clone(),
+                        items,
+                        next: 0,
+                        acc: Vec::new(),
+                    }
+                } else {
+                    PendingHof::Filter {
+                        func: func.clone(),
+                        items,
+                        next: 0,
+                        acc: Vec::new(),
+                    }
+                };
+                self.frames[idx].pending = Some(pending);
+                self.push_call_frame(func, vec![first])?;
+                self.frames[idx].ip += 1;
+                Ok(())
+            }
+            // Insertion sort passo a passo: primeira comparacao do par (1, 0).
+            _ => {
+                if items.len() < 2 {
+                    self.push_checked(idx, Value::Array(items))?;
+                    self.frames[idx].ip += 1;
+                    return Ok(());
+                }
+                let a = items[1].clone();
+                let b = items[0].clone();
+                self.frames[idx].pending = Some(PendingHof::Sort {
+                    func: func.clone(),
+                    sorted: items,
+                    i: 1,
+                    j: 1,
+                });
+                self.push_call_frame(func, vec![a, b])?;
+                self.frames[idx].ip += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Avanca o HOF com o retorno do callback: acumula e empilha a proxima
+    /// chamada, ou finaliza empilhando o resultado. Chamado no `Return`.
+    fn advance_hof(&mut self, idx: usize, pending: PendingHof, ret: Value) -> Result<(), VmError> {
+        match pending {
+            PendingHof::Map {
+                func,
+                items,
+                mut next,
+                mut acc,
+            } => {
+                acc.push(ret);
+                next += 1;
+                if next < items.len() {
+                    let arg = items[next].clone();
+                    self.frames[idx].pending = Some(PendingHof::Map {
+                        func: func.clone(),
+                        items,
+                        next,
+                        acc,
+                    });
+                    self.push_call_frame(func, vec![arg])
+                } else {
+                    self.push_checked(idx, Value::Array(acc))
+                }
+            }
+            PendingHof::Filter {
+                func,
+                items,
+                mut next,
+                mut acc,
+            } => {
+                match ret {
+                    Value::Bool(true) => acc.push(items[next].clone()),
+                    Value::Bool(false) => {}
+                    other => {
+                        return Err(VmError::new(format!(
+                            "`filter` exige retorno bool, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                }
+                next += 1;
+                if next < items.len() {
+                    let arg = items[next].clone();
+                    self.frames[idx].pending = Some(PendingHof::Filter {
+                        func: func.clone(),
+                        items,
+                        next,
+                        acc,
+                    });
+                    self.push_call_frame(func, vec![arg])
+                } else {
+                    self.push_checked(idx, Value::Array(acc))
+                }
+            }
+            PendingHof::Sort {
+                func,
+                mut sorted,
+                mut i,
+                mut j,
+            } => {
+                let cmp = match ret {
+                    Value::Int(c) => c,
+                    other => {
+                        return Err(VmError::new(format!(
+                            "comparador de `usort` deve retornar int, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                };
+                let n = sorted.len();
+                if cmp < 0 {
+                    sorted.swap(j, j - 1);
+                    if j > 1 {
+                        j -= 1;
+                    } else {
+                        i += 1;
+                        j = i;
+                    }
+                } else {
+                    i += 1;
+                    j = i;
+                }
+                if i < n {
+                    let a = sorted[j].clone();
+                    let b = sorted[j - 1].clone();
+                    self.frames[idx].pending = Some(PendingHof::Sort {
+                        func: func.clone(),
+                        sorted,
+                        i,
+                        j,
+                    });
+                    self.push_call_frame(func, vec![a, b])
+                } else {
+                    self.push_checked(idx, Value::Array(sorted))
+                }
+            }
+        }
     }
 
     /// Desenrola frames ate o handler de `try` mais interno.
@@ -960,7 +1253,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Str(a), Value::Str(b)) => a == b,
         (Value::Array(a), Value::Array(b)) => a == b,
         (Value::Map(a), Value::Map(b)) => a == b,
-        (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
+        (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(&a.def, &b.def) && a.env == b.env,
         _ => false,
     }
 }
@@ -1306,10 +1599,295 @@ mod tests {
     }
 
     #[test]
+    fn runs_map_with_callback() {
+        assert_eq!(
+            run_src("echo map([1, 2, 3], fn (x) { return x * 2; });").expect("ok"),
+            "[2, 4, 6]\n"
+        );
+        // Callback captura o ambiente (closure de verdade, nao funcao solta).
+        assert_eq!(
+            run_src("let k = 10; echo map([1, 2], fn (x) { return x + k; });").expect("ok"),
+            "[11, 12]\n"
+        );
+        // Vazio nao chama; aninhado funciona (`pending` e por frame).
+        assert_eq!(
+            run_src("echo map([], fn (x) { return x; });").expect("ok"),
+            "[]\n"
+        );
+        assert_eq!(
+            run_src(
+                "echo map([[1, 2], [3]], fn (r) { return map(r, fn (x) { return x * 10; }); });"
+            )
+            .expect("ok"),
+            "[[10, 20], [30]]\n"
+        );
+        // Erros claros: tipos e aridade do callback.
+        assert!(run_err("echo map(1, fn (x) { return x; });").contains("array, funcao"));
+        assert!(run_err("echo map([1], 42);").contains("array, funcao"));
+        assert!(run_err("echo map([1], fn (a, b) { return a; });").contains("ao menos 2"));
+        // `throw` no callback propaga (estado pendente descartado com o frame).
+        assert_eq!(
+            run_src("try { echo map([1], fn (x) { throw \"boom\"; }); } catch e { echo e; }")
+                .expect("ok"),
+            "boom\n"
+        );
+    }
+
+    #[test]
+    fn runs_filter_with_callback() {
+        assert_eq!(
+            run_src("echo filter([1, 2, 3, 4], fn (x) { return x > 2; });").expect("ok"),
+            "[3, 4]\n"
+        );
+        assert_eq!(
+            run_src("echo filter([], fn (x) { return true; });").expect("ok"),
+            "[]\n"
+        );
+        // Sem truthiness: retorno nao-bool e erro (divergencia PHP documentada).
+        assert!(run_err("echo filter([1], fn (x) { return x; });").contains("bool"));
+    }
+
+    #[test]
+    fn runs_usort_with_comparator() {
+        assert_eq!(
+            run_src("echo usort([3, 1, 2], fn (a, b) { return a - b; });").expect("ok"),
+            "[1, 2, 3]\n"
+        );
+        assert_eq!(
+            run_src("echo usort([1, 2, 3], fn (a, b) { return b - a; });").expect("ok"),
+            "[3, 2, 1]\n"
+        );
+        // Estavel: empates mantem a ordem original.
+        assert_eq!(
+            run_src("echo usort([{k: 1, v: \"a\"}, {k: 1, v: \"b\"}, {k: 0, v: \"c\"}], fn (x, y) { return x[\"k\"] - y[\"k\"]; });")
+                .expect("ok"),
+            "[{k: 0, v: c}, {k: 1, v: a}, {k: 1, v: b}]\n"
+        );
+        assert_eq!(
+            run_src("echo usort([], fn (a, b) { return 0; });").expect("ok"),
+            "[]\n"
+        );
+        assert_eq!(
+            run_src("echo usort([5], fn (a, b) { return 0; });").expect("ok"),
+            "[5]\n"
+        );
+        // Comparador deve retornar int.
+        assert!(run_err("echo usort([2, 1], fn (a, b) { return true; });").contains("int"));
+        assert!(run_err("echo usort(1, fn (a, b) { return 0; });").contains("array, funcao"));
+    }
+
+    #[test]
+    fn runs_default_and_variadic_args() {
+        // Default aplicado; expressao constante dobrada em compilacao.
+        assert_eq!(
+            run_src("fn f(a, b = 2, c = 1 + 2) { return a + b + c; } echo f(10);").expect("ok"),
+            "15\n"
+        );
+        // `null` explicito e valor (nao aciona default).
+        assert_eq!(
+            run_src(
+                "fn f(a = 1) { if a == null { return \"nulo\"; } return \"cheio\"; } echo f(null);"
+            )
+            .expect("ok"),
+            "nulo\n"
+        );
+        // `...rest` coleta excedentes (`[]` se nenhum).
+        assert_eq!(
+            run_src("fn f(a, ...rest) { return rest; } echo f(1); echo f(1, 2, 3);").expect("ok"),
+            "[]\n[2, 3]\n"
+        );
+        // Combinado: default + variadico; `...rest` sombreia captura.
+        assert_eq!(
+            run_src("let rest = 99; let f = fn (a, b = 20, ...rest) { return a + b + rest[0]; }; echo f(1, 2, 3); echo rest;")
+                .expect("ok"),
+            "6\n99\n"
+        );
+        // Callback com default funciona via HOF (mesmo caminho de chamada).
+        assert_eq!(
+            run_src("echo map([1], fn (x, y = 10) { return x + y; });").expect("ok"),
+            "[11]\n"
+        );
+        // Erros: abaixo do minimo, acima do maximo sem `...`, default nao-const.
+        assert!(run_err("fn f(a, b = 1) { return a; } echo f();").contains("ao menos 1"));
+        assert!(run_err("fn f(a) { return a; } echo f(1, 2);").contains("espera 1"));
+    }
+
+    #[test]
+    fn rejects_second_variadic_at_parse() {
+        // `...` so um e por ultimo: o segundo nao e aceito no parse.
+        let err = parse_source("fn f(a, ...r, ...s) { return a; }")
+            .expect_err("segundo `...` deve falhar");
+        assert!(err.contains("`)`"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_destructuring() {
+        // Array por posicao; excedentes ignorados.
+        assert_eq!(
+            run_src("let [a, b] = [1, 2, 3]; echo a; echo b;").expect("ok"),
+            "1\n2\n"
+        );
+        // Mapa: atalho e renomeado.
+        assert_eq!(
+            run_src("let {x} = {x: 10, y: 20}; echo x;").expect("ok"),
+            "10\n"
+        );
+        assert_eq!(
+            run_src("let {k: v} = {k: 99}; echo v;").expect("ok"),
+            "99\n"
+        );
+        // `const` congela todos (atribuir depois e erro de compilacao).
+        assert_eq!(
+            run_src("const [c, d] = [3, 4]; echo c + d;").expect("ok"),
+            "7\n"
+        );
+        // RHS avaliado uma unica vez.
+        assert_eq!(
+            run_src("let n = 0; fn prox() { n = n + 1; return [7, 8]; } let [a, b] = prox(); echo a; echo b; echo n;")
+                .expect("ok"),
+            "7\n8\n1\n"
+        );
+        // Erros herdados: indice fora, chave ausente, duplicata, const.
+        assert!(run_err("let [a, b] = [1]; echo a;").contains("fora do intervalo"));
+        assert!(run_err("let {z} = {x: 1}; echo z;").contains("chave"));
+        assert!(run_err("let [a, a] = [1, 2];").contains("ja declarada"));
+        // Atribuir a `const` desestruturado e erro de compilacao (regra vigente).
+        let program = parse_source("const [c] = [1]; c = 2;").expect("parse deve passar");
+        let err = rhp_bytecode::compile(&program).expect_err("atribuicao a const deve falhar");
+        assert!(err.message.contains("constante"), "obteve: {}", err.message);
+    }
+
+    #[test]
+    fn runs_switch_statement() {
+        // Match + break (sem fallthrough).
+        assert_eq!(
+            run_src("switch 2 { case 1 { echo \"a\"; } case 2 { echo \"b\"; break; } default { echo \"d\"; } }")
+                .expect("ok"),
+            "b\n"
+        );
+        // Fallthrough ate o fim quando nao ha `break`.
+        assert_eq!(
+            run_src("switch 1 { case 1 { echo \"a\"; } case 2 { echo \"b\"; } default { echo \"d\"; } }")
+                .expect("ok"),
+            "a\nb\nd\n"
+        );
+        // `default` no meio: casa por ordem, fallthrough continua depois.
+        assert_eq!(
+            run_src("switch 2 { case 1 { echo \"a\"; } default { echo \"d\"; } case 2 { echo \"b\"; } }")
+                .expect("ok"),
+            "d\nb\n"
+        );
+        // Sem match e sem default: nada executa.
+        assert_eq!(
+            run_src("switch 99 { case 1 { echo \"x\"; } }").expect("ok"),
+            ""
+        );
+        // So default.
+        assert_eq!(
+            run_src("switch 99 { default { echo \"d\"; } }").expect("ok"),
+            "d\n"
+        );
+        // Vazio.
+        assert_eq!(run_src("switch 1 { }").expect("ok"), "");
+        // Comparacao segue o `==` do RHP (int/float com promocao; resto
+        // mesmo tipo): `1` casa com `1.0`, mas `true` nao casa com `1`.
+        assert_eq!(
+            run_src("switch 1 { case 1.0 { echo \"num\"; } }").expect("ok"),
+            "num\n"
+        );
+        assert_eq!(
+            run_src("switch true { case 1 { echo \"x\"; } default { echo \"d\"; } }").expect("ok"),
+            "d\n"
+        );
+        // Discriminante avaliado uma unica vez.
+        assert_eq!(
+            run_src("let n = 0; fn prox() { n = n + 1; return n; } switch prox() { case 1 { echo \"ok\"; } } echo n;")
+                .expect("ok"),
+            "ok\n1\n"
+        );
+        // `let` repetido em cases distintos nao colide (escopo por case).
+        assert_eq!(
+            run_src(
+                "switch 2 { case 1 { let v = 1; echo v; } case 2 { let v = 2; echo v; break; } }"
+            )
+            .expect("ok"),
+            "2\n"
+        );
+        // Aninhado + `break` so sai do interno.
+        assert_eq!(
+            run_src("switch 1 { case 1 { switch 2 { case 2 { echo \"dentro\"; break; } } echo \"fora\"; break; } }")
+                .expect("ok"),
+            "dentro\nfora\n"
+        );
+        // `switch` em laco: `continue` mira o laco, `break` sai do `switch`.
+        assert_eq!(
+            run_src("let i = 0; while i < 3 { i = i + 1; switch i { case 2 { continue; } default { echo i; } } echo \"f\"; }")
+                .expect("ok"),
+            "1\nf\n3\nf\n"
+        );
+        // Laco em case: `break` sai do laco (mais interno).
+        assert_eq!(
+            run_src("switch 1 { case 1 { let j = 0; while j < 5 { j = j + 1; if j == 2 { break; } } echo j; break; } }")
+                .expect("ok"),
+            "2\n"
+        );
+        // `return` em case sai da ativacao.
+        assert_eq!(
+            run_src("fn f(x) { switch x { case 1 { return \"um\"; } default { return \"outro\"; } } } echo f(1); echo f(9);")
+                .expect("ok"),
+            "um\noutro\n"
+        );
+    }
+
+    #[test]
     fn reports_call_errors() {
         assert!(run_err("echo f();").contains("nao definida"));
         assert!(run_err("let f = 1; echo f();").contains("como funcao"));
         assert!(run_err("fn f(a) { return a; } echo f(1, 2);").contains("espera 1"));
+    }
+
+    #[test]
+    fn closures_capture_by_value_and_call() {
+        // Basico: atribuicao + chamada.
+        assert_eq!(
+            run_src("let f = fn (x) { return x + 1; }; echo f(41);").expect("ok"),
+            "42\n"
+        );
+        // IIFE: chamada direta do literal.
+        assert_eq!(
+            run_src("echo (fn (x) { return x * 2; })(21);").expect("ok"),
+            "42\n"
+        );
+        // Captura por valor: snapshot do escopo de ativacao. `n = 20`
+        // altera o escopo, nao o clone que a closure carrega.
+        assert_eq!(
+            run_src("fn mk() { let n = 10; let f = fn () { return n; }; n = 20; return f; } let g = mk(); echo g();").expect("ok"),
+            "10\n"
+        );
+        // Nivel superior: `let` vive em `globals` (mapa do modulo), fora
+        // da cadeia de escopos — closure e `fn` nomeada enxergam o valor
+        // atual, em paridade (nao congela comportamento existente).
+        assert_eq!(
+            run_src("let n = 10; let f = fn () { return n; }; n = 20; echo f();").expect("ok"),
+            "20\n"
+        );
+        assert_eq!(
+            run_src("let n = 10; fn g() { return n; } n = 20; echo g();").expect("ok"),
+            "20\n"
+        );
+        // Parametro sombreia variavel capturada com o mesmo nome.
+        assert_eq!(
+            run_src("let x = 1; let f = fn (x) { return x; }; echo f(2);").expect("ok"),
+            "2\n"
+        );
+        // Encadeada via variavel: `f(x)(y)`.
+        assert_eq!(
+            run_src("let f = fn (x) { return fn (y) { return x + y; }; }; echo f(40)(2);")
+                .expect("ok"),
+            "42\n"
+        );
+        // Nao-funcao em callee arbitrario continua erro claro.
+        assert!(run_err("let f = 1; echo (f)(2);").contains("como funcao"));
     }
 
     #[test]

@@ -492,6 +492,11 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+        // HOFs com callback (RFC 0005) nunca chegam aqui: o `step` intercepta
+        // e executa via protocolo de chamada pendente. Defesa em profundidade.
+        Builtin::Map | Builtin::Filter | Builtin::Usort => Err(VmError::new(
+            "HOF com callback fora do protocolo de execucao (bug interno)".to_string(),
+        )),
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)

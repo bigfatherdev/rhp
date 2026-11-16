@@ -49,23 +49,30 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 ## 2. Instrucoes
 
 ```text
-Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt
-           | ForStmt | TryStmt | ThrowStmt | BreakStmt | ContinueStmt | FnDef
+Stmt       := LetStmt | ConstStmt | DestructureStmt | AssignStmt | EchoStmt
+           | IfStmt | WhileStmt | ForStmt | SwitchStmt | TryStmt | ThrowStmt
+           | BreakStmt | ContinueStmt | FnDef
            | ReturnStmt | Block | ImportStmt | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
 ConstStmt  := "const" Ident "=" Expr ";"
+DestructureStmt := ("let" | "const") ("[" Ident ("," Ident)* "]"
+           | "{" (Ident | Ident ":" Ident) ("," (Ident | Ident ":" Ident))* "}") "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
 Target     := Ident | Ident "[" Expr "]"
 EchoStmt   := "echo" Expr ";"
 IfStmt     := "if" Expr Block ("else" Block)?
 WhileStmt  := "while" Expr Block
 ForStmt    := "for" Ident "in" Expr Block
+SwitchStmt := "switch" Expr "{" (CaseClause | DefaultClause)* "}"
+CaseClause := "case" Expr Block   // `default` unico, posicao livre
+DefaultClause := "default" Block
 TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
            // ao menos um de `catch`/`finally` e obrigatorio
 ThrowStmt  := "throw" Expr ";"
 BreakStmt  := "break" ";"
 ContinueStmt := "continue" ";"
-FnDef      := "fn" Ident "(" (Ident ("," Ident)*)? ")" Block
+FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" Block
+Param      := Ident ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
 ReturnStmt := "return" Expr? ";"
 ImportStmt := "import" String ";"
 ExprStmt   := Expr ";"
@@ -73,6 +80,12 @@ ExprStmt   := Expr ";"
 
 - `let x = e;` declara no escopo atual (`let x;` inicializa com `null`).
   Redeclarar no mesmo escopo e erro em runtime.
+- `let [a, b] = e;` / `let {x} = e;` / `let {k: v} = e;` (e formas `const`,
+  que congelam todos; RFC 0007): avalia `e` uma vez e desempacota por
+  posicao (array) ou chave (mapa; `{x}` = chave `"x"`). Indice fora dos
+  limites, chave ausente e duplicata no padrao = erro (regras vigentes de
+  `Index`/`DeclareName`; sem `null` silencioso). Padroes vazios e aninhados
+  = erro de parse.
 - `x = e;` exige variavel visivel (escopos internos -> externos -> globais).
 - `echo e;` escreve `Display` do valor + `\n` (qualquer tipo).
 - `if`/`while` exigem condicao `Bool` (sem truthiness implicita). `while`
@@ -81,13 +94,24 @@ ExprStmt   := Expr ";"
   ordem (mesma ordem de `keys`); outro tipo = erro de runtime ("`for`
   exige array ou mapa"). `x` e declarada a cada iteracao no escopo do
   corpo (atribuir a `x` nao afeta a iteracao; para strings, use
-  `for c in split(s, "")`). `break`/`continue` (sempre dentro de `while`
-  ou `for`, mesmo aninhados em `if`/blocos) saem da iteracao ou do laco
-  e fecham tambem o escopo do corpo — `let`s internos nao vazam para fora;
-  fora de laco e erro de compilacao. `continue` no `for` pula ao proximo
+  `for c in split(s, "")`). `break` (dentro de `while`, `for` ou `switch`,
+  mesmo aninhados em `if`/blocos) sai do laco/`switch` mais interno e fecha
+  tambem o escopo do corpo — `let`s internos nao vazam para fora; fora de
+  laco/`switch` e erro de compilacao. `continue` exige laco externo (pula
+  `switch`s no caminho). `continue` no `for` pula ao proximo
   elemento. `in` e contextual (identificador comum fora do `for`), mas
   `for` e palavra reservada. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
+- `switch e { case c { ... } default { ... } }` (RFC 0004): avalia `e` uma
+  vez; cada `case` compara com `==` do RHP em ordem ate o primeiro match
+  (preguicoso); sem `break`, o controle cai no proximo ramo (fallthrough);
+  `default` e unico, em qualquer posicao, e casa quando alcancado sem match
+  anterior. `break` sai do `switch` (mais interno); `continue` ignora o
+  `switch` e mira o laco mais externo (sem laco = erro de compilacao).
+  Cada ramo tem escopo proprio (`let` repetido em ramos distintos nao
+  colide). `case`/`default` fora de `switch` e erro de parse; `switch`
+  vazio e permitido. `switch(true)` com cases int nao casa (`==` nao promove
+  `Bool`; ver `PHP_DIFFERENCES.md`).
 - `try B (catch V? C)? (finally F)?` (ao menos um dos dois): erro em `B`
   (incluindo `throw`, `assert` falho, builtin com erro) procura o `catch`
   mais interno na mesma funcao; sem handler, desenrola chamadas (rodando
@@ -101,11 +125,24 @@ ExprStmt   := Expr ";"
   (inclusive `NOME[i] = v`) e erro de compilacao.
 - `fn nome(params) { ... }` declara funcao no escopo atual. Chamada
   `nome(args)` avalia callee e argumentos da esquerda para a direita;
-  aridade deve coincidir. `return e;` sai da funcao com o valor (`return;`
+  aridade: sem defaults/`...`, exata; com defaults, ao menos os
+  obrigatorios (iniciais; obrigatorio apos opcional e erro de parse);
+  `...rest` (no maximo um, por ultimo) coleta excedentes em `Array`
+  (`[]` se nenhum). Ausentes usam o padrao compilado (`null` explicito
+  e valor, nao aciona padrao). `return e;` sai da funcao com o valor (`return;`
   retorna `null`); fim do corpo sem `return` tambem retorna `null`.
   `return` fora de funcao e erro de compilacao. Recursao permitida ate
   `MAX_CALL_DEPTH = 512` (erro apos o limite). Funcoes enxergam parametros,
-  locais proprios e globais (sem closures sobre locais de outras funcoes).
+  locais proprios, ambiente capturado (closures) e globais.
+- `fn (params) { ... }` (sem nome) e expressao: cria funcao de primeira
+  classe capturando o ambiente atual por valor (snapshot dos escopos
+  internos para os externos; parametros sombreiam capturadas). Atribuicao
+  posterior ao mesmo nome nao afeta a closure ja criada dentro de funcoes;
+  no nivel superior, `let` vive em `globals` e segue dinamico (paridade com
+  `fn` nomeada). Chamada de callee arbitrario: `(fn (x) { ... })(41)`,
+  `f(x)(y)`; `f(x)` direto preserva o caminho classico (precedencia de
+  builtins). `import`/`export` dentro de closure e erro do loader
+  (so nivel superior). Display: `<fn {closure}>` para anonimas.
 - `ExprStmt` (ex.: `f();`) avalia e descarta o valor.
 
 ## 3. Expressoes e precedencia (da menor para a maior)
@@ -118,11 +155,14 @@ OU-bit (`|`) < XOR-bit (`^`) < E-bit (`&`) < comparacao (`<`, `<=`, `>`,
 
 ```text
 Primary   := Int | Float | String | "true" | "false" | "null"
-           | Array | Map | Ident | Call | "(" Expr ")"
+           | Array | Map | Ident | Closure | "(" Expr ")"
+Closure   := "fn" "(" (Ident ("," Ident)*)? ")" Block
 Array     := "[" (Expr ("," Expr)*)? "]"
 Map       := "{" ((String | Ident) ":" Expr ("," ...)*)? "}"
 Call      := Ident "(" (Expr ("," Expr)*)? ")"
-// Posfixo: Primary ("[" Expr "]")*  (indexacao encadeada em leitura)
+CallValue := Postfix "(" (Expr ("," Expr)*)? ")" // callee arbitrario
+// Posfixo: Primary (("[" Expr "]") | ("(" Args ")"))* (indexacao e
+// chamada encadeadas; callee `Ident` simples usa `Call` classico)
 ```
 
 Literais: inteiros `i64` (`42`), floats (`1.5`, ao menos um digito apos o
@@ -139,8 +179,8 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
   `%` exige `Int` e `Int`. `-x` exige numero; `!b` exige `Bool`.
 - Comparacao: `< <= > >=` aceitam numero-numero (com promocao) e
   `Str`-`Str` (lexicografica); resto e erro. `==`/`!=` aceitam quaisquer
-  valores: `Int`/`Float` comparam numericamente, funcoes por identidade,
-  tipos diferentes sao diferentes.
+  valores: `Int`/`Float` comparam numericamente, funcoes por identidade de
+  definicao + igualdade do ambiente capturado, tipos diferentes sao diferentes.
 - Bitwise (`& | ^`, so `Int`): E/OU/XOR bit a bit; `~x` inverte os bits de
   `Int`; `<<`/`>>` deslocam (deslocamento negativo ou >= 64 = erro).
 - Ternario `c ? a : b` avalia so o ramo escolhido (`c` deve ser `Bool`).
@@ -207,6 +247,9 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `argv()` | `Array` de `Str` com os argumentos apos o arquivo (`rhp run prog.rhp a b` => `["a", "b"]`). |
 | `env(nome)` | Valor da variavel de ambiente ou `null` se ausente. |
 | `sort(arr)` | Copia ordenada (estavel): numeros (`Int`/`Float`, mistos comparam exato quando possivel), `Str` (ordem lexicografica de bytes UTF-8) ou `Bool` (`false` < `true`); vazio => vazio. Mistura com outros tipos ou nao-array = erro. Nao muta o original (`a = sort(a);`). |
+| `map(arr, f)` | (RFC 0005) Aplica `f(elem)` a cada elemento e devolve array de resultados (mesma ordem); vazio => `[]` sem chamar. `f` declara exatamente 1 param. |
+| `filter(arr, f)` | (RFC 0005) Devolve elementos cujo `f(elem)` retorna `Bool(true)` (ordem preservada); vazio => `[]`. Retorno nao-`Bool` = erro (sem truthiness). `f` declara exatamente 1 param. |
+| `usort(arr, cmp)` | (RFC 0005) Copia ordenada por `cmp(a, b): Int` (`< 0`: `a` antes; `> 0`: depois; `0`: empate, estavel — insertion sort). Retorno nao-`Int` = erro. Vazio/unitario nao chama. Nao muta o original. |
 | `exit(codigo)` | Encerra o programa com codigo 0-255 (fora disso ou nao-`Int` = erro). Desenrola chamadas; em `rhp test`, conta como falha do arquivo. |
 | `now()` | Segundos desde 1970-01-01T00:00:00Z (`Int`; relogio do sistema). |
 | `sleep(s)` | Bloqueia `s` segundos (`Int`/`Float`; fracao = sub-segundo). Negativo, nao-finito ou > 3600 = erro. Devolve `null`. VM single-thread: tudo para junto. |

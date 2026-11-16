@@ -6,9 +6,9 @@
 //! Program    := Stmt*
 //! Block      := "{" Stmt* "}"
 //! Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt
-//!             | WhileStmt | ForStmt | TryStmt | ThrowStmt | BreakStmt
-//!             | ContinueStmt | FnDef | ReturnStmt | Block | ImportStmt
-//!             | ImportNames | Export | ExprStmt
+//!             | WhileStmt | ForStmt | SwitchStmt | TryStmt | ThrowStmt
+//!             | BreakStmt | ContinueStmt | FnDef | ReturnStmt | Block
+//!             | ImportStmt | ImportNames | Export | ExprStmt
 //! LetStmt    := "let" Ident ("=" Expr)? ";"
 //! ConstStmt  := "const" Ident "=" Expr ";"
 //! AssignStmt := Target "=" Expr ";"
@@ -17,6 +17,9 @@
 //! IfStmt     := "if" Expr Block ("else" Block)?
 //! WhileStmt  := "while" Expr Block
 //! ForStmt    := "for" Ident "in" Expr Block
+//! SwitchStmt := "switch" Expr "{" (CaseClause | DefaultClause)* "}"
+//! CaseClause := "case" Expr Block  // `default` unico, posicao livre
+//! DefaultClause := "default" Block
 //! TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
 //!             // ao menos um de `catch`/`finally` e obrigatorio
 //! ThrowStmt  := "throw" Expr ";"
@@ -40,12 +43,14 @@
 //! Addition   := Multiplication (("+" | "-") Multiplication)*
 //! Multiplication := Unary (("*" | "/" | "%") Unary)*
 //! Unary      := ("!" | "-" | "~" | "+") Unary | Postfix
-//! Postfix    := Primary ("[" Expr "]")*
+//! Postfix    := Primary (("[" Expr "]") | ("(" Args ")"))*
 //! Primary    := Int | Float | String | "true" | "false" | "null"
-//!             | Array | Map | Ident | Call | "(" Expr ")"
+//!             | Array | Map | Ident | Closure | "(" Expr ")"
+//! Closure    := "fn" "(" (Ident ("," Ident)*)? ")" Block
 //! Array      := "[" (Expr ("," Expr)*)? "]"
 //! Map        := "{" ((String | Ident) ":" Expr ("," ...)*)? "}"
-//! Call       := Ident "(" (Expr ("," Expr)*)? ")"
+//! Call       := Ident "(" (Expr ("," Expr)*)? ")"   // callee direto
+//! CallValue  := Postfix "(" (Expr ("," Expr)*)? ")" // callee arbitrario
 //! ```
 
 use rhp_lexer::{Token, TokenKind};
@@ -66,6 +71,14 @@ pub enum Stmt {
     Let {
         name: String,
         init: Option<Expr>,
+    },
+    /// `let [a, b] = expr;` / `let {x} = expr;` / `let {k: v} = expr;`
+    /// (e as formas `const`, que congelam todos; RFC 0007). RHS avaliado
+    /// uma vez; faltas viram erro do `Index` vigente (sem `null`).
+    Destructure {
+        target: DestructureTarget,
+        init: Expr,
+        is_const: bool,
     },
     /// `const NOME = expr;` — como `let`, mas imutavel (atribuicao posterior e erro de compilacao).
     Const {
@@ -96,6 +109,14 @@ pub enum Stmt {
         iter: Expr,
         body: Vec<Stmt>,
     },
+    /// `switch EXPR { (case EXPR { ... } | default { ... })* }` (RFC 0004).
+    /// Comparacao frouxa `==`, fallthrough, `default` unico em qualquer
+    /// posicao (`cond: None`). `break` sai do `switch`; `continue` mira o
+    /// laco externo (checado na compilacao).
+    Switch {
+        discriminant: Expr,
+        cases: Vec<SwitchCase>,
+    },
     /// `try BLOCO (catch VAR? BLOCO)? (finally BLOCO)?` (RFC 0001).
     /// Ao menos um de `catch`/`finally` e obrigatorio (checado no parse).
     /// `catch` presente com corpo vazio (`catch e { }`) consome o erro.
@@ -111,7 +132,9 @@ pub enum Stmt {
     },
     FnDef {
         name: String,
-        params: Vec<String>,
+        params: Vec<Param>,
+        /// `...rest` (no maximo um, por ultimo; RFC 0006).
+        variadic: Option<String>,
         body: Vec<Stmt>,
     },
     Return {
@@ -146,11 +169,35 @@ pub struct ImportName {
     pub alias: Option<String>,
 }
 
+/// Parametro de funcao/closure: nome + padrao opcional (constante, RFC 0006).
+/// O `...rest` (variadico, por ultimo) vai em `variadic`, nao aqui.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub default: Option<Expr>,
+}
+
+/// Ramo de `switch`: `cond: None` e o `default` (unico, posicao livre).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCase {
+    pub cond: Option<Expr>,
+    pub body: Vec<Stmt>,
+}
+
 /// Alvo de atribuicao: variavel ou elemento `nome[indice]` (um nivel).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignTarget {
     Var(String),
     Index { name: String, index: Expr },
+}
+
+/// Padrao de destructuring (raso; RFC 0007): por posicao `[a, b]` ou por
+/// chave `{x}` (atalho p/ `("x","x")`) / `{k: v}` (`(chave, nome)`).
+/// Aninhados sao erro de parse.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DestructureTarget {
+    Positional(Vec<String>),
+    ByKey(Vec<(String, String)>),
 }
 
 /// Expressao do RHP.
@@ -186,6 +233,27 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// Chamada de callee arbitrario: `f()(1)`, `(fn(x) { x })(2)`,
+    /// `arr[0](x)`. `f(x)` direto continua `Call` (precedencia de builtins
+    /// preservada byte a byte). `Box` no callee para nao inflar `sizeof(Expr)`
+    /// (o guarda de profundidade assume frames enxutos; ver MAX_PARSE_DEPTH).
+    CallValue {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// `fn (params) { corpo }` como valor (closure, RFC 0003).
+    /// Sem nome: recursao usa o `let` externo (ligacao tardia).
+    /// `Box` proposital: mantem `Expr` no tamanho anterior a RFC 0003.
+    Closure(Box<ClosureData>),
+}
+
+/// Corpo de closure, sempre heap-alocado (ver `Expr::Closure`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureData {
+    pub params: Vec<Param>,
+    /// `...rest` (no maximo um, por ultimo; RFC 0006).
+    pub variadic: Option<String>,
+    pub body: Vec<Stmt>,
 }
 
 /// Operador binario.
@@ -385,6 +453,7 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::If => parse_if(cursor),
         TokenKind::While => parse_while(cursor),
         TokenKind::For => parse_for(cursor),
+        TokenKind::Switch => parse_switch(cursor),
         TokenKind::Try => parse_try(cursor),
         TokenKind::Throw => parse_throw(cursor),
         TokenKind::Fn => parse_fn_def(cursor),
@@ -405,6 +474,21 @@ fn parse_echo(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 
 fn parse_const(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
+    // `const [a, b] = ...` / `const {x} = ...` (congela todos; RFC 0007).
+    if matches!(
+        cursor.peek().map(|t| &t.kind),
+        Some(TokenKind::LBracket | TokenKind::LBrace)
+    ) {
+        let target = parse_destructure_target(cursor)?;
+        expect_token(cursor, &TokenKind::Assign, "esperado `=` apos padrao")?;
+        let init = parse_expr(cursor)?;
+        expect_semicolon(cursor)?;
+        return Ok(Stmt::Destructure {
+            target,
+            init,
+            is_const: true,
+        });
+    }
     let name = expect_ident(cursor)?;
     expect_token(
         cursor,
@@ -418,6 +502,21 @@ fn parse_const(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 
 fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
+    // `let [a, b] = ...` / `let {x} = ...` / `let {k: v} = ...` (RFC 0007).
+    if matches!(
+        cursor.peek().map(|t| &t.kind),
+        Some(TokenKind::LBracket | TokenKind::LBrace)
+    ) {
+        let target = parse_destructure_target(cursor)?;
+        expect_token(cursor, &TokenKind::Assign, "esperado `=` apos padrao")?;
+        let init = parse_expr(cursor)?;
+        expect_semicolon(cursor)?;
+        return Ok(Stmt::Destructure {
+            target,
+            init,
+            is_const: false,
+        });
+    }
     let name = expect_ident(cursor)?;
     let init = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Assign)) {
         cursor.next();
@@ -427,6 +526,76 @@ fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     };
     expect_semicolon(cursor)?;
     Ok(Stmt::Let { name, init })
+}
+
+/// Padrao de destructuring apos `let`/`const` (cursor no `[` ou `{`).
+fn parse_destructure_target(cursor: &mut Cursor<'_>) -> Result<DestructureTarget, ParseError> {
+    match cursor.next().map(|t| t.kind.clone()) {
+        Some(TokenKind::LBracket) => {
+            let mut names = Vec::new();
+            if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RBracket)) {
+                loop {
+                    names.push(expect_ident(cursor)?);
+                    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
+                        cursor.next();
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            expect_token(cursor, &TokenKind::RBracket, "esperado `]` apos padrao")?;
+            if names.is_empty() {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "padrao `[]` vazio (declare ao menos um nome)".to_string(),
+                    line,
+                    col,
+                ));
+            }
+            Ok(DestructureTarget::Positional(names))
+        }
+        Some(TokenKind::LBrace) => {
+            let mut pairs = Vec::new();
+            if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RBrace)) {
+                loop {
+                    let key = expect_ident(cursor)?;
+                    // `{k: v}` renomeia; `{x}` e atalho para `("x", "x")`.
+                    let name = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) {
+                        cursor.next();
+                        expect_ident(cursor)?
+                    } else {
+                        key.clone()
+                    };
+                    pairs.push((key, name));
+                    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
+                        cursor.next();
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            expect_token(cursor, &TokenKind::RBrace, "esperado `}` apos padrao")?;
+            if pairs.is_empty() {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "padrao `{}` vazio (declare ao menos um nome)".to_string(),
+                    line,
+                    col,
+                ));
+            }
+            Ok(DestructureTarget::ByKey(pairs))
+        }
+        _ => {
+            let (line, col) = cursor.end_pos();
+            Err(ParseError::new(
+                "esperado `[` ou `{` apos `let`/`const` para destructuring".to_string(),
+                line,
+                col,
+            ))
+        }
+    }
 }
 
 /// `alvo = expr;` ou instrucao por expressao.
@@ -531,6 +700,76 @@ fn parse_for(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     Ok(Stmt::For { var, iter, body })
 }
 
+/// `switch EXPR { case EXPR { ... } default { ... } }` (RFC 0004).
+///
+/// `default` e unico (segundo = erro) e livre de posicao; cases e default
+/// exigem braces (consistente com `if`/`while`). `case`/`default` fora do
+/// `switch` nao chegam aqui (o dispatch so entra via `TokenKind::Switch`).
+fn parse_switch(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next(); // consome `switch`
+    let discriminant = parse_expr(cursor)?;
+    expect_token(
+        cursor,
+        &TokenKind::LBrace,
+        "esperado `{` apos expressao do `switch`",
+    )?;
+    let mut cases = Vec::new();
+    let mut has_default = false;
+    loop {
+        match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::RBrace) => {
+                cursor.next();
+                break;
+            }
+            Some(TokenKind::Case) => {
+                cursor.next();
+                let cond = parse_expr(cursor)?;
+                let body = parse_block(cursor)?;
+                cases.push(SwitchCase {
+                    cond: Some(cond),
+                    body,
+                });
+            }
+            Some(TokenKind::Default) => {
+                let tok = cursor.next().expect("peek garantiu `default`");
+                if has_default {
+                    return Err(ParseError::new(
+                        "`switch` aceita um unico `default`".to_string(),
+                        tok.line,
+                        tok.col,
+                    ));
+                }
+                has_default = true;
+                let body = parse_block(cursor)?;
+                cases.push(SwitchCase { cond: None, body });
+            }
+            Some(other) => {
+                let tok = cursor.next().expect("peek garantiu token");
+                return Err(ParseError::new(
+                    format!(
+                        "esperado `case`, `default` ou `}}` no `switch`, encontrado {}",
+                        describe(other)
+                    ),
+                    tok.line,
+                    tok.col,
+                ));
+            }
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `case`, `default` ou `}` no `switch`, encontrado fim de arquivo",
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    Ok(Stmt::Switch {
+        discriminant,
+        cases,
+    })
+}
+
 fn parse_throw(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
     let expr = parse_expr(cursor)?;
@@ -576,15 +815,91 @@ fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
     let name = expect_ident(cursor)?;
+    let (params, variadic) = parse_params_list(cursor, "apos nome da funcao")?;
+    let body = parse_block(cursor)?;
+    Ok(Stmt::FnDef {
+        name,
+        params,
+        variadic,
+        body,
+    })
+}
+
+/// Lista de parametros `(a, b = expr, ...rest)`: `(` ja deve ser o proximo.
+/// Retorna `(params, variadic)`. Regras (RFC 0006): `...rest` so por ultimo;
+/// obrigatorio apos opcional e erro; duplicatas sao checadas na compilacao.
+fn parse_params_list(
+    cursor: &mut Cursor<'_>,
+    context: &str,
+) -> Result<(Vec<Param>, Option<String>), ParseError> {
     expect_token(
         cursor,
         &TokenKind::LParen,
-        "esperado `(` apos nome da funcao",
+        &format!("esperado `(` {context}"),
     )?;
     let mut params = Vec::new();
+    let mut variadic = None;
+    let mut seen_optional = false;
     if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RParen)) {
         loop {
-            params.push(expect_ident(cursor)?);
+            if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Ellipsis)) {
+                cursor.next();
+                let name_tok = cursor.next().ok_or_else(|| {
+                    let (line, col) = cursor.end_pos();
+                    ParseError::new("esperado nome apos `...` (resto de parametros)", line, col)
+                })?;
+                match &name_tok.kind {
+                    TokenKind::Ident(name) => {
+                        variadic = Some(name.clone());
+                    }
+                    other => {
+                        return Err(ParseError::new(
+                            format!("esperado nome apos `...`, encontrado {}", describe(other)),
+                            name_tok.line,
+                            name_tok.col,
+                        ));
+                    }
+                }
+                break;
+            }
+            let name = expect_ident(cursor)?;
+            let default = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Assign)) {
+                cursor.next();
+                seen_optional = true;
+                Some(parse_expr(cursor)?)
+            } else {
+                if seen_optional {
+                    let (line, col) = cursor.end_pos();
+                    return Err(ParseError::new(
+                        "parametro obrigatorio apos opcional (reordene: opcionais por ultimo)"
+                            .to_string(),
+                        line,
+                        col,
+                    ));
+                }
+                None
+            };
+            params.push(Param { name, default });
+            if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
+                cursor.next();
+                // `, ...rest` ou `, )`: continua o laco (o `...`/`)` decide).
+                continue;
+            } else {
+                break;
+            }
+        }
+    }
+    expect_token(cursor, &TokenKind::RParen, "esperado `)` apos parametros")?;
+    Ok((params, variadic))
+}
+
+/// Argumentos de chamada `(a, b, ...)`: `(` ja deve ser o proximo token.
+fn parse_call_args(cursor: &mut Cursor<'_>) -> Result<Vec<Expr>, ParseError> {
+    cursor.next();
+    let mut args = Vec::new();
+    if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RParen)) {
+        loop {
+            args.push(parse_expr(cursor)?);
             if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
                 cursor.next();
             } else {
@@ -592,9 +907,8 @@ fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
             }
         }
     }
-    expect_token(cursor, &TokenKind::RParen, "esperado `)` apos parametros")?;
-    let body = parse_block(cursor)?;
-    Ok(Stmt::FnDef { name, params, body })
+    expect_token(cursor, &TokenKind::RParen, "esperado `)` apos argumentos")?;
+    Ok(args)
 }
 
 fn parse_return(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -995,16 +1309,45 @@ fn parse_unary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_postfix(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_primary(cursor)?;
-    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBracket)) {
-        cursor.next();
-        let index = parse_expr(cursor)?;
-        expect_token(cursor, &TokenKind::RBracket, "esperado `]`")?;
-        expr = Expr::Index {
-            base: Box::new(expr),
-            index: Box::new(index),
-        };
+    loop {
+        match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::LBracket) => {
+                expr = parse_index_suffix(cursor, expr)?;
+            }
+            Some(TokenKind::LParen) => {
+                expr = parse_call_suffix(cursor, expr)?;
+            }
+            _ => break,
+        }
     }
     Ok(expr)
+}
+
+/// Corpo do sufixo `[indice]` isolado para manter o frame de
+/// `parse_postfix` pequeno no caminho quente (ver MAX_PARSE_DEPTH).
+#[inline(never)]
+fn parse_index_suffix(cursor: &mut Cursor<'_>, base: Expr) -> Result<Expr, ParseError> {
+    cursor.next();
+    let index = parse_expr(cursor)?;
+    expect_token(cursor, &TokenKind::RBracket, "esperado `]`")?;
+    Ok(Expr::Index {
+        base: Box::new(base),
+        index: Box::new(index),
+    })
+}
+
+/// Corpo do sufixo `(args)` isolado pelo mesmo motivo acima.
+#[inline(never)]
+fn parse_call_suffix(cursor: &mut Cursor<'_>, callee: Expr) -> Result<Expr, ParseError> {
+    let args = parse_call_args(cursor)?;
+    Ok(match callee {
+        // `f(x)` direto preserva o caminho classico (builtins).
+        Expr::Var(name) => Expr::Call { name, args },
+        callee => Expr::CallValue {
+            callee: Box::new(callee),
+            args,
+        },
+    })
 }
 
 fn parse_primary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
@@ -1024,23 +1367,22 @@ fn parse_primary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         TokenKind::Ident(name) => {
             let name = name.clone();
             if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
-                cursor.next();
-                let mut args = Vec::new();
-                if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RParen)) {
-                    loop {
-                        args.push(parse_expr(cursor)?);
-                        if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
-                            cursor.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                expect_token(cursor, &TokenKind::RParen, "esperado `)` apos argumentos")?;
+                let args = parse_call_args(cursor)?;
                 Ok(Expr::Call { name, args })
             } else {
                 Ok(Expr::Var(name))
             }
+        }
+        TokenKind::Fn => {
+            // `tok` ja consumiu `fn`; `(` vem a seguir ou e erro claro.
+            let (params, variadic) =
+                parse_params_list(cursor, "apos `fn` (funcao anonima usa `fn (args) { }`)")?;
+            let body = parse_block(cursor)?;
+            Ok(Expr::Closure(Box::new(ClosureData {
+                params,
+                variadic,
+                body,
+            })))
         }
         TokenKind::LParen => {
             let expr = parse_expr(cursor)?;
@@ -1169,6 +1511,10 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Else => "`else`".to_string(),
         TokenKind::While => "`while`".to_string(),
         TokenKind::For => "`for`".to_string(),
+        TokenKind::Ellipsis => "`...`".to_string(),
+        TokenKind::Switch => "`switch`".to_string(),
+        TokenKind::Case => "`case`".to_string(),
+        TokenKind::Default => "`default`".to_string(),
         TokenKind::Try => "`try`".to_string(),
         TokenKind::Catch => "`catch`".to_string(),
         TokenKind::Finally => "`finally`".to_string(),
@@ -1386,6 +1732,155 @@ mod tests {
     }
 
     #[test]
+    fn parses_switch_with_default_in_middle() {
+        let program = lex_and_parse(
+            "switch x { case 1 { echo \"a\"; } default { echo \"d\"; } case 2 { echo \"b\"; } }",
+        )
+        .expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::Switch {
+                discriminant: Expr::Var("x".to_string()),
+                cases: vec![
+                    SwitchCase {
+                        cond: Some(Expr::Int(1)),
+                        body: vec![Stmt::Echo {
+                            expr: Expr::StringLiteral("a".to_string()),
+                        }],
+                    },
+                    SwitchCase {
+                        cond: None,
+                        body: vec![Stmt::Echo {
+                            expr: Expr::StringLiteral("d".to_string()),
+                        }],
+                    },
+                    SwitchCase {
+                        cond: Some(Expr::Int(2)),
+                        body: vec![Stmt::Echo {
+                            expr: Expr::StringLiteral("b".to_string()),
+                        }],
+                    },
+                ],
+            }]
+        );
+        // Vazio e sem-default passam.
+        lex_and_parse("switch x { }").expect("switch vazio deve passar");
+        lex_and_parse("switch 1 { case 1 { echo 1; } }").expect("sem default deve passar");
+    }
+
+    #[test]
+    fn rejects_switch_misuse() {
+        // `default` duplo.
+        let err = lex_and_parse("switch x { default { } default { } }")
+            .expect_err("default duplo deve falhar");
+        assert!(err.to_string().contains("unico `default`"), "obteve: {err}");
+        // `case` fora de `switch` nao e statement valido (cai em expressao).
+        let err = lex_and_parse("case 1 { echo 1; }").expect_err("case solto deve falhar");
+        assert!(err.to_string().contains("`case`"), "obteve: {err}");
+        // `default` fora de `switch` tambem nao.
+        lex_and_parse("default { echo 1; }").expect_err("default solto deve falhar");
+    }
+
+    #[test]
+    fn parses_params_with_defaults_and_variadic() {
+        let program = lex_and_parse("fn f(a, b = 2, c = 1 + 2, ...rest) { return a; }")
+            .expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::FnDef {
+                name: "f".to_string(),
+                params: vec![
+                    Param {
+                        name: "a".to_string(),
+                        default: None,
+                    },
+                    Param {
+                        name: "b".to_string(),
+                        default: Some(Expr::Int(2)),
+                    },
+                    Param {
+                        name: "c".to_string(),
+                        default: Some(Expr::Binary {
+                            op: BinOp::Add,
+                            left: Box::new(Expr::Int(1)),
+                            right: Box::new(Expr::Int(2)),
+                        }),
+                    },
+                ],
+                variadic: Some("rest".to_string()),
+                body: vec![Stmt::Return {
+                    expr: Some(Expr::Var("a".to_string())),
+                }],
+            }]
+        );
+        // Closure aceita a mesma forma.
+        let program =
+            lex_and_parse("let f = fn (a = \"x\") { return a; };").expect("parse deve passar");
+        match &program.statements[0] {
+            Stmt::Let {
+                init: Some(Expr::Closure(data)),
+                ..
+            } => {
+                assert_eq!(data.params.len(), 1);
+                assert!(data.params[0].default.is_some());
+                assert_eq!(data.variadic, None);
+            }
+            other => panic!("esperado closure, obteve {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_param_forms() {
+        // Obrigatorio apos opcional.
+        let err = lex_and_parse("fn f(a = 1, b) { }").expect_err("deve falhar");
+        assert!(err.to_string().contains("apos opcional"), "obteve: {err}");
+        // `...` no meio.
+        let err = lex_and_parse("fn f(...r, b) { }").expect_err("deve falhar");
+        assert!(err.to_string().contains("`)`"), "obteve: {err}");
+        // `...` sem nome.
+        lex_and_parse("fn f(...) { }").expect_err("`...` sem nome deve falhar");
+    }
+
+    #[test]
+    fn parses_destructuring_forms() {
+        let program = lex_and_parse("let [a, b] = arr;").expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::Destructure {
+                target: DestructureTarget::Positional(vec!["a".to_string(), "b".to_string()]),
+                init: Expr::Var("arr".to_string()),
+                is_const: false,
+            }]
+        );
+        let program = lex_and_parse("const {k: v, x} = m;").expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::Destructure {
+                target: DestructureTarget::ByKey(vec![
+                    ("k".to_string(), "v".to_string()),
+                    ("x".to_string(), "x".to_string()),
+                ]),
+                init: Expr::Var("m".to_string()),
+                is_const: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_destructure_forms() {
+        // Padrao vazio.
+        lex_and_parse("let [] = a;").expect_err("`[]` vazio deve falhar");
+        lex_and_parse("let {} = m;").expect_err("`{}` vazio deve falhar");
+        // Aninhado: `expect_ident` rejeita.
+        lex_and_parse("let [[a]] = x;").expect_err("aninhado deve falhar");
+        lex_and_parse("let {k: [v]} = m;").expect_err("aninhado deve falhar");
+        // Placeholder `[, b]` nao suportado.
+        lex_and_parse("let [, b] = x;").expect_err("placeholder deve falhar");
+        // `const` sem init continua erro (regra vigente).
+        lex_and_parse("const [a] ;").expect_err("const sem init deve falhar");
+    }
+
+    #[test]
     fn keeps_in_as_plain_identifier_elsewhere() {
         // `in` so tem sentido apos `for VAR`; no resto, e identificador comum.
         let program = lex_and_parse("let in = 1; echo in;").expect("parse deve passar");
@@ -1419,6 +1914,54 @@ mod tests {
         assert_eq!(program.statements.len(), 2);
         assert!(matches!(program.statements[0], Stmt::FnDef { .. }));
         assert!(matches!(program.statements[1], Stmt::Echo { .. }));
+    }
+
+    #[test]
+    fn parses_anonymous_fn_and_general_calls() {
+        // `let f = fn (x) { return x; };`
+        let program = lex_and_parse("let f = fn (x) { return x; };").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Let {
+                init: Some(Expr::Closure(_)),
+                ..
+            }
+        ));
+        // Chamada direta de literal: IIFE.
+        let program = lex_and_parse("echo (fn (x) { return x; })(41);").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::CallValue { .. }
+            }
+        ));
+        // `f(x)` direto continua `Call` (precedencia de builtins).
+        let program = lex_and_parse("echo soma(1);").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::Call { .. }
+            }
+        ));
+        // Chamada encadeada e por indice: `CallValue`.
+        let program = lex_and_parse("echo f(1)(2);").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Echo {
+                expr: Expr::CallValue { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_named_fn_in_expression() {
+        // `fn nome` so existe como instrucao; em expressao exige `(`.
+        let err = lex_and_parse("let f = fn g(x) { return x; };").expect_err("deve falhar");
+        assert!(
+            err.message.contains("esperado `(`"),
+            "obteve: {}",
+            err.message
+        );
     }
 
     #[test]

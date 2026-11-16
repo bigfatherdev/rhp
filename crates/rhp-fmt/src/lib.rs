@@ -5,7 +5,7 @@
 //! exatamente uma quebra de linha. O formatador e idempotente:
 //! `format(parse(format(p))) == format(p)`.
 
-use rhp_parser::{AssignTarget, BinOp, Expr, Program, Stmt, UnaryOp};
+use rhp_parser::{AssignTarget, BinOp, DestructureTarget, Expr, Param, Program, Stmt, UnaryOp};
 use std::fmt::Write as _;
 
 /// Formata o programa no estilo canonico.
@@ -57,6 +57,33 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
         Stmt::Const { name, init } => {
             indent(level, out);
             let _ = writeln!(out, "const {name} = {};", fmt_expr(init, 0));
+        }
+        Stmt::Destructure {
+            target,
+            init,
+            is_const,
+        } => {
+            indent(level, out);
+            let keyword = if *is_const { "const" } else { "let" };
+            let pattern = match target {
+                DestructureTarget::Positional(names) => {
+                    format!("[{}]", names.join(", "))
+                }
+                DestructureTarget::ByKey(pairs) => {
+                    let parts: Vec<String> = pairs
+                        .iter()
+                        .map(|(key, name)| {
+                            if key == name {
+                                key.clone()
+                            } else {
+                                format!("{key}: {name}")
+                            }
+                        })
+                        .collect();
+                    format!("{{{}}}", parts.join(", "))
+                }
+            };
+            let _ = writeln!(out, "{keyword} {pattern} = {};", fmt_expr(init, 0));
         }
         Stmt::Break => {
             indent(level, out);
@@ -147,9 +174,39 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str("}\n");
         }
-        Stmt::FnDef { name, params, body } => {
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
             indent(level, out);
-            let _ = writeln!(out, "fn {name}({}) {{", params.join(", "));
+            let _ = writeln!(out, "switch {} {{", fmt_expr(discriminant, 0));
+            for case in cases {
+                indent(level + 1, out);
+                match &case.cond {
+                    Some(cond) => {
+                        let _ = writeln!(out, "case {} {{", fmt_expr(cond, 0));
+                    }
+                    None => out.push_str("default {\n"),
+                }
+                fmt_block(&case.body, level + 2, out);
+                indent(level + 1, out);
+                out.push_str("}\n");
+            }
+            indent(level, out);
+            out.push_str("}\n");
+        }
+        Stmt::FnDef {
+            name,
+            params,
+            variadic,
+            body,
+        } => {
+            indent(level, out);
+            let _ = writeln!(
+                out,
+                "fn {name}({}) {{",
+                fmt_params(params, variadic.as_deref())
+            );
             fmt_block(body, level + 1, out);
             indent(level, out);
             out.push_str("}\n");
@@ -206,6 +263,21 @@ fn fmt_block(stmts: &[Stmt], level: usize, out: &mut String) {
     for stmt in stmts {
         fmt_stmt(stmt, level, out);
     }
+}
+
+/// Lista de parametros canonica: `a, b = <expr>, ...rest` (RFC 0006).
+fn fmt_params(params: &[Param], variadic: Option<&str>) -> String {
+    let mut parts: Vec<String> = params
+        .iter()
+        .map(|p| match &p.default {
+            Some(d) => format!("{} = {}", p.name, fmt_expr(d, 0)),
+            None => p.name.clone(),
+        })
+        .collect();
+    if let Some(rest) = variadic {
+        parts.push(format!("...{rest}"));
+    }
+    parts.join(", ")
 }
 
 /// Precedencia para parenteses minimos (maior = liga mais forte).
@@ -327,6 +399,21 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             let inner: Vec<String> = args.iter().map(|arg| fmt_expr(arg, 0)).collect();
             format!("{name}({})", inner.join(", "))
         }
+        Expr::CallValue { callee, args } => {
+            let inner: Vec<String> = args.iter().map(|arg| fmt_expr(arg, 0)).collect();
+            format!("{}({})", fmt_atom(callee), inner.join(", "))
+        }
+        Expr::Closure(data) => {
+            // Multilinha com indentacao relativa: estavel e reparsavel
+            // (idempotencia garantida; closures aninhadas nao herdam o
+            // nivel absoluto — aceito nesta etapa, ver RFC 0003 §7).
+            let mut body = String::new();
+            fmt_block(&data.body, 1, &mut body);
+            format!(
+                "fn ({}) {{\n{body}}}",
+                fmt_params(&data.params, data.variadic.as_deref())
+            )
+        }
     }
 }
 
@@ -351,6 +438,8 @@ fn fmt_atom(expr: &Expr) -> String {
     match expr {
         Expr::Var(_)
         | Expr::Call { .. }
+        | Expr::CallValue { .. }
+        | Expr::Closure(_)
         | Expr::Index { .. }
         | Expr::Array(_)
         | Expr::Map(_)
@@ -396,6 +485,54 @@ mod tests {
         assert_eq!(fmt("echo 10 - (4 - 3);"), "echo 10 - (4 - 3);\n");
         assert_eq!(fmt("echo -(1 + 2);"), "echo -(1 + 2);\n");
         assert_eq!(fmt("echo !true;"), "echo !true;\n");
+    }
+
+    #[test]
+    fn formats_switch_statement() {
+        assert_eq!(
+            fmt("switch x{case 1{echo \"a\";}default{echo \"d\";}}"),
+            "switch x {\n  case 1 {\n    echo \"a\";\n  }\n  default {\n    echo \"d\";\n  }\n}\n"
+        );
+        // Idempotente + reparse preserva a AST (inclusive fallthrough e aninhado).
+        check_idempotent(
+            "switch x { case 1 { echo \"a\"; } default { echo \"d\"; } case 2 { echo \"b\"; } }",
+        );
+        check_idempotent(
+            "while i < 3 { switch i { case 2 { continue; } default { echo i; break; } } }",
+        );
+    }
+
+    #[test]
+    fn formats_defaults_and_variadic() {
+        assert_eq!(
+            fmt("fn f(a,b=2,...rest){return a;}"),
+            "fn f(a, b = 2, ...rest) {\n  return a;\n}\n"
+        );
+        check_idempotent("let g = fn (a = 1 + 2, ...r) { return a; };");
+        check_idempotent("fn f(a = [1, 2], b = {x: 1}) { return a; }");
+    }
+
+    #[test]
+    fn formats_destructuring() {
+        assert_eq!(fmt("let [a,b]=[1,2];"), "let [a, b] = [1, 2];\n");
+        assert_eq!(
+            fmt("const {k:v,x}={k:1,x:2};"),
+            "const {k: v, x} = {k: 1, x: 2};\n"
+        );
+        check_idempotent("let [a, b] = f([1, 2]);");
+        check_idempotent("const {k: v} = m;");
+    }
+
+    #[test]
+    fn formats_closures_and_general_calls() {
+        assert_eq!(
+            fmt("let f=fn(x){return x+1;};"),
+            "let f = fn (x) {\n  return x + 1;\n};\n"
+        );
+        // IIFE dispa parenteses externos redundantes, mantem os da chamada.
+        check_idempotent("echo (fn (x) { return x * 2; })(21);");
+        check_idempotent("let f = fn (x) { return fn (y) { return x + y; }; };");
+        check_idempotent("echo f(40)(2);");
     }
 
     #[test]

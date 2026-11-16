@@ -1,0 +1,12 @@
+// Exemplos de destructuring raso (RFC 0007).
+let [a, b] = [1, 2];
+echo a + b;
+
+let ponto = {x: 3, y: 4};
+let {x} = ponto;
+echo x;
+let {y: altura} = ponto;
+echo altura;
+
+const [c, d] = [10, 20];
+echo c * d;

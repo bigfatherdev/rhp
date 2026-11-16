@@ -1023,6 +1023,33 @@ impl Renamer<'_> {
                     init: renamed_init,
                 }
             }
+            Stmt::Destructure {
+                target,
+                init,
+                is_const,
+            } => {
+                let renamed_init = self.expr(init);
+                let target = match target {
+                    rhp_parser::DestructureTarget::Positional(names) => {
+                        rhp_parser::DestructureTarget::Positional(
+                            names.iter().map(|n| self.declare(n)).collect(),
+                        )
+                    }
+                    rhp_parser::DestructureTarget::ByKey(pairs) => {
+                        rhp_parser::DestructureTarget::ByKey(
+                            pairs
+                                .iter()
+                                .map(|(k, n)| (k.clone(), self.declare(n)))
+                                .collect(),
+                        )
+                    }
+                };
+                Stmt::Destructure {
+                    target,
+                    init: renamed_init,
+                    is_const: *is_const,
+                }
+            }
             Stmt::Break => Stmt::Break,
             Stmt::Continue => Stmt::Continue,
             Stmt::Assign { target, expr } => {
@@ -1078,17 +1105,56 @@ impl Renamer<'_> {
                     body,
                 }
             }
-            Stmt::FnDef { name, params, body } => {
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                let discriminant = self.expr(discriminant);
+                let cases = cases
+                    .iter()
+                    .map(|case| {
+                        let cond = case.cond.as_ref().map(|e| self.expr(e));
+                        // Escopo proprio por case (paridade com a VM).
+                        self.scopes.push(HashSet::new());
+                        let body = case.body.iter().map(|s| self.stmt(s)).collect();
+                        self.scopes.pop();
+                        rhp_parser::SwitchCase { cond, body }
+                    })
+                    .collect();
+                Stmt::Switch {
+                    discriminant,
+                    cases,
+                }
+            }
+            Stmt::FnDef {
+                name,
+                params,
+                variadic,
+                body,
+            } => {
                 let renamed = self.declare(name);
+                // Defaults sao constantes (sem Vars validos); renomeia no
+                // escopo externo antes de vincular os params (como `let`).
+                let params = params
+                    .iter()
+                    .map(|p| rhp_parser::Param {
+                        name: p.name.clone(),
+                        default: p.default.as_ref().map(|e| self.expr(e)),
+                    })
+                    .collect::<Vec<_>>();
                 self.scopes.push(HashSet::new());
-                for param in params {
-                    self.declare(param);
+                for param in &params {
+                    self.declare(&param.name);
+                }
+                if let Some(rest) = variadic {
+                    self.declare(rest);
                 }
                 let body = body.iter().map(|s| self.stmt(s)).collect();
                 self.scopes.pop();
                 Stmt::FnDef {
                     name: renamed,
-                    params: params.clone(),
+                    params,
+                    variadic: variadic.clone(),
                     body,
                 }
             }
@@ -1183,6 +1249,34 @@ impl Renamer<'_> {
                 name: self.reference(name),
                 args: args.iter().map(|e| self.expr(e)).collect(),
             },
+            Expr::CallValue { callee, args } => Expr::CallValue {
+                callee: Box::new(self.expr(callee)),
+                args: args.iter().map(|e| self.expr(e)).collect(),
+            },
+            Expr::Closure(data) => {
+                let params = data
+                    .params
+                    .iter()
+                    .map(|p| rhp_parser::Param {
+                        name: p.name.clone(),
+                        default: p.default.as_ref().map(|e| self.expr(e)),
+                    })
+                    .collect::<Vec<_>>();
+                self.scopes.push(HashSet::new());
+                for param in &params {
+                    self.declare(&param.name);
+                }
+                if let Some(rest) = &data.variadic {
+                    self.declare(rest);
+                }
+                let body = data.body.iter().map(|s| self.stmt(s)).collect();
+                self.scopes.pop();
+                Expr::Closure(Box::new(rhp_parser::ClosureData {
+                    params,
+                    variadic: data.variadic.clone(),
+                    body,
+                }))
+            }
         }
     }
 }
@@ -1205,6 +1299,95 @@ fn collect_imports(statements: &[Stmt]) -> Result<RawImports, LoadError> {
 
 /// Rejeita `import`/`export` dentro de blocos/funcoes (a semantica seria
 /// icar o modulo para o topo, surpreendente e nao documentada).
+/// Varre as expressoes diretas de um statement a procura de corpos de
+/// closure com `import`/`export` (unico aninhamento via expressao).
+fn check_stmt_expr_imports(stmt: &Stmt) -> Result<(), LoadError> {
+    match stmt {
+        Stmt::Echo { expr }
+        | Stmt::Const { init: expr, .. }
+        | Stmt::Assign { expr, .. }
+        | Stmt::ExprStmt { expr } => check_expr_imports(expr),
+        Stmt::Let { init, .. } => {
+            if let Some(expr) = init {
+                check_expr_imports(expr)?;
+            }
+            Ok(())
+        }
+        Stmt::Return { expr } => {
+            if let Some(expr) = expr {
+                check_expr_imports(expr)?;
+            }
+            Ok(())
+        }
+        Stmt::Throw { expr } => check_expr_imports(expr),
+        Stmt::Destructure { init, .. } => check_expr_imports(init),
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::For { iter: cond, .. } => {
+            check_expr_imports(cond)
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            check_expr_imports(discriminant)?;
+            for case in cases {
+                if let Some(cond) = &case.cond {
+                    check_expr_imports(cond)?;
+                }
+                check_block_imports(&case.body, "em `switch`")?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Desce recursivamente ate corpos de closure e aplica a mesma regra de
+/// `check_block_imports` (erro claro em vez de ignorar silencioso).
+fn check_expr_imports(expr: &rhp_parser::Expr) -> Result<(), LoadError> {
+    use rhp_parser::Expr as E;
+    match expr {
+        E::Closure(data) => check_block_imports(&data.body, "em closure"),
+        E::CallValue { callee, args } => {
+            check_expr_imports(callee)?;
+            for arg in args {
+                check_expr_imports(arg)?;
+            }
+            Ok(())
+        }
+        E::Array(items) | E::Call { args: items, .. } => {
+            for item in items {
+                check_expr_imports(item)?;
+            }
+            Ok(())
+        }
+        E::Map(entries) => {
+            for (_, v) in entries {
+                check_expr_imports(v)?;
+            }
+            Ok(())
+        }
+        E::Index { base, index } => {
+            check_expr_imports(base)?;
+            check_expr_imports(index)
+        }
+        E::Unary { expr, .. } => check_expr_imports(expr),
+        E::Binary { left, right, .. } => {
+            check_expr_imports(left)?;
+            check_expr_imports(right)
+        }
+        E::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            check_expr_imports(cond)?;
+            check_expr_imports(then_branch)?;
+            check_expr_imports(else_branch)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
     for stmt in statements {
         match stmt {
@@ -1221,6 +1404,11 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
             }
             Stmt::While { body, .. } => check_block_imports(body, "em `while`")?,
             Stmt::For { body, .. } => check_block_imports(body, "em `for`")?,
+            Stmt::Switch { cases, .. } => {
+                for case in cases {
+                    check_block_imports(&case.body, "em `switch`")?;
+                }
+            }
             Stmt::Try {
                 body,
                 catch_body,
@@ -1235,11 +1423,20 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
                     check_block_imports(finally_body, "em `finally`")?;
                 }
             }
-            Stmt::FnDef { body, name, .. } => {
+            Stmt::FnDef {
+                body, name, params, ..
+            } => {
                 check_block_imports(body, &format!("na funcao `{name}`"))?;
+                for param in params {
+                    if let Some(default) = &param.default {
+                        check_expr_imports(default)?;
+                    }
+                }
             }
             Stmt::Block(body) => check_block_imports(body, "em bloco")?,
-            _ => {}
+            // Closure e o unico caminho de `import` aninhado via expressao
+            // (RFC 0003); rejeita com o mesmo erro claro das funcoes.
+            other => check_stmt_expr_imports(other)?,
         }
     }
     Ok(())
@@ -1460,7 +1657,10 @@ mod tests {
         match &renamed[1] {
             Stmt::FnDef { name, params, .. } => {
                 assert_eq!(name, "__rhp_mod0__f");
-                assert_eq!(params, &["x".to_string()]);
+                assert_eq!(
+                    params.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    ["x".to_string()]
+                );
             }
             other => panic!("esperado FnDef, obteve {other:?}"),
         }
@@ -1471,6 +1671,186 @@ mod tests {
                 other => panic!("esperado Var, obteve {other:?}"),
             },
             other => panic!("esperado Echo, obteve {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runs_closures_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "let f = fn (x) { return x + 1; }; echo f(41); echo (fn (x) { return x * 2; })(21);",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"42\n42\n");
+    }
+
+    #[test]
+    fn runs_switch_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "switch 2 { case 1 { echo \"a\"; } default { echo \"d\"; } case 2 { echo \"b\"; break; } }",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"d\nb\n");
+    }
+
+    #[test]
+    fn runs_defaults_and_variadic_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "fn f(a, b = 2, ...rest) { echo a + b; echo rest; } f(1); f(10, 20, 30);",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"3\n[]\n30\n[30]\n");
+    }
+
+    #[test]
+    fn runs_destructuring_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "let [a, b] = [1, 2]; echo a + b; const {k: v} = {k: 40}; echo v + 2;",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"3\n42\n");
+    }
+
+    #[test]
+    fn rename_destructuring_declares_names() {
+        use std::collections::HashSet as Set;
+        let stmts = rhp_parser::parse_source("let x = [1, 2];\nlet [a, b] = x;\necho a;\n")
+            .expect("parse deve passar")
+            .statements;
+        let top: Set<String> = ["x".to_string()].into_iter().collect();
+        let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
+        match &renamed[1] {
+            Stmt::Destructure { target, init, .. } => {
+                assert!(matches!(
+                    init,
+                    rhp_parser::Expr::Var(name) if name == "__rhp_mod0__x"
+                ));
+                match target {
+                    rhp_parser::DestructureTarget::Positional(names) => {
+                        assert_eq!(names, &["a".to_string(), "b".to_string()]);
+                    }
+                    other => panic!("esperado Positional, obteve {other:?}"),
+                }
+            }
+            other => panic!("esperado Destructure, obteve {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_import_inside_default() {
+        // Default com closure contendo `import`: mesmo erro claro.
+        let dir = temp_dir("default-import");
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "fn f(a = (fn () { import \"outro.rhp\"; return 1; })()) { return a; }\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nivel superior"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rejects_import_inside_switch_case() {
+        let dir = temp_dir("switch-import");
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "switch 1 {\n  case 1 {\n    import \"outro.rhp\";\n  }\n}\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nivel superior"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rename_switch_cases_have_own_scope() {
+        use std::collections::HashSet as Set;
+        // `let v` em cases distintos nao colide; topo renomeado.
+        let stmts = rhp_parser::parse_source(
+            "let x = 1;\nswitch x {\n  case 1 {\n    let v = 1;\n    echo v;\n  }\n  case 2 {\n    let v = 2;\n    echo v;\n  }\n}\n",
+        )
+        .expect("parse deve passar")
+        .statements;
+        let top: Set<String> = ["x".to_string()].into_iter().collect();
+        let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
+        match &renamed[1] {
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                assert!(matches!(
+                    discriminant,
+                    rhp_parser::Expr::Var(name) if name == "__rhp_mod0__x"
+                ));
+                assert_eq!(cases.len(), 2);
+                for case in cases {
+                    assert!(matches!(&case.body[0],
+                        Stmt::Let { name, .. } if name == "v"));
+                }
+            }
+            other => panic!("esperado Switch, obteve {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_import_inside_closure() {
+        let dir = temp_dir("closure-import");
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "let f = fn () {\n  import \"outro.rhp\";\n  return 1;\n};\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nivel superior"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rename_closures_shadow_params() {
+        use std::collections::HashSet as Set;
+        // Parametro sombreia o topo; livre do corpo e renomeada.
+        let stmts = rhp_parser::parse_source("let x = 1;\nlet f = fn (x) {\n  return x;\n};\n")
+            .expect("parse deve passar")
+            .statements;
+        let top: Set<String> = ["x".to_string(), "f".to_string()].into_iter().collect();
+        let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
+        match &renamed[1] {
+            Stmt::Let {
+                init: Some(expr), ..
+            } => match expr {
+                rhp_parser::Expr::Closure(data) => {
+                    assert_eq!(
+                        data.params
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect::<Vec<_>>(),
+                        ["x".to_string()]
+                    );
+                    assert!(matches!(&data.body[0],
+                        Stmt::Return { expr: Some(rhp_parser::Expr::Var(name)) }
+                        if name == "x"));
+                }
+                other => panic!("esperada Closure, obteve {other:?}"),
+            },
+            other => panic!("esperado Let, obteve {other:?}"),
         }
     }
 

@@ -24,6 +24,9 @@ pub enum TokenKind {
     Else,
     While,
     For,
+    Switch,
+    Case,
+    Default,
     Break,
     Continue,
     Try,
@@ -68,6 +71,8 @@ pub enum TokenKind {
     Semicolon,
     Comma,
     Colon,
+    /// `...` (resto de parametros, RFC 0006). `.` isolado e erro lexico.
+    Ellipsis,
     LParen,
     RParen,
     LBrace,
@@ -154,6 +159,26 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 tokens.push(Token::new(TokenKind::Colon, line, col));
                 chars.next();
                 col += 1;
+            }
+            '.' => {
+                // `...` (RFC 0006); `.`/`..` sao erro claro (RHP nao tem
+                // ponto flutuante lider nem acesso por ponto).
+                let start_col = col;
+                let mut dots = 0;
+                while chars.peek().copied().is_some_and(|(_, c)| c == '.') && dots < 3 {
+                    chars.next();
+                    dots += 1;
+                }
+                col += dots;
+                if dots == 3 {
+                    tokens.push(Token::new(TokenKind::Ellipsis, line, start_col));
+                } else {
+                    return Err(LexError::new(
+                        "esperado `...` (resto de parametros)".to_string(),
+                        line,
+                        start_col,
+                    ));
+                }
             }
             '(' => {
                 tokens.push(Token::new(TokenKind::LParen, line, col));
@@ -568,6 +593,9 @@ fn lex_ident_or_keyword(
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
         "for" => TokenKind::For,
+        "switch" => TokenKind::Switch,
+        "case" => TokenKind::Case,
+        "default" => TokenKind::Default,
         "try" => TokenKind::Try,
         "catch" => TokenKind::Catch,
         "finally" => TokenKind::Finally,
@@ -762,6 +790,12 @@ mod tests {
                 TokenKind::RBracket,
             ]
         );
+        assert_eq!(
+            kinds("...rest"),
+            vec![TokenKind::Ellipsis, TokenKind::Ident("rest".to_string())]
+        );
+        let err = lex("fn f(a, ..b) { }").expect_err("`..` deve falhar");
+        assert!(err.to_string().contains("..."), "obteve: {err}");
     }
 
     #[test]
@@ -782,6 +816,10 @@ mod tests {
         assert_eq!(
             kinds("break continue const"),
             vec![TokenKind::Break, TokenKind::Continue, TokenKind::Const]
+        );
+        assert_eq!(
+            kinds("switch case default"),
+            vec![TokenKind::Switch, TokenKind::Case, TokenKind::Default]
         );
     }
 

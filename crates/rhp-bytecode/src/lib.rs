@@ -4,7 +4,9 @@
 //! vetor de instrucoes, mais builtins da biblioteca-padrao nucleo. A VM e
 //! baseada em pilha e valida o chunk (recursivamente) antes de executar.
 
-use rhp_parser::{AssignTarget, BinOp, Expr, Program, Stmt, UnaryOp};
+use rhp_parser::{
+    AssignTarget, BinOp, DestructureTarget, Expr, Program, Stmt, SwitchCase, UnaryOp,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
@@ -19,8 +21,16 @@ pub enum Value {
     Str(String),
     Array(Vec<Value>),
     Map(HashMap<String, Value>),
-    /// Funcao definida por `fn`: parametros + corpo compilado.
-    Func(Rc<FuncDef>),
+    /// Funcao de primeira classe (RFC 0003): definicao compilada +
+    /// ambiente capturado por valor no momento da criacao (`MakeFunc`).
+    Func(FuncValue),
+}
+
+/// Valor funcional de primeira classe: definicao + ambiente capturado.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncValue {
+    pub def: Rc<FuncDef>,
+    pub env: HashMap<String, Value>,
 }
 
 impl fmt::Display for Value {
@@ -55,7 +65,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            Self::Func(func) => write!(f, "<fn {}>", func.name),
+            Self::Func(func) => write!(f, "<fn {}>", func.def.name),
         }
     }
 }
@@ -65,6 +75,10 @@ impl fmt::Display for Value {
 pub struct FuncDef {
     pub name: String,
     pub params: Vec<String>,
+    /// Padrao por posicao (`None` = obrigatorio; RFC 0006). Alinhado a `params`.
+    pub defaults: Vec<Option<Value>>,
+    /// `...rest` (no maximo um, por ultimo; RFC 0006).
+    pub variadic: Option<String>,
     pub body: Chunk,
 }
 
@@ -137,6 +151,12 @@ pub enum Builtin {
     HttpServe,
     /// `template(texto, valores)` — interpola `{{chave}}` com escape HTML.
     Template,
+    /// `map(arr, f)` — aplica `f(elem)` e empilha array de resultados (RFC 0005).
+    Map,
+    /// `filter(arr, f)` — `f(elem)` deve ser `Bool`; empilha filtrados (RFC 0005).
+    Filter,
+    /// `usort(arr, cmp)` — insertion sort estavel via `cmp(a, b): Int` (RFC 0005).
+    Usort,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -193,6 +213,9 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "db_close" => Some(Builtin::DbClose),
         "http_serve" => Some(Builtin::HttpServe),
         "template" => Some(Builtin::Template),
+        "map" => Some(Builtin::Map),
+        "filter" => Some(Builtin::Filter),
+        "usort" => Some(Builtin::Usort),
         _ => None,
     }
 }
@@ -244,7 +267,10 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::FsWrite
         | Builtin::FsAppend
         | Builtin::HttpFetch
-        | Builtin::Template => 2,
+        | Builtin::Template
+        | Builtin::Map
+        | Builtin::Filter
+        | Builtin::Usort => 2,
         Builtin::DbExec | Builtin::DbQuery | Builtin::HttpServe => 3,
         Builtin::Replace => 3,
     }
@@ -300,6 +326,10 @@ pub enum Op {
     ExitScope,
     /// Cria `Func` de `funcs[idx]` e declara no escopo atual.
     DefineFunc(u32),
+    /// Cria `Func` de `funcs[idx]` capturando o ambiente atual por valor
+    /// (RFC 0003: snapshot dos escopos internos para os externos) e o
+    /// empilha como valor de primeira classe.
+    MakeFunc(u32),
     /// Chama a funcao no topo (apos `aridade` argumentos); empilha retorno.
     Call(u32),
     /// Retorna da funcao com o valor no topo da pilha.
@@ -389,6 +419,9 @@ impl BuiltinId {
             47 => Ok(Builtin::DbClose),
             48 => Ok(Builtin::HttpServe),
             49 => Ok(Builtin::Template),
+            50 => Ok(Builtin::Map),
+            51 => Ok(Builtin::Filter),
+            52 => Ok(Builtin::Usort),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -447,6 +480,9 @@ impl From<Builtin> for BuiltinId {
             Builtin::DbClose => 47,
             Builtin::HttpServe => 48,
             Builtin::Template => 49,
+            Builtin::Map => 50,
+            Builtin::Filter => 51,
+            Builtin::Usort => 52,
         };
         Self(id)
     }
@@ -530,7 +566,7 @@ impl Chunk {
                         "chunk invalido em `{context}`: nome {idx} fora do pool"
                     )));
                 }
-                Op::DefineFunc(idx) if (idx as usize) >= self.funcs.len() => {
+                Op::DefineFunc(idx) | Op::MakeFunc(idx) if (idx as usize) >= self.funcs.len() => {
                     return Err(CompileError::new(format!(
                         "chunk invalido em `{context}`: funcao {idx} inexistente"
                     )));
@@ -651,6 +687,8 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
             }
             Op::Jump(target) => (height, Some(vec![target as usize])),
             Op::DefineFunc(_) | Op::EnterScope | Op::ExitScope => (height, Some(vec![ip + 1])),
+            // `MakeFunc` captura o ambiente sem tocar na pilha de operandos.
+            Op::MakeFunc(_) => (height + 1, Some(vec![ip + 1])),
             Op::Halt | Op::Return => (height, None),
             Op::Call(arity) => {
                 let arity = arity as usize;
@@ -787,8 +825,12 @@ struct PendingTry {
     loop_depth: usize,
 }
 
-/// Contexto de compilacao de um laco (para `break`/`continue`).
+/// Contexto de compilacao de um laco ou `switch` (para `break`/`continue`).
+/// `switch` empilha com `is_loop: false`: `break` mira o topo (seja laco
+/// ou `switch`); `continue` ignora `switch` e mira o laco mais interno.
 struct LoopCtx {
+    /// Verdadeiro para `while`/`for`; falso para `switch`.
+    is_loop: bool,
     /// Profundidade de escopo a manter ao sair com `break`.
     /// (`while`: fecha tambem o escopo do corpo; `for`: mantem o escopo
     /// do laco, fechado na saida, pois a condicao vive dentro dele.)
@@ -814,6 +856,160 @@ enum ConstKey {
     Str(String),
     Bool(bool),
     Null,
+}
+
+/// Avalia expressao constante (defaults de parametros, RFC 0006) para
+/// `Value` em tempo de compilacao. Espelha as regras de `LANGUAGE_SPEC`
+/// §4 para os casos suportados; resto (variaveis, chamadas, closures,
+/// indice, ternario) e erro: padrao deve ser constante.
+fn eval_const_expr(expr: &Expr) -> Result<Value, CompileError> {
+    let not_const = || {
+        CompileError::new(
+            "padrao de parametro deve ser expressao constante (literal, operacao entre constantes ou composto de constantes)".to_string(),
+        )
+    };
+    match expr {
+        Expr::StringLiteral(s) => Ok(Value::Str(s.clone())),
+        Expr::Int(n) => Ok(Value::Int(*n)),
+        Expr::Float(x) => Ok(Value::Float(*x)),
+        Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Null => Ok(Value::Null),
+        Expr::Array(items) => items
+            .iter()
+            .map(eval_const_expr)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Expr::Map(entries) => entries
+            .iter()
+            .map(|(k, v)| eval_const_expr(v).map(|folded| (k.clone(), folded)))
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()
+            .map(Value::Map),
+        Expr::Unary { op, expr } => {
+            let v = eval_const_expr(expr)?;
+            match (op, v) {
+                (UnaryOp::Neg, Value::Int(n)) => n.checked_neg().map(Value::Int).ok_or_else(|| {
+                    CompileError::new("estouro de `Int` em expressao constante".to_string())
+                }),
+                (UnaryOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
+                (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+                (UnaryOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
+                _ => Err(CompileError::new(
+                    "operacao unaria invalida em expressao constante".to_string(),
+                )),
+            }
+        }
+        Expr::Binary { op, left, right } => {
+            let l = eval_const_expr(left)?;
+            let r = eval_const_expr(right)?;
+            eval_const_binary(*op, l, r)
+        }
+        _ => Err(not_const()),
+    }
+}
+
+/// Aplica operador binario a valores constantes (regras de `LANGUAGE_SPEC` §4).
+fn eval_const_binary(op: BinOp, l: Value, r: Value) -> Result<Value, CompileError> {
+    use Value::{Bool as B, Float as F, Int as I, Str as S};
+    let invalid = || {
+        CompileError::new(
+            "operacao invalida em expressao constante (tipos incompativeis)".to_string(),
+        )
+    };
+    match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+            let num_err =
+                || CompileError::new("aritmetica em expressao constante exige numeros".to_string());
+            match (l, r) {
+                (I(a), I(b)) => {
+                    let res = match op {
+                        BinOp::Add => a.checked_add(b),
+                        BinOp::Sub => a.checked_sub(b),
+                        BinOp::Mul => a.checked_mul(b),
+                        BinOp::Div => (b != 0).then(|| a / b),
+                        _ => (b != 0).then(|| a % b),
+                    };
+                    res.map(I).ok_or_else(|| {
+                        CompileError::new(
+                            "estouro de `Int` ou divisao por zero em expressao constante"
+                                .to_string(),
+                        )
+                    })
+                }
+                (F(a), F(b)) => {
+                    if matches!(op, BinOp::Div | BinOp::Mod) && b == 0.0 {
+                        return Err(CompileError::new(
+                            "divisao por zero em expressao constante".to_string(),
+                        ));
+                    }
+                    let res = match op {
+                        BinOp::Add => a + b,
+                        BinOp::Sub => a - b,
+                        BinOp::Mul => a * b,
+                        BinOp::Div => a / b,
+                        _ => a % b,
+                    };
+                    Ok(F(res))
+                }
+                (I(a), F(b)) => eval_const_binary(op, F(a as f64), F(b)),
+                (F(a), I(b)) => eval_const_binary(op, F(a), F(b as f64)),
+                (S(a), S(b)) if matches!(op, BinOp::Add) => Ok(S(a + &b)),
+                _ => Err(num_err()),
+            }
+        }
+        BinOp::Eq => Ok(B(const_eq(&l, &r))),
+        BinOp::Ne => Ok(B(!const_eq(&l, &r))),
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            let ord = match (&l, &r) {
+                (I(a), I(b)) => a.partial_cmp(b),
+                (F(a), F(b)) => a.partial_cmp(b),
+                (I(a), F(b)) => (*a as f64).partial_cmp(b),
+                (F(a), I(b)) => a.partial_cmp(&(*b as f64)),
+                (S(a), S(b)) => Some(a.cmp(b)),
+                _ => None,
+            };
+            match ord {
+                Some(o) => Ok(B(match op {
+                    BinOp::Lt => o.is_lt(),
+                    BinOp::Le => o.is_le(),
+                    BinOp::Gt => o.is_gt(),
+                    _ => o.is_ge(),
+                })),
+                None => Err(invalid()),
+            }
+        }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => match (l, r) {
+            (I(a), I(b)) => Ok(I(match op {
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                _ => a ^ b,
+            })),
+            _ => Err(invalid()),
+        },
+        BinOp::Shl | BinOp::Shr => match (l, r) {
+            (I(a), I(b)) if (0..64).contains(&b) => Ok(I(match op {
+                BinOp::Shl => a << b,
+                _ => a >> b,
+            })),
+            _ => Err(CompileError::new(
+                "deslocamento invalido em expressao constante (0-63)".to_string(),
+            )),
+        },
+        BinOp::NullCoalesce => Ok(match l {
+            Value::Null => r,
+            v => v,
+        }),
+    }
+}
+
+/// Igualdade de constantes: numeros com promocao, resto por tipo/valor.
+fn const_eq(l: &Value, r: &Value) -> bool {
+    match (l, r) {
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Int(a), Value::Float(b)) => *a as f64 == *b,
+        (Value::Float(a), Value::Int(b)) => *a == *b as f64,
+        _ => l == r,
+    }
 }
 
 impl Compiler {
@@ -924,12 +1120,70 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compila o corpo de uma funcao (nomeada ou closure) em compilador
+    /// aninhado, registra o `FuncDef` na tabela e devolve o indice.
+    /// Usado por `Stmt::FnDef` e `Expr::Closure` (RFC 0003); defaults e
+    /// `...rest` pela RFC 0006 (defaults dobrados para `Value` aqui).
+    fn compile_func_body(
+        &mut self,
+        name: &str,
+        params: &[rhp_parser::Param],
+        variadic: Option<&str>,
+        body: &[Stmt],
+    ) -> Result<u32, CompileError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::with_capacity(params.len());
+        let mut defaults = Vec::with_capacity(params.len());
+        for param in params {
+            if !seen.insert(param.name.clone()) {
+                return Err(CompileError::new(format!(
+                    "parametro duplicado: {}",
+                    param.name
+                )));
+            }
+            names.push(param.name.clone());
+            defaults.push(param.default.as_ref().map(eval_const_expr).transpose()?);
+        }
+        if let Some(rest) = variadic {
+            if !seen.insert(rest.to_string()) {
+                return Err(CompileError::new(format!("parametro duplicado: {rest}")));
+            }
+        }
+        let mut fn_compiler = Compiler::new(true);
+        fn_compiler.compile_stmts(body)?;
+        let null_idx = fn_compiler.add_constant(Value::Null)?;
+        fn_compiler.emit(Op::Constant(null_idx));
+        fn_compiler.emit(Op::Return);
+        fn_compiler.emit(Op::Halt);
+        let body_chunk = fn_compiler.chunk;
+        body_chunk.validate()?;
+        if self.chunk.funcs.len() >= u32::MAX as usize {
+            return Err(CompileError::new("limite de funcoes excedido"));
+        }
+        self.chunk.funcs.push(FuncDef {
+            name: name.to_string(),
+            params: names,
+            defaults,
+            variadic: variadic.map(str::to_string),
+            body: body_chunk,
+        });
+        Ok((self.chunk.funcs.len() - 1) as u32)
+    }
+
     /// Nome oculto do laco `for` (lista ou indice): contem NUL, impossivel
     /// de escrever no fonte, logo nunca colide com variaveis do usuario.
     fn hidden_for_name(&mut self, what: &str) -> String {
         let id = self.for_counter;
         self.for_counter += 1;
         format!("\0for:{what}:{id}")
+    }
+
+    /// Nome oculto generico para temporarios (ex.: RHS do destructuring):
+    /// contem NUL, impossivel no fonte (contador compartilhado com o `for`).
+    fn hidden_name(&mut self, what: &str) -> String {
+        let id = self.for_counter;
+        self.for_counter += 1;
+        format!("\0tmp:{what}:{id}")
     }
 
     /// Compila `for VAR in ITER BLOCO`.
@@ -964,6 +1218,7 @@ impl Compiler {
         self.emit_scope_open();
         let body_depth = self.scopes.len();
         self.loops.push(LoopCtx {
+            is_loop: true,
             break_depth: for_depth,
             continue_depth: body_depth,
             start: None,
@@ -1042,8 +1297,11 @@ impl Compiler {
         let mut i = self.pending_trys.len();
         while i > 0 {
             i -= 1;
+            // `depth` = indice do laco-alvo + 1: cruzam os `try`s abertos
+            // dentro dele (profundidade maior). Para desvios que miram o
+            // topo sem `switch` no caminho, equivale ao `==` anterior.
             let apply = match crossing_loop {
-                Some(depth) => self.pending_trys[i].loop_depth == depth,
+                Some(depth) => self.pending_trys[i].loop_depth >= depth,
                 None => true,
             };
             if !apply {
@@ -1168,6 +1426,95 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compila `switch` (RFC 0004): discriminante avaliado uma vez;
+    /// testes em ordem (`Dup + case + Eq`, `JumpIfFalse` para o proximo;
+    /// `default` desvia incondicional), corpos em sequencia com fallthrough
+    /// natural; `break` e o caminho sem-match convergem no `Pop` final
+    /// (dispensa o discriminante, pilha balanceada). Nenhum op novo.
+    fn compile_switch(
+        &mut self,
+        discriminant: &Expr,
+        cases: &[SwitchCase],
+    ) -> Result<(), CompileError> {
+        self.compile_expr(discriminant)?;
+        // Salva o rastreamento de escopos: `break`/`continue`/`return` nos
+        // cases o alteram; restaurado no fim (pools e saltos mantidos).
+        let saved_scopes = self.scopes.clone();
+        // Contexto "breakable": `break` mira o `switch`; `continue` o ignora.
+        self.loops.push(LoopCtx {
+            is_loop: false,
+            break_depth: self.scopes.len(),
+            continue_depth: self.scopes.len(),
+            start: None,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
+        // Bloco de testes: cada match desvia para o corpo (remendado apos).
+        let mut body_jumps: Vec<usize> = Vec::with_capacity(cases.len());
+        let mut next_test: Option<usize> = None;
+        for case in cases {
+            if let Some(pos) = next_test.take() {
+                let here = self.chunk.code.len() as u32;
+                self.patch_jump(pos, here);
+            }
+            match &case.cond {
+                Some(cond) => {
+                    self.emit(Op::Dup);
+                    self.compile_expr(cond)?;
+                    self.emit(Op::Eq);
+                    next_test = Some(self.emit(Op::JumpIfFalse(u32::MAX)));
+                    body_jumps.push(self.emit(Op::Jump(u32::MAX)));
+                }
+                // `default` casa quando alcancado (sem teste).
+                None => {
+                    body_jumps.push(self.emit(Op::Jump(u32::MAX)));
+                }
+            }
+        }
+        // Sem-match: remendado para o `Pop` apos os corpos (abaixo).
+        // O bloco de testes nunca cai em sequencia (todo teste desvia).
+        let no_match_jump = next_test.take();
+        // Corpos em sequencia (fallthrough); cada teste remendado p/ o seu.
+        for (case, jump) in cases.iter().zip(body_jumps.iter()) {
+            let here = self.chunk.code.len() as u32;
+            self.patch_jump(*jump, here);
+            self.emit_scope_open();
+            // Desvios no meio (`break; echo x`) baguncam o rastreamento;
+            // corpo divergente nao cai aqui (volta a entrada, sem emitir).
+            let case_saved = self.scopes.clone();
+            self.compile_stmts(&case.body)?;
+            if diverges(&case.body) {
+                self.scopes = saved_scopes.clone();
+            } else {
+                self.scopes = case_saved;
+                self.emit_scope_close()?;
+            }
+        }
+        // `break` (com `Pop` proprio) chega sem discriminante e converge
+        // no fim; fallthrough/sem-match o dispensam aqui. Cada salto mira
+        // o ponto de altura correspondente.
+        let pop_pos = self.chunk.code.len() as u32;
+        if let Some(pos) = no_match_jump {
+            self.patch_jump(pos, pop_pos);
+        }
+        self.emit(Op::Pop);
+        let end_target = self.chunk.code.len() as u32;
+        let Some(switch_ctx) = self.loops.pop() else {
+            return Err(CompileError::new(
+                "desequilibrio interno de lacos".to_string(),
+            ));
+        };
+        for pos in &switch_ctx.breaks {
+            self.patch_jump(*pos, end_target);
+        }
+        debug_assert!(
+            switch_ctx.continues.is_empty(),
+            "`continue` nunca mira `switch`"
+        );
+        self.scopes = saved_scopes;
+        Ok(())
+    }
+
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
             Stmt::Echo { expr } => {
@@ -1191,10 +1538,54 @@ impl Compiler {
                 self.emit(Op::DeclareName(name_idx));
                 self.declare_const(name);
             }
+            Stmt::Destructure {
+                target,
+                init,
+                is_const,
+            } => {
+                // RHS uma vez em temporario oculto; cada alvo = `tmp[i|k]`
+                // declarado (erros de indice/chave/duplicata herdados).
+                self.compile_expr(init)?;
+                let tmp = self.hidden_name("destructure");
+                let tmp_idx = self.intern_name(&tmp)?;
+                self.emit(Op::DeclareName(tmp_idx));
+                match target {
+                    DestructureTarget::Positional(names) => {
+                        for (i, name) in names.iter().enumerate() {
+                            let name_idx = self.intern_name(name)?;
+                            self.emit(Op::LoadName(tmp_idx));
+                            let key_idx = self.add_constant(Value::Int(i as i64))?;
+                            self.emit(Op::Constant(key_idx));
+                            self.emit(Op::Index);
+                            self.emit(Op::DeclareName(name_idx));
+                            if *is_const {
+                                self.declare_const(name);
+                            }
+                        }
+                    }
+                    DestructureTarget::ByKey(pairs) => {
+                        for (key, name) in pairs {
+                            let name_idx = self.intern_name(name)?;
+                            self.emit(Op::LoadName(tmp_idx));
+                            let key_idx = self.add_constant(Value::Str(key.clone()))?;
+                            self.emit(Op::Constant(key_idx));
+                            self.emit(Op::Index);
+                            self.emit(Op::DeclareName(name_idx));
+                            if *is_const {
+                                self.declare_const(name);
+                            }
+                        }
+                    }
+                }
+            }
             Stmt::Break => {
                 let Some(loop_ctx) = self.loops.last() else {
                     return Err(CompileError::new("`break` fora de laco".to_string()));
                 };
+                // `break` no `switch` (topo nao-laco): dispensa o proprio
+                // discriminante antes de saltar (o dono remenda para DEPOIS
+                // do `Pop` do `switch`; lacos remendam para a saida normal).
+                let pop_discriminant = !loop_ctx.is_loop;
                 let break_depth = loop_ctx.break_depth;
                 let loop_level = self.loops.len();
                 // Fecha `try`s cruzados (handler + `finally`) antes de sair.
@@ -1202,30 +1593,47 @@ impl Compiler {
                 while self.scopes.len() > break_depth {
                     self.emit_scope_close()?;
                 }
+                if pop_discriminant {
+                    self.emit(Op::Pop);
+                }
                 let pos = self.emit(Op::Jump(u32::MAX));
                 if let Some(top) = self.loops.last_mut() {
                     top.breaks.push(pos);
                 }
             }
             Stmt::Continue => {
-                let (continue_depth, start) = match self.loops.last() {
-                    Some(loop_ctx) => (loop_ctx.continue_depth, loop_ctx.start),
-                    None => return Err(CompileError::new("`continue` fora de laco".to_string())),
+                // `continue` ignora contextos `switch` (nao sao lacos) e
+                // mira o laco mais interno; sem laco externo e erro.
+                let target = self.loops.iter().rposition(|ctx| ctx.is_loop);
+                let Some(pos) = target else {
+                    return Err(CompileError::new("`continue` fora de laco".to_string()));
                 };
-                let loop_level = self.loops.len();
-                self.emit_abrupt_exits(Some(loop_level))?;
+                let (continue_depth, start) = {
+                    let loop_ctx = &self.loops[pos];
+                    (loop_ctx.continue_depth, loop_ctx.start)
+                };
+                // Desvios cruzam `try`s abertos dentro do laco-alvo
+                // (profundidade de pilha maior que a do alvo).
+                self.emit_abrupt_exits(Some(pos + 1))?;
                 while self.scopes.len() > continue_depth {
                     self.emit_scope_close()?;
+                }
+                // Dispensa um discriminante por `switch` cruzado: cada um
+                // deixou seu valor na pilha (o alvo espera a altura sem eles).
+                let crossed = self.loops[pos + 1..]
+                    .iter()
+                    .filter(|ctx| !ctx.is_loop)
+                    .count();
+                for _ in 0..crossed {
+                    self.emit(Op::Pop);
                 }
                 match start {
                     Some(target) => {
                         self.emit(Op::Jump(target));
                     }
                     None => {
-                        let pos = self.emit(Op::Jump(u32::MAX));
-                        if let Some(top) = self.loops.last_mut() {
-                            top.continues.push(pos);
-                        }
+                        let jump = self.emit(Op::Jump(u32::MAX));
+                        self.loops[pos].continues.push(jump);
                     }
                 }
             }
@@ -1265,6 +1673,7 @@ impl Compiler {
                 let base_depth = self.scopes.len();
                 self.emit_scope_open();
                 self.loops.push(LoopCtx {
+                    is_loop: true,
                     break_depth: base_depth,
                     continue_depth: base_depth,
                     start: Some(loop_start),
@@ -1297,30 +1706,19 @@ impl Compiler {
             Stmt::For { var, iter, body } => {
                 self.compile_for(var, iter, body)?;
             }
-            Stmt::FnDef { name, params, body } => {
-                let mut seen = std::collections::HashSet::new();
-                for param in params {
-                    if !seen.insert(param) {
-                        return Err(CompileError::new(format!("parametro duplicado: {param}")));
-                    }
-                }
-                let mut fn_compiler = Compiler::new(true);
-                fn_compiler.compile_stmts(body)?;
-                let null_idx = fn_compiler.add_constant(Value::Null)?;
-                fn_compiler.emit(Op::Constant(null_idx));
-                fn_compiler.emit(Op::Return);
-                fn_compiler.emit(Op::Halt);
-                let body_chunk = fn_compiler.chunk;
-                body_chunk.validate()?;
-                if self.chunk.funcs.len() >= u32::MAX as usize {
-                    return Err(CompileError::new("limite de funcoes excedido"));
-                }
-                self.chunk.funcs.push(FuncDef {
-                    name: name.clone(),
-                    params: params.clone(),
-                    body: body_chunk,
-                });
-                let func_idx = (self.chunk.funcs.len() - 1) as u32;
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                self.compile_switch(discriminant, cases)?;
+            }
+            Stmt::FnDef {
+                name,
+                params,
+                variadic,
+                body,
+            } => {
+                let func_idx = self.compile_func_body(name, params, variadic.as_deref(), body)?;
                 self.intern_name(name)?;
                 self.emit(Op::DefineFunc(func_idx));
             }
@@ -1523,6 +1921,34 @@ impl Compiler {
                     self.emit(Op::Call(args.len() as u32));
                 }
             }
+            Expr::CallValue { callee, args } => {
+                // `f(x)` direto preserva o caminho classico (precedencia
+                // de builtins e erro de aridade em compilacao).
+                if let Expr::Var(name) = callee.as_ref() {
+                    self.compile_expr(&Expr::Call {
+                        name: name.clone(),
+                        args: args.clone(),
+                    })?;
+                } else {
+                    self.compile_expr(callee)?;
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                    }
+                    if args.len() > u32::MAX as usize {
+                        return Err(CompileError::new("numero de argumentos excedido"));
+                    }
+                    self.emit(Op::Call(args.len() as u32));
+                }
+            }
+            Expr::Closure(data) => {
+                let func_idx = self.compile_func_body(
+                    "{closure}",
+                    &data.params,
+                    data.variadic.as_deref(),
+                    &data.body,
+                )?;
+                self.emit(Op::MakeFunc(func_idx));
+            }
         }
         Ok(())
     }
@@ -1639,6 +2065,84 @@ mod tests {
     }
 
     #[test]
+    fn compiles_hofs_with_callback() {
+        // `map`/`filter`/`usort` viram `CallBuiltin` com ids estaveis; aridade 2.
+        let chunk = compile_src("echo map([1], fn (x) { return x; });");
+        assert!(chunk.code.contains(&Op::CallBuiltin(BuiltinId(50))));
+        let chunk = compile_src("echo filter([1], fn (x) { return true; });");
+        assert!(chunk.code.contains(&Op::CallBuiltin(BuiltinId(51))));
+        let chunk = compile_src("echo usort([2, 1], fn (a, b) { return a - b; });");
+        assert!(chunk.code.contains(&Op::CallBuiltin(BuiltinId(52))));
+        // Aridade checada em compilacao (regra dos builtins).
+        let program = parse_source("echo map([1]);").expect("parse deve passar");
+        let err = compile(&program).expect_err("aridade deve falhar");
+        assert!(err.message.contains("espera 2"));
+    }
+
+    #[test]
+    fn compiles_defaults_and_variadic() {
+        // Defaults dobrados para `Value`; `...rest` registrado.
+        let chunk = compile_src("fn f(a, b = 2, c = 1 + 2, ...rest) { return a; }");
+        assert_eq!(chunk.funcs.len(), 1);
+        let def = &chunk.funcs[0];
+        assert_eq!(
+            def.params,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            def.defaults,
+            vec![None, Some(Value::Int(2)), Some(Value::Int(3))]
+        );
+        assert_eq!(def.variadic, Some("rest".to_string()));
+        // Nao-constante rejeitada; divisao por zero em constante tambem.
+        let program = parse_source("fn f(a = b) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("default nao-const deve falhar");
+        assert!(err.message.contains("constante"));
+        let program = parse_source("fn f(a = 1 / 0) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("divisao por zero deve falhar");
+        assert!(err.message.contains("divisao por zero"));
+        // Duplicata (incluindo `...rest` repetindo param) rejeitada.
+        let program = parse_source("fn f(a, a) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("duplicata deve falhar");
+        assert!(err.message.contains("duplicado"));
+        let program = parse_source("fn f(a, ...a) { return a; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("rest duplicado deve falhar");
+        assert!(err.message.contains("duplicado"));
+    }
+
+    #[test]
+    fn compiles_destructuring() {
+        // Temporario oculto + `Index` + `DeclareName` por alvo; valido.
+        let chunk = compile_src("let [a, b] = [1, 2];");
+        chunk.validate().expect("destructure deve validar");
+        let declares = chunk
+            .code
+            .iter()
+            .filter(|op| matches!(op, Op::DeclareName(_)))
+            .count();
+        assert_eq!(declares, 3, "temporario + 2 nomes");
+        assert!(chunk.code.contains(&Op::Index));
+        // `const` marca todos como imutaveis (atribuicao posterior falha).
+        let program = parse_source("const {x} = {x: 1}; x = 2;").expect("parse deve passar");
+        let err = compile(&program).expect_err("atribuicao a const deve falhar");
+        assert!(err.message.contains("constante"));
+    }
+
+    #[test]
+    fn compiles_closure_and_general_calls() {
+        // Closure vira `MakeFunc` (valor); `f(1)` direto preserva `Call`.
+        let chunk = compile_src("let f = fn (x) { return x; }; echo f(1);");
+        assert_eq!(chunk.funcs.len(), 1);
+        assert_eq!(chunk.funcs[0].name, "{closure}");
+        assert!(chunk.code.contains(&Op::MakeFunc(0)));
+        assert!(chunk.code.contains(&Op::Call(1)));
+        // Chamada de callee arbitrario compila callee + `Call`.
+        let chunk = compile_src("echo (fn (x) { return x; })(41);");
+        assert!(chunk.code.contains(&Op::MakeFunc(0)));
+        assert!(chunk.code.contains(&Op::Call(1)));
+    }
+
+    #[test]
     fn rejects_builtin_arity_at_compile_time() {
         let program = parse_source("echo len(1, 2);").expect("parse deve passar");
         let err = compile(&program).expect_err("deve falhar");
@@ -1657,6 +2161,31 @@ mod tests {
     fn compiles_while_loop() {
         let chunk = compile_src("while false { echo 1; }");
         chunk.validate().expect("laco deve ser valido");
+    }
+
+    #[test]
+    fn compiles_switch_with_break_and_fallthrough() {
+        // Discriminante + Dup/Eq/JumpIfFalse por case com teste; `break`
+        // com `Pop` proprio; `Pop` final; chunk valido.
+        let chunk = compile_src(
+            "switch x { case 1 { echo \"a\"; break; } default { echo \"d\"; } case 2 { echo \"b\"; } }",
+        );
+        chunk.validate().expect("switch deve ser valido");
+        assert!(chunk.code.contains(&Op::Dup));
+        assert!(chunk.code.contains(&Op::Eq));
+        assert!(chunk.code.contains(&Op::Pop));
+        assert!(chunk.code.iter().any(|op| matches!(op, Op::JumpIfFalse(_))));
+        // `break` fora de laco/`switch` continua erro.
+        let program = parse_source("break;").expect("parse deve passar");
+        let err = compile(&program).expect_err("break solto deve falhar");
+        assert!(err.message.contains("fora de laco"));
+        let program = parse_source("continue;").expect("parse deve passar");
+        let err = compile(&program).expect_err("continue solto deve falhar");
+        assert!(err.message.contains("fora de laco"));
+        // `continue` sem laco externo (so `switch`) e erro.
+        let program = parse_source("switch 1 { case 1 { continue; } }").expect("parse deve passar");
+        let err = compile(&program).expect_err("continue em switch deve falhar");
+        assert!(err.message.contains("fora de laco"));
     }
 
     #[test]
@@ -1911,6 +2440,9 @@ mod tests {
             Builtin::DbClose,
             Builtin::HttpServe,
             Builtin::Template,
+            Builtin::Map,
+            Builtin::Filter,
+            Builtin::Usort,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);
@@ -1987,8 +2519,17 @@ mod tests {
         let func = Rc::new(FuncDef {
             name: "f".to_string(),
             params: vec![],
+            defaults: vec![],
+            variadic: None,
             body: Chunk::new(),
         });
-        assert_eq!(Value::Func(func).to_string(), "<fn f>");
+        assert_eq!(
+            Value::Func(FuncValue {
+                def: func,
+                env: HashMap::new()
+            })
+            .to_string(),
+            "<fn f>"
+        );
     }
 }
