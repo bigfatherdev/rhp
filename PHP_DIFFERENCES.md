@@ -95,6 +95,19 @@ a semantica for especificada e implementada.
 - `rand` NAO e criptografico (xorshift; sem `random_bytes` nesta leva).
 - `fs_list` raso e ordenado (sem flag de recursao por ora).
 
+## `hash_password`/`verify_password` (RFC 0013, Fase 5)
+
+- Nomes proprios do RHP (nao `password_hash`/`password_verify`): sem
+  promessa de agility de algoritmo nem constantes `PASSWORD_*`.
+- Criacao sempre Argon2id (OWASP defaults); verificacao aceita `$argon2id$`
+  e bcrypt `$2a$`/`$2b$`/`$2x$`/`$2y$` (migracao de bancos PHP: mesmos hashes
+  verificam). PHP aceita os mesmos formatos na leitura.
+- `verify` devolve `false` para senha errada, mas erro para hash malformado
+  ou algoritmo desconhecido (PHP retorna `false` tambem nesses casos;
+  RHP prefere erro explicito). Teto anti-DoS nos parametros (m<=64MiB,
+  t<=16, p<=4) — PHP nao documenta teto equivalente.
+- Truncamento bcrypt de 72 bytes herdado (igual ao PHP).
+
 - Sintaxe comparada (`echo`, `;`, strings) apos ampliacao da linguagem.
 - Sistema de tipos e conversoes.
 - Semantica de `echo`/`print` vs PHP.

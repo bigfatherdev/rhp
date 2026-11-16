@@ -533,6 +533,51 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+        Builtin::HashPassword => match &args[0] {
+            Value::Str(password) => {
+                use argon2::{Argon2, PasswordHasher};
+                Argon2::default()
+                    .hash_password(password.as_bytes())
+                    .map(|hash| Value::Str(hash.to_string()))
+                    .map_err(|e| VmError::new(format!("`hash_password` falhou: {e}")))
+            }
+            other => Err(VmError::new(format!(
+                "`hash_password` exige senha (string), encontrada {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::VerifyPassword => match (&args[0], &args[1]) {
+            (Value::Str(password), Value::Str(hash)) => {
+                if hash.starts_with("$argon2id$") {
+                    use argon2::{Argon2, PasswordVerifier};
+                    use password_hash::phc::PasswordHash;
+                    let parsed = PasswordHash::new(hash)
+                        .map_err(|_| VmError::new("hash argon2 invalido"))?;
+                    check_argon2_bounds(&parsed)?;
+                    Ok(Value::Bool(
+                        Argon2::default()
+                            .verify_password(password.as_bytes(), &parsed)
+                            .is_ok(),
+                    ))
+                } else if hash.starts_with("$2a$")
+                    || hash.starts_with("$2b$")
+                    || hash.starts_with("$2x$")
+                    || hash.starts_with("$2y$")
+                {
+                    bcrypt::verify(password, hash)
+                        .map(Value::Bool)
+                        .map_err(|_| VmError::new("hash bcrypt invalido"))
+                } else {
+                    Err(VmError::new(
+                        "algoritmo nao suportado (use Argon2id ou bcrypt)".to_string(),
+                    ))
+                }
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`verify_password` exige (senha, hash) em strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)
@@ -636,6 +681,21 @@ fn next_rand(state: &mut u64) -> u64 {
     x ^= x >> 27;
     *state = x;
     x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+/// Tetos anti-DoS para verificacao Argon2 (RFC 0013): os parametros vem do
+/// proprio hash (atacante controla); acima disto = erro antes de alocar.
+/// Padroes OWASP (m=19MiB, t=2, p=1) passam folgados.
+fn check_argon2_bounds(parsed: &password_hash::phc::PasswordHash) -> Result<(), VmError> {
+    let m = parsed.params.get_decimal("m").unwrap_or(19456);
+    let t = parsed.params.get_decimal("t").unwrap_or(2);
+    let p = parsed.params.get_decimal("p").unwrap_or(1);
+    if m > 65536 || t > 16 || p > 4 {
+        return Err(VmError::new(
+            "parametros Argon2 acima do teto (m<=65536KiB, t<=16, p<=4)".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn sort_array(items: &[Value]) -> Result<Vec<Value>, VmError> {

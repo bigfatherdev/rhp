@@ -158,6 +158,10 @@ pub enum Builtin {
     Filter,
     /// `usort(arr, cmp)` — insertion sort estavel via `cmp(a, b): Int` (RFC 0005).
     Usort,
+    /// `hash_password(senha)` — Argon2id (`$argon2id$v=19$...`; RFC 0013).
+    HashPassword,
+    /// `verify_password(senha, hash)` — `Bool`; `$argon2id$` ou bcrypt `$2*$` (RFC 0013).
+    VerifyPassword,
     /// `rand()` — `Int` em `[0, i64::MAX]` (xorshift64*; NAO criptografico; RFC 0012).
     Rand,
     /// `rand_range(min, max)` — `Int` em `[min, max]` (inclusive; RFC 0012).
@@ -226,6 +230,8 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "rand" => Some(Builtin::Rand),
         "rand_range" => Some(Builtin::RandRange),
         "fs_list" => Some(Builtin::FsList),
+        "hash_password" => Some(Builtin::HashPassword),
+        "verify_password" => Some(Builtin::VerifyPassword),
         _ => None,
     }
 }
@@ -263,7 +269,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::DateStr
         | Builtin::DbOpen
         | Builtin::DbClose
-        | Builtin::FsList => 1,
+        | Builtin::FsList
+        | Builtin::HashPassword => 1,
         Builtin::Push
         | Builtin::Contains
         | Builtin::StartsWith
@@ -282,7 +289,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Map
         | Builtin::Filter
         | Builtin::Usort
-        | Builtin::RandRange => 2,
+        | Builtin::RandRange
+        | Builtin::VerifyPassword => 2,
         Builtin::DbExec | Builtin::DbQuery | Builtin::HttpServe => 3,
         Builtin::Replace => 3,
     }
@@ -449,6 +457,8 @@ impl BuiltinId {
             53 => Ok(Builtin::Rand),
             54 => Ok(Builtin::RandRange),
             55 => Ok(Builtin::FsList),
+            56 => Ok(Builtin::HashPassword),
+            57 => Ok(Builtin::VerifyPassword),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -513,6 +523,8 @@ impl From<Builtin> for BuiltinId {
             Builtin::Rand => 53,
             Builtin::RandRange => 54,
             Builtin::FsList => 55,
+            Builtin::HashPassword => 56,
+            Builtin::VerifyPassword => 57,
         };
         Self(id)
     }
@@ -2834,6 +2846,8 @@ mod tests {
             Builtin::Rand,
             Builtin::RandRange,
             Builtin::FsList,
+            Builtin::HashPassword,
+            Builtin::VerifyPassword,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);
