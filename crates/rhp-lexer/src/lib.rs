@@ -898,4 +898,37 @@ mod tests {
             let _ = lex(src);
         }
     }
+
+    /// Gerador pseudoaleatorio deterministico (LCG; sem dependencias).
+    struct FuzzRng(u64);
+
+    impl FuzzRng {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % bound
+        }
+    }
+
+    #[test]
+    fn fuzz_random_bytes_never_panic() {
+        // Etapa 3: corpus deterministico (seed fixa, std-only). Lexer nunca
+        // entra em panico: so Ok(tokens) ou Err(posicionado).
+        const PIECES: [&str; 41] = [
+            "\"", "'", "(", ")", "{", "}", "[", "]", ",", ";", ":", ".", "=", "==", "+", "-", "*",
+            "/", "%", "<", ">", "!", "&", "|", " \n\t", "0", "42", "3.5", "abc", "let", "echo",
+            "fn", "if", "true", "é", "𝕩", "\\", "\u{0}", "a\"b", "1_", "..",
+        ];
+        let mut rng = FuzzRng(0x1EA0_F00D_1E5E_0D00);
+        for _ in 0..5000 {
+            let mut src = String::new();
+            let n = rng.next(12_usize);
+            for _ in 0..n {
+                src.push_str(PIECES[rng.next(PIECES.len())]);
+            }
+            let _ = lex(&src);
+        }
+    }
 }

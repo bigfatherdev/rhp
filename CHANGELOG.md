@@ -4,8 +4,20 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ## [unreleased]
 
+### Fixed
+
+- Panic com `max_stack_depth` + `return` (Etapa 3, achado do fuzz):
+  `Return` remove o frame e a checagem final de profundidade usava
+  índice obsoleto; agora tolera frame removido (topo corrente medido
+  no passo seguinte). Regressão pinada. Registro:
+  `changes/2026-11-16-fix-fuzz-vm-panic.md`.
+
 ### Added
 
+- Fuzz determinístico std-only em CI (Etapa 3): lexer (5000 entradas),
+  parser (5000 sequências), VM/validador (8000 chunks hostis + 600
+  mutações de programas válidos). Sem novas dependências. Registro:
+  `changes/2026-11-16-fix-fuzz-vm-panic.md`.
 - Closures de primeira classe (RFC 0003, PHP-100 P1): `fn (params) { }`
   como expressão com captura por valor, `MakeFunc`, chamadas de callee
   arbitrário (`CallValue`), `import` em closure rejeitado no loader.
