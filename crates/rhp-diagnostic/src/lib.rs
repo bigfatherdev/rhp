@@ -299,6 +299,11 @@ pub fn runtime_code(message: &str) -> (&'static str, Option<&'static str>) {
         )
     } else if message.contains("http_get") || message.contains("http_fetch") {
         ("E3011", Some("use http://, 2xx e corpo UTF-8 ate 1 MiB"))
+    } else if message.contains("heap excedeu o limite") {
+        (
+            "E3012",
+            Some("aumente o teto (--max-heap-bytes) ou reduza o trabalho"),
+        )
     } else {
         ("E3000", None)
     }
@@ -422,6 +427,7 @@ mod tests {
         assert_eq!(runtime_code("importacao circular").0, "E3009");
         assert_eq!(runtime_code("limite de instrucoes").0, "E3010");
         assert_eq!(runtime_code("http_get falhou").0, "E3011");
+        assert_eq!(runtime_code("heap excedeu o limite (512 bytes)").0, "E3012");
         assert_eq!(runtime_code("algo totalmente novo").0, "E3000");
     }
 }
