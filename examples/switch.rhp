@@ -1,0 +1,39 @@
+// Exemplos do `switch` (RFC 0004): match, fallthrough, break,
+// `default` no meio, sem-match, aninhado, em laco e avaliacao unica.
+let dia = 3;
+switch dia {
+  case 1 { echo "segunda"; break; }
+  case 2 { echo "terca"; break; }
+  case 3 { echo "quarta"; break; }
+  default { echo "outro dia"; }
+}
+
+switch dia {
+  case 3 { echo "caiu"; }
+  default { echo "sempre"; }
+  case 4 { echo "depois"; break; }
+}
+
+switch 99 { case 1 { echo "nunca"; } }
+
+switch 1 {
+  case 1 {
+    switch 2 { case 2 { echo "dentro"; } }
+    break;
+  }
+  default { echo "fora"; }
+}
+
+let i = 0;
+while i < 3 {
+  i = i + 1;
+  switch i {
+    case 2 { continue; }
+    default { echo i; }
+  }
+}
+
+let n = 0;
+fn prox() { n = n + 1; return n; }
+switch prox() { case 1 { echo "uma vez"; break; } }
+echo n;

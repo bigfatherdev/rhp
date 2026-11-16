@@ -1078,6 +1078,27 @@ impl Renamer<'_> {
                     body,
                 }
             }
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                let discriminant = self.expr(discriminant);
+                let cases = cases
+                    .iter()
+                    .map(|case| {
+                        let cond = case.cond.as_ref().map(|e| self.expr(e));
+                        // Escopo proprio por case (paridade com a VM).
+                        self.scopes.push(HashSet::new());
+                        let body = case.body.iter().map(|s| self.stmt(s)).collect();
+                        self.scopes.pop();
+                        rhp_parser::SwitchCase { cond, body }
+                    })
+                    .collect();
+                Stmt::Switch {
+                    discriminant,
+                    cases,
+                }
+            }
             Stmt::FnDef { name, params, body } => {
                 let renamed = self.declare(name);
                 self.scopes.push(HashSet::new());
@@ -1245,6 +1266,19 @@ fn check_stmt_expr_imports(stmt: &Stmt) -> Result<(), LoadError> {
         Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::For { iter: cond, .. } => {
             check_expr_imports(cond)
         }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            check_expr_imports(discriminant)?;
+            for case in cases {
+                if let Some(cond) = &case.cond {
+                    check_expr_imports(cond)?;
+                }
+                check_block_imports(&case.body, "em `switch`")?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1312,6 +1346,11 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
             }
             Stmt::While { body, .. } => check_block_imports(body, "em `while`")?,
             Stmt::For { body, .. } => check_block_imports(body, "em `for`")?,
+            Stmt::Switch { cases, .. } => {
+                for case in cases {
+                    check_block_imports(&case.body, "em `switch`")?;
+                }
+            }
             Stmt::Try {
                 body,
                 catch_body,
@@ -1577,6 +1616,63 @@ mod tests {
         )
         .expect("deve passar");
         assert_eq!(buf, b"42\n42\n");
+    }
+
+    #[test]
+    fn runs_switch_end_to_end() {
+        let mut buf: Vec<u8> = Vec::new();
+        run_source(
+            "switch 2 { case 1 { echo \"a\"; } default { echo \"d\"; } case 2 { echo \"b\"; break; } }",
+            "<teste>",
+            &mut buf,
+        )
+        .expect("deve passar");
+        assert_eq!(buf, b"d\nb\n");
+    }
+
+    #[test]
+    fn rejects_import_inside_switch_case() {
+        let dir = temp_dir("switch-import");
+        let main = write_temp_module(
+            &dir,
+            "main.rhp",
+            "switch 1 {\n  case 1 {\n    import \"outro.rhp\";\n  }\n}\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&main.to_string_lossy(), &[], &mut buf)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("nivel superior"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rename_switch_cases_have_own_scope() {
+        use std::collections::HashSet as Set;
+        // `let v` em cases distintos nao colide; topo renomeado.
+        let stmts = rhp_parser::parse_source(
+            "let x = 1;\nswitch x {\n  case 1 {\n    let v = 1;\n    echo v;\n  }\n  case 2 {\n    let v = 2;\n    echo v;\n  }\n}\n",
+        )
+        .expect("parse deve passar")
+        .statements;
+        let top: Set<String> = ["x".to_string()].into_iter().collect();
+        let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
+        match &renamed[1] {
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                assert!(matches!(
+                    discriminant,
+                    rhp_parser::Expr::Var(name) if name == "__rhp_mod0__x"
+                ));
+                assert_eq!(cases.len(), 2);
+                for case in cases {
+                    assert!(matches!(&case.body[0],
+                        Stmt::Let { name, .. } if name == "v"));
+                }
+            }
+            other => panic!("esperado Switch, obteve {other:?}"),
+        }
     }
 
     #[test]

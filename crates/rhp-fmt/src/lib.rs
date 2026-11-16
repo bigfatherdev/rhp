@@ -147,6 +147,27 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str("}\n");
         }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            indent(level, out);
+            let _ = writeln!(out, "switch {} {{", fmt_expr(discriminant, 0));
+            for case in cases {
+                indent(level + 1, out);
+                match &case.cond {
+                    Some(cond) => {
+                        let _ = writeln!(out, "case {} {{", fmt_expr(cond, 0));
+                    }
+                    None => out.push_str("default {\n"),
+                }
+                fmt_block(&case.body, level + 2, out);
+                indent(level + 1, out);
+                out.push_str("}\n");
+            }
+            indent(level, out);
+            out.push_str("}\n");
+        }
         Stmt::FnDef { name, params, body } => {
             indent(level, out);
             let _ = writeln!(out, "fn {name}({}) {{", params.join(", "));
@@ -410,6 +431,21 @@ mod tests {
         assert_eq!(fmt("echo 10 - (4 - 3);"), "echo 10 - (4 - 3);\n");
         assert_eq!(fmt("echo -(1 + 2);"), "echo -(1 + 2);\n");
         assert_eq!(fmt("echo !true;"), "echo !true;\n");
+    }
+
+    #[test]
+    fn formats_switch_statement() {
+        assert_eq!(
+            fmt("switch x{case 1{echo \"a\";}default{echo \"d\";}}"),
+            "switch x {\n  case 1 {\n    echo \"a\";\n  }\n  default {\n    echo \"d\";\n  }\n}\n"
+        );
+        // Idempotente + reparse preserva a AST (inclusive fallthrough e aninhado).
+        check_idempotent(
+            "switch x { case 1 { echo \"a\"; } default { echo \"d\"; } case 2 { echo \"b\"; } }",
+        );
+        check_idempotent(
+            "while i < 3 { switch i { case 2 { continue; } default { echo i; break; } } }",
+        );
     }
 
     #[test]

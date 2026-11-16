@@ -91,6 +91,13 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
   `Constant(Null); Return; Halt` + `DefineFunc` (nomeada) ou `MakeFunc`
   (closure). `return e;` = valor + `Return` (`return` no topo = erro de
   compilacao).
+- `switch` (RFC 0004) = discriminante + por case com teste
+  `Dup + case + Eq + JumpIfFalse proximo` (`default` = `Jump` incondicional)
+  e corpos em sequencia com `EnterScope`/`ExitScope` por case (fallthrough);
+  `break` com `Pop` proprio remendado para o fim, `continue` com `Pop` por
+  `switch` cruzado mirando o laco externo; `Pop` final dispensa o
+  discriminante no caminho sem-match/fallthrough. `LoopCtx.is_loop`
+  distingue laco (alvo de `continue`) de `switch`.
 - `Stmt::Import` e consumido pelo carregador de modulos; a compilacao direta
   o ignora (programa deve chegar resolvido).
 

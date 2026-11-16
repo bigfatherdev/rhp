@@ -10,6 +10,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   como expressão com captura por valor, `MakeFunc`, chamadas de callee
   arbitrário (`CallValue`), `import` em closure rejeitado no loader.
   Registro: `changes/2026-11-16-feat-closures-primeira-classe.md`.
+- `switch` com fallthrough (RFC 0004, Fase 2): `case`/`default` (único,
+  posição livre), `break`/`continue`, escopo por ramo, comparação `==`.
+  `switch`/`case`/`default` viram keywords.
+  Registro: `changes/2026-11-16-feat-switch.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 

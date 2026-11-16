@@ -18,6 +18,18 @@ a semantica for especificada e implementada.
   `Closure` nao converte para string (erro). Detalhes de conversao serao
   definidos na fase de tipos.
 
+## `switch` (RFC 0004, Fase 2)
+
+- Sintaxe com braces (`switch e { case c { ... } default { ... } }`); sem
+  `:` e sem `endswitch` (RHP nao tem sintaxe alternativa em nenhum comando).
+- Comparacao com o `==` do RHP (promocao int/float; demais tipos exigem
+  igualdade de tipo): difere do PHP, cujo `switch` e frouxo (`1 == true`
+  casa la; aqui nao). `switch(true)` com cases int nao casa.
+- Cada ramo tem escopo proprio (`let` repetido em ramos distintos nao
+  colide); no PHP o `switch` inteiro compartilha um escopo.
+- Sem `break N` (RHP nao tem `break` com argumento); `break` sai do
+  `switch` mais interno, `continue` mira o laco externo.
+
 - Sintaxe comparada (`echo`, `;`, strings) apos ampliacao da linguagem.
 - Sistema de tipos e conversoes.
 - Semantica de `echo`/`print` vs PHP.

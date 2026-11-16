@@ -24,6 +24,9 @@ pub enum TokenKind {
     Else,
     While,
     For,
+    Switch,
+    Case,
+    Default,
     Break,
     Continue,
     Try,
@@ -568,6 +571,9 @@ fn lex_ident_or_keyword(
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
         "for" => TokenKind::For,
+        "switch" => TokenKind::Switch,
+        "case" => TokenKind::Case,
+        "default" => TokenKind::Default,
         "try" => TokenKind::Try,
         "catch" => TokenKind::Catch,
         "finally" => TokenKind::Finally,
@@ -782,6 +788,10 @@ mod tests {
         assert_eq!(
             kinds("break continue const"),
             vec![TokenKind::Break, TokenKind::Continue, TokenKind::Const]
+        );
+        assert_eq!(
+            kinds("switch case default"),
+            vec![TokenKind::Switch, TokenKind::Case, TokenKind::Default]
         );
     }
 

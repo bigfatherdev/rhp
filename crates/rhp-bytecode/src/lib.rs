@@ -4,7 +4,7 @@
 //! vetor de instrucoes, mais builtins da biblioteca-padrao nucleo. A VM e
 //! baseada em pilha e valida o chunk (recursivamente) antes de executar.
 
-use rhp_parser::{AssignTarget, BinOp, Expr, Program, Stmt, UnaryOp};
+use rhp_parser::{AssignTarget, BinOp, Expr, Program, Stmt, SwitchCase, UnaryOp};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
@@ -801,8 +801,12 @@ struct PendingTry {
     loop_depth: usize,
 }
 
-/// Contexto de compilacao de um laco (para `break`/`continue`).
+/// Contexto de compilacao de um laco ou `switch` (para `break`/`continue`).
+/// `switch` empilha com `is_loop: false`: `break` mira o topo (seja laco
+/// ou `switch`); `continue` ignora `switch` e mira o laco mais interno.
 struct LoopCtx {
+    /// Verdadeiro para `while`/`for`; falso para `switch`.
+    is_loop: bool,
     /// Profundidade de escopo a manter ao sair com `break`.
     /// (`while`: fecha tambem o escopo do corpo; `for`: mantem o escopo
     /// do laco, fechado na saida, pois a condicao vive dentro dele.)
@@ -1012,6 +1016,7 @@ impl Compiler {
         self.emit_scope_open();
         let body_depth = self.scopes.len();
         self.loops.push(LoopCtx {
+            is_loop: true,
             break_depth: for_depth,
             continue_depth: body_depth,
             start: None,
@@ -1090,8 +1095,11 @@ impl Compiler {
         let mut i = self.pending_trys.len();
         while i > 0 {
             i -= 1;
+            // `depth` = indice do laco-alvo + 1: cruzam os `try`s abertos
+            // dentro dele (profundidade maior). Para desvios que miram o
+            // topo sem `switch` no caminho, equivale ao `==` anterior.
             let apply = match crossing_loop {
-                Some(depth) => self.pending_trys[i].loop_depth == depth,
+                Some(depth) => self.pending_trys[i].loop_depth >= depth,
                 None => true,
             };
             if !apply {
@@ -1216,6 +1224,95 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compila `switch` (RFC 0004): discriminante avaliado uma vez;
+    /// testes em ordem (`Dup + case + Eq`, `JumpIfFalse` para o proximo;
+    /// `default` desvia incondicional), corpos em sequencia com fallthrough
+    /// natural; `break` e o caminho sem-match convergem no `Pop` final
+    /// (dispensa o discriminante, pilha balanceada). Nenhum op novo.
+    fn compile_switch(
+        &mut self,
+        discriminant: &Expr,
+        cases: &[SwitchCase],
+    ) -> Result<(), CompileError> {
+        self.compile_expr(discriminant)?;
+        // Salva o rastreamento de escopos: `break`/`continue`/`return` nos
+        // cases o alteram; restaurado no fim (pools e saltos mantidos).
+        let saved_scopes = self.scopes.clone();
+        // Contexto "breakable": `break` mira o `switch`; `continue` o ignora.
+        self.loops.push(LoopCtx {
+            is_loop: false,
+            break_depth: self.scopes.len(),
+            continue_depth: self.scopes.len(),
+            start: None,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
+        // Bloco de testes: cada match desvia para o corpo (remendado apos).
+        let mut body_jumps: Vec<usize> = Vec::with_capacity(cases.len());
+        let mut next_test: Option<usize> = None;
+        for case in cases {
+            if let Some(pos) = next_test.take() {
+                let here = self.chunk.code.len() as u32;
+                self.patch_jump(pos, here);
+            }
+            match &case.cond {
+                Some(cond) => {
+                    self.emit(Op::Dup);
+                    self.compile_expr(cond)?;
+                    self.emit(Op::Eq);
+                    next_test = Some(self.emit(Op::JumpIfFalse(u32::MAX)));
+                    body_jumps.push(self.emit(Op::Jump(u32::MAX)));
+                }
+                // `default` casa quando alcancado (sem teste).
+                None => {
+                    body_jumps.push(self.emit(Op::Jump(u32::MAX)));
+                }
+            }
+        }
+        // Sem-match: remendado para o `Pop` apos os corpos (abaixo).
+        // O bloco de testes nunca cai em sequencia (todo teste desvia).
+        let no_match_jump = next_test.take();
+        // Corpos em sequencia (fallthrough); cada teste remendado p/ o seu.
+        for (case, jump) in cases.iter().zip(body_jumps.iter()) {
+            let here = self.chunk.code.len() as u32;
+            self.patch_jump(*jump, here);
+            self.emit_scope_open();
+            // Desvios no meio (`break; echo x`) baguncam o rastreamento;
+            // corpo divergente nao cai aqui (volta a entrada, sem emitir).
+            let case_saved = self.scopes.clone();
+            self.compile_stmts(&case.body)?;
+            if diverges(&case.body) {
+                self.scopes = saved_scopes.clone();
+            } else {
+                self.scopes = case_saved;
+                self.emit_scope_close()?;
+            }
+        }
+        // `break` (com `Pop` proprio) chega sem discriminante e converge
+        // no fim; fallthrough/sem-match o dispensam aqui. Cada salto mira
+        // o ponto de altura correspondente.
+        let pop_pos = self.chunk.code.len() as u32;
+        if let Some(pos) = no_match_jump {
+            self.patch_jump(pos, pop_pos);
+        }
+        self.emit(Op::Pop);
+        let end_target = self.chunk.code.len() as u32;
+        let Some(switch_ctx) = self.loops.pop() else {
+            return Err(CompileError::new(
+                "desequilibrio interno de lacos".to_string(),
+            ));
+        };
+        for pos in &switch_ctx.breaks {
+            self.patch_jump(*pos, end_target);
+        }
+        debug_assert!(
+            switch_ctx.continues.is_empty(),
+            "`continue` nunca mira `switch`"
+        );
+        self.scopes = saved_scopes;
+        Ok(())
+    }
+
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
             Stmt::Echo { expr } => {
@@ -1243,6 +1340,10 @@ impl Compiler {
                 let Some(loop_ctx) = self.loops.last() else {
                     return Err(CompileError::new("`break` fora de laco".to_string()));
                 };
+                // `break` no `switch` (topo nao-laco): dispensa o proprio
+                // discriminante antes de saltar (o dono remenda para DEPOIS
+                // do `Pop` do `switch`; lacos remendam para a saida normal).
+                let pop_discriminant = !loop_ctx.is_loop;
                 let break_depth = loop_ctx.break_depth;
                 let loop_level = self.loops.len();
                 // Fecha `try`s cruzados (handler + `finally`) antes de sair.
@@ -1250,30 +1351,47 @@ impl Compiler {
                 while self.scopes.len() > break_depth {
                     self.emit_scope_close()?;
                 }
+                if pop_discriminant {
+                    self.emit(Op::Pop);
+                }
                 let pos = self.emit(Op::Jump(u32::MAX));
                 if let Some(top) = self.loops.last_mut() {
                     top.breaks.push(pos);
                 }
             }
             Stmt::Continue => {
-                let (continue_depth, start) = match self.loops.last() {
-                    Some(loop_ctx) => (loop_ctx.continue_depth, loop_ctx.start),
-                    None => return Err(CompileError::new("`continue` fora de laco".to_string())),
+                // `continue` ignora contextos `switch` (nao sao lacos) e
+                // mira o laco mais interno; sem laco externo e erro.
+                let target = self.loops.iter().rposition(|ctx| ctx.is_loop);
+                let Some(pos) = target else {
+                    return Err(CompileError::new("`continue` fora de laco".to_string()));
                 };
-                let loop_level = self.loops.len();
-                self.emit_abrupt_exits(Some(loop_level))?;
+                let (continue_depth, start) = {
+                    let loop_ctx = &self.loops[pos];
+                    (loop_ctx.continue_depth, loop_ctx.start)
+                };
+                // Desvios cruzam `try`s abertos dentro do laco-alvo
+                // (profundidade de pilha maior que a do alvo).
+                self.emit_abrupt_exits(Some(pos + 1))?;
                 while self.scopes.len() > continue_depth {
                     self.emit_scope_close()?;
+                }
+                // Dispensa um discriminante por `switch` cruzado: cada um
+                // deixou seu valor na pilha (o alvo espera a altura sem eles).
+                let crossed = self.loops[pos + 1..]
+                    .iter()
+                    .filter(|ctx| !ctx.is_loop)
+                    .count();
+                for _ in 0..crossed {
+                    self.emit(Op::Pop);
                 }
                 match start {
                     Some(target) => {
                         self.emit(Op::Jump(target));
                     }
                     None => {
-                        let pos = self.emit(Op::Jump(u32::MAX));
-                        if let Some(top) = self.loops.last_mut() {
-                            top.continues.push(pos);
-                        }
+                        let jump = self.emit(Op::Jump(u32::MAX));
+                        self.loops[pos].continues.push(jump);
                     }
                 }
             }
@@ -1313,6 +1431,7 @@ impl Compiler {
                 let base_depth = self.scopes.len();
                 self.emit_scope_open();
                 self.loops.push(LoopCtx {
+                    is_loop: true,
                     break_depth: base_depth,
                     continue_depth: base_depth,
                     start: Some(loop_start),
@@ -1344,6 +1463,12 @@ impl Compiler {
             }
             Stmt::For { var, iter, body } => {
                 self.compile_for(var, iter, body)?;
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                self.compile_switch(discriminant, cases)?;
             }
             Stmt::FnDef { name, params, body } => {
                 let func_idx = self.compile_func_body(name, params, body)?;
@@ -1720,6 +1845,31 @@ mod tests {
     fn compiles_while_loop() {
         let chunk = compile_src("while false { echo 1; }");
         chunk.validate().expect("laco deve ser valido");
+    }
+
+    #[test]
+    fn compiles_switch_with_break_and_fallthrough() {
+        // Discriminante + Dup/Eq/JumpIfFalse por case com teste; `break`
+        // com `Pop` proprio; `Pop` final; chunk valido.
+        let chunk = compile_src(
+            "switch x { case 1 { echo \"a\"; break; } default { echo \"d\"; } case 2 { echo \"b\"; } }",
+        );
+        chunk.validate().expect("switch deve ser valido");
+        assert!(chunk.code.contains(&Op::Dup));
+        assert!(chunk.code.contains(&Op::Eq));
+        assert!(chunk.code.contains(&Op::Pop));
+        assert!(chunk.code.iter().any(|op| matches!(op, Op::JumpIfFalse(_))));
+        // `break` fora de laco/`switch` continua erro.
+        let program = parse_source("break;").expect("parse deve passar");
+        let err = compile(&program).expect_err("break solto deve falhar");
+        assert!(err.message.contains("fora de laco"));
+        let program = parse_source("continue;").expect("parse deve passar");
+        let err = compile(&program).expect_err("continue solto deve falhar");
+        assert!(err.message.contains("fora de laco"));
+        // `continue` sem laco externo (so `switch`) e erro.
+        let program = parse_source("switch 1 { case 1 { continue; } }").expect("parse deve passar");
+        let err = compile(&program).expect_err("continue em switch deve falhar");
+        assert!(err.message.contains("fora de laco"));
     }
 
     #[test]

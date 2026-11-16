@@ -50,8 +50,8 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 
 ```text
 Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt | WhileStmt
-           | ForStmt | TryStmt | ThrowStmt | BreakStmt | ContinueStmt | FnDef
-           | ReturnStmt | Block | ImportStmt | ExprStmt
+           | ForStmt | SwitchStmt | TryStmt | ThrowStmt | BreakStmt
+           | ContinueStmt | FnDef | ReturnStmt | Block | ImportStmt | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
 ConstStmt  := "const" Ident "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
@@ -60,6 +60,9 @@ EchoStmt   := "echo" Expr ";"
 IfStmt     := "if" Expr Block ("else" Block)?
 WhileStmt  := "while" Expr Block
 ForStmt    := "for" Ident "in" Expr Block
+SwitchStmt := "switch" Expr "{" (CaseClause | DefaultClause)* "}"
+CaseClause := "case" Expr Block   // `default` unico, posicao livre
+DefaultClause := "default" Block
 TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
            // ao menos um de `catch`/`finally` e obrigatorio
 ThrowStmt  := "throw" Expr ";"
@@ -81,13 +84,24 @@ ExprStmt   := Expr ";"
   ordem (mesma ordem de `keys`); outro tipo = erro de runtime ("`for`
   exige array ou mapa"). `x` e declarada a cada iteracao no escopo do
   corpo (atribuir a `x` nao afeta a iteracao; para strings, use
-  `for c in split(s, "")`). `break`/`continue` (sempre dentro de `while`
-  ou `for`, mesmo aninhados em `if`/blocos) saem da iteracao ou do laco
-  e fecham tambem o escopo do corpo — `let`s internos nao vazam para fora;
-  fora de laco e erro de compilacao. `continue` no `for` pula ao proximo
+  `for c in split(s, "")`). `break` (dentro de `while`, `for` ou `switch`,
+  mesmo aninhados em `if`/blocos) sai do laco/`switch` mais interno e fecha
+  tambem o escopo do corpo — `let`s internos nao vazam para fora; fora de
+  laco/`switch` e erro de compilacao. `continue` exige laco externo (pula
+  `switch`s no caminho). `continue` no `for` pula ao proximo
   elemento. `in` e contextual (identificador comum fora do `for`), mas
   `for` e palavra reservada. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
+- `switch e { case c { ... } default { ... } }` (RFC 0004): avalia `e` uma
+  vez; cada `case` compara com `==` do RHP em ordem ate o primeiro match
+  (preguicoso); sem `break`, o controle cai no proximo ramo (fallthrough);
+  `default` e unico, em qualquer posicao, e casa quando alcancado sem match
+  anterior. `break` sai do `switch` (mais interno); `continue` ignora o
+  `switch` e mira o laco mais externo (sem laco = erro de compilacao).
+  Cada ramo tem escopo proprio (`let` repetido em ramos distintos nao
+  colide). `case`/`default` fora de `switch` e erro de parse; `switch`
+  vazio e permitido. `switch(true)` com cases int nao casa (`==` nao promove
+  `Bool`; ver `PHP_DIFFERENCES.md`).
 - `try B (catch V? C)? (finally F)?` (ao menos um dos dois): erro em `B`
   (incluindo `throw`, `assert` falho, builtin com erro) procura o `catch`
   mais interno na mesma funcao; sem handler, desenrola chamadas (rodando

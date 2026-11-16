@@ -1342,6 +1342,88 @@ mod tests {
     }
 
     #[test]
+    fn runs_switch_statement() {
+        // Match + break (sem fallthrough).
+        assert_eq!(
+            run_src("switch 2 { case 1 { echo \"a\"; } case 2 { echo \"b\"; break; } default { echo \"d\"; } }")
+                .expect("ok"),
+            "b\n"
+        );
+        // Fallthrough ate o fim quando nao ha `break`.
+        assert_eq!(
+            run_src("switch 1 { case 1 { echo \"a\"; } case 2 { echo \"b\"; } default { echo \"d\"; } }")
+                .expect("ok"),
+            "a\nb\nd\n"
+        );
+        // `default` no meio: casa por ordem, fallthrough continua depois.
+        assert_eq!(
+            run_src("switch 2 { case 1 { echo \"a\"; } default { echo \"d\"; } case 2 { echo \"b\"; } }")
+                .expect("ok"),
+            "d\nb\n"
+        );
+        // Sem match e sem default: nada executa.
+        assert_eq!(
+            run_src("switch 99 { case 1 { echo \"x\"; } }").expect("ok"),
+            ""
+        );
+        // So default.
+        assert_eq!(
+            run_src("switch 99 { default { echo \"d\"; } }").expect("ok"),
+            "d\n"
+        );
+        // Vazio.
+        assert_eq!(run_src("switch 1 { }").expect("ok"), "");
+        // Comparacao segue o `==` do RHP (int/float com promocao; resto
+        // mesmo tipo): `1` casa com `1.0`, mas `true` nao casa com `1`.
+        assert_eq!(
+            run_src("switch 1 { case 1.0 { echo \"num\"; } }").expect("ok"),
+            "num\n"
+        );
+        assert_eq!(
+            run_src("switch true { case 1 { echo \"x\"; } default { echo \"d\"; } }").expect("ok"),
+            "d\n"
+        );
+        // Discriminante avaliado uma unica vez.
+        assert_eq!(
+            run_src("let n = 0; fn prox() { n = n + 1; return n; } switch prox() { case 1 { echo \"ok\"; } } echo n;")
+                .expect("ok"),
+            "ok\n1\n"
+        );
+        // `let` repetido em cases distintos nao colide (escopo por case).
+        assert_eq!(
+            run_src(
+                "switch 2 { case 1 { let v = 1; echo v; } case 2 { let v = 2; echo v; break; } }"
+            )
+            .expect("ok"),
+            "2\n"
+        );
+        // Aninhado + `break` so sai do interno.
+        assert_eq!(
+            run_src("switch 1 { case 1 { switch 2 { case 2 { echo \"dentro\"; break; } } echo \"fora\"; break; } }")
+                .expect("ok"),
+            "dentro\nfora\n"
+        );
+        // `switch` em laco: `continue` mira o laco, `break` sai do `switch`.
+        assert_eq!(
+            run_src("let i = 0; while i < 3 { i = i + 1; switch i { case 2 { continue; } default { echo i; } } echo \"f\"; }")
+                .expect("ok"),
+            "1\nf\n3\nf\n"
+        );
+        // Laco em case: `break` sai do laco (mais interno).
+        assert_eq!(
+            run_src("switch 1 { case 1 { let j = 0; while j < 5 { j = j + 1; if j == 2 { break; } } echo j; break; } }")
+                .expect("ok"),
+            "2\n"
+        );
+        // `return` em case sai da ativacao.
+        assert_eq!(
+            run_src("fn f(x) { switch x { case 1 { return \"um\"; } default { return \"outro\"; } } } echo f(1); echo f(9);")
+                .expect("ok"),
+            "um\noutro\n"
+        );
+    }
+
+    #[test]
     fn reports_call_errors() {
         assert!(run_err("echo f();").contains("nao definida"));
         assert!(run_err("let f = 1; echo f();").contains("como funcao"));

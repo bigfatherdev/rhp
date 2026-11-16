@@ -6,9 +6,9 @@
 //! Program    := Stmt*
 //! Block      := "{" Stmt* "}"
 //! Stmt       := LetStmt | ConstStmt | AssignStmt | EchoStmt | IfStmt
-//!             | WhileStmt | ForStmt | TryStmt | ThrowStmt | BreakStmt
-//!             | ContinueStmt | FnDef | ReturnStmt | Block | ImportStmt
-//!             | ImportNames | Export | ExprStmt
+//!             | WhileStmt | ForStmt | SwitchStmt | TryStmt | ThrowStmt
+//!             | BreakStmt | ContinueStmt | FnDef | ReturnStmt | Block
+//!             | ImportStmt | ImportNames | Export | ExprStmt
 //! LetStmt    := "let" Ident ("=" Expr)? ";"
 //! ConstStmt  := "const" Ident "=" Expr ";"
 //! AssignStmt := Target "=" Expr ";"
@@ -17,6 +17,9 @@
 //! IfStmt     := "if" Expr Block ("else" Block)?
 //! WhileStmt  := "while" Expr Block
 //! ForStmt    := "for" Ident "in" Expr Block
+//! SwitchStmt := "switch" Expr "{" (CaseClause | DefaultClause)* "}"
+//! CaseClause := "case" Expr Block  // `default` unico, posicao livre
+//! DefaultClause := "default" Block
 //! TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
 //!             // ao menos um de `catch`/`finally` e obrigatorio
 //! ThrowStmt  := "throw" Expr ";"
@@ -98,6 +101,14 @@ pub enum Stmt {
         iter: Expr,
         body: Vec<Stmt>,
     },
+    /// `switch EXPR { (case EXPR { ... } | default { ... })* }` (RFC 0004).
+    /// Comparacao frouxa `==`, fallthrough, `default` unico em qualquer
+    /// posicao (`cond: None`). `break` sai do `switch`; `continue` mira o
+    /// laco externo (checado na compilacao).
+    Switch {
+        discriminant: Expr,
+        cases: Vec<SwitchCase>,
+    },
     /// `try BLOCO (catch VAR? BLOCO)? (finally BLOCO)?` (RFC 0001).
     /// Ao menos um de `catch`/`finally` e obrigatorio (checado no parse).
     /// `catch` presente com corpo vazio (`catch e { }`) consome o erro.
@@ -146,6 +157,13 @@ pub enum Stmt {
 pub struct ImportName {
     pub name: String,
     pub alias: Option<String>,
+}
+
+/// Ramo de `switch`: `cond: None` e o `default` (unico, posicao livre).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCase {
+    pub cond: Option<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 /// Alvo de atribuicao: variavel ou elemento `nome[indice]` (um nivel).
@@ -406,6 +424,7 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::If => parse_if(cursor),
         TokenKind::While => parse_while(cursor),
         TokenKind::For => parse_for(cursor),
+        TokenKind::Switch => parse_switch(cursor),
         TokenKind::Try => parse_try(cursor),
         TokenKind::Throw => parse_throw(cursor),
         TokenKind::Fn => parse_fn_def(cursor),
@@ -550,6 +569,76 @@ fn parse_for(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     let iter = parse_expr(cursor)?;
     let body = parse_block(cursor)?;
     Ok(Stmt::For { var, iter, body })
+}
+
+/// `switch EXPR { case EXPR { ... } default { ... } }` (RFC 0004).
+///
+/// `default` e unico (segundo = erro) e livre de posicao; cases e default
+/// exigem braces (consistente com `if`/`while`). `case`/`default` fora do
+/// `switch` nao chegam aqui (o dispatch so entra via `TokenKind::Switch`).
+fn parse_switch(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next(); // consome `switch`
+    let discriminant = parse_expr(cursor)?;
+    expect_token(
+        cursor,
+        &TokenKind::LBrace,
+        "esperado `{` apos expressao do `switch`",
+    )?;
+    let mut cases = Vec::new();
+    let mut has_default = false;
+    loop {
+        match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::RBrace) => {
+                cursor.next();
+                break;
+            }
+            Some(TokenKind::Case) => {
+                cursor.next();
+                let cond = parse_expr(cursor)?;
+                let body = parse_block(cursor)?;
+                cases.push(SwitchCase {
+                    cond: Some(cond),
+                    body,
+                });
+            }
+            Some(TokenKind::Default) => {
+                let tok = cursor.next().expect("peek garantiu `default`");
+                if has_default {
+                    return Err(ParseError::new(
+                        "`switch` aceita um unico `default`".to_string(),
+                        tok.line,
+                        tok.col,
+                    ));
+                }
+                has_default = true;
+                let body = parse_block(cursor)?;
+                cases.push(SwitchCase { cond: None, body });
+            }
+            Some(other) => {
+                let tok = cursor.next().expect("peek garantiu token");
+                return Err(ParseError::new(
+                    format!(
+                        "esperado `case`, `default` ou `}}` no `switch`, encontrado {}",
+                        describe(other)
+                    ),
+                    tok.line,
+                    tok.col,
+                ));
+            }
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `case`, `default` ou `}` no `switch`, encontrado fim de arquivo",
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    Ok(Stmt::Switch {
+        discriminant,
+        cases,
+    })
 }
 
 fn parse_throw(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -1238,6 +1327,9 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Else => "`else`".to_string(),
         TokenKind::While => "`while`".to_string(),
         TokenKind::For => "`for`".to_string(),
+        TokenKind::Switch => "`switch`".to_string(),
+        TokenKind::Case => "`case`".to_string(),
+        TokenKind::Default => "`default`".to_string(),
         TokenKind::Try => "`try`".to_string(),
         TokenKind::Catch => "`catch`".to_string(),
         TokenKind::Finally => "`finally`".to_string(),
@@ -1452,6 +1544,56 @@ mod tests {
                 }],
             }]
         );
+    }
+
+    #[test]
+    fn parses_switch_with_default_in_middle() {
+        let program = lex_and_parse(
+            "switch x { case 1 { echo \"a\"; } default { echo \"d\"; } case 2 { echo \"b\"; } }",
+        )
+        .expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::Switch {
+                discriminant: Expr::Var("x".to_string()),
+                cases: vec![
+                    SwitchCase {
+                        cond: Some(Expr::Int(1)),
+                        body: vec![Stmt::Echo {
+                            expr: Expr::StringLiteral("a".to_string()),
+                        }],
+                    },
+                    SwitchCase {
+                        cond: None,
+                        body: vec![Stmt::Echo {
+                            expr: Expr::StringLiteral("d".to_string()),
+                        }],
+                    },
+                    SwitchCase {
+                        cond: Some(Expr::Int(2)),
+                        body: vec![Stmt::Echo {
+                            expr: Expr::StringLiteral("b".to_string()),
+                        }],
+                    },
+                ],
+            }]
+        );
+        // Vazio e sem-default passam.
+        lex_and_parse("switch x { }").expect("switch vazio deve passar");
+        lex_and_parse("switch 1 { case 1 { echo 1; } }").expect("sem default deve passar");
+    }
+
+    #[test]
+    fn rejects_switch_misuse() {
+        // `default` duplo.
+        let err = lex_and_parse("switch x { default { } default { } }")
+            .expect_err("default duplo deve falhar");
+        assert!(err.to_string().contains("unico `default`"), "obteve: {err}");
+        // `case` fora de `switch` nao e statement valido (cai em expressao).
+        let err = lex_and_parse("case 1 { echo 1; }").expect_err("case solto deve falhar");
+        assert!(err.to_string().contains("`case`"), "obteve: {err}");
+        // `default` fora de `switch` tambem nao.
+        lex_and_parse("default { echo 1; }").expect_err("default solto deve falhar");
     }
 
     #[test]
