@@ -37,6 +37,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - Hashing de senhas (RFC 0013, Fase 5): `hash_password` (Argon2id) e
   `verify_password` (`$argon2id$` + bcrypt `$2*$`, migração de bancos PHP).
   Registro: `changes/2026-11-16-feat-password-hashing.md`.
+- Regex, hashing e HMAC (RFC 0014, Fase 6): `regex_match`/`regex_replace`/
+  `regex_split` (sem lookaround/backrefs), `sha256` + `hmac_sha256`/`hmac_verify`
+  (RustCrypto puro, teto anti-DoS).
+  Registro: `changes/2026-11-16-feat-regex-hmac.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 

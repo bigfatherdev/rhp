@@ -162,6 +162,18 @@ pub enum Builtin {
     HashPassword,
     /// `verify_password(senha, hash)` — `Bool`; `$argon2id$` ou bcrypt `$2*$` (RFC 0013).
     VerifyPassword,
+    /// `regex_match(s, padrao)` — `Bool`; tempo linear, sem lookaround/backrefs (RFC 0014).
+    RegexMatch,
+    /// `regex_replace(s, padrao, subst)` — `$1`/`$name`; `Str` (RFC 0014).
+    RegexReplace,
+    /// `regex_split(s, padrao)` — `Array` de `Str` (RFC 0014).
+    RegexSplit,
+    /// `sha256(s)` — hex; puro Rust (RFC 0014).
+    Sha256,
+    /// `hmac_sha256(chave, msg)` — tag hex, tempo constante na verificacao (RFC 0014).
+    HmacSha256,
+    /// `hmac_verify(chave, msg, tag)` — `Bool` (RFC 0014).
+    HmacVerify,
     /// `rand()` — `Int` em `[0, i64::MAX]` (xorshift64*; NAO criptografico; RFC 0012).
     Rand,
     /// `rand_range(min, max)` — `Int` em `[min, max]` (inclusive; RFC 0012).
@@ -232,6 +244,12 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "fs_list" => Some(Builtin::FsList),
         "hash_password" => Some(Builtin::HashPassword),
         "verify_password" => Some(Builtin::VerifyPassword),
+        "regex_match" => Some(Builtin::RegexMatch),
+        "regex_replace" => Some(Builtin::RegexReplace),
+        "regex_split" => Some(Builtin::RegexSplit),
+        "sha256" => Some(Builtin::Sha256),
+        "hmac_sha256" => Some(Builtin::HmacSha256),
+        "hmac_verify" => Some(Builtin::HmacVerify),
         _ => None,
     }
 }
@@ -270,7 +288,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::DbOpen
         | Builtin::DbClose
         | Builtin::FsList
-        | Builtin::HashPassword => 1,
+        | Builtin::HashPassword
+        | Builtin::Sha256 => 1,
         Builtin::Push
         | Builtin::Contains
         | Builtin::StartsWith
@@ -290,8 +309,15 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Filter
         | Builtin::Usort
         | Builtin::RandRange
-        | Builtin::VerifyPassword => 2,
-        Builtin::DbExec | Builtin::DbQuery | Builtin::HttpServe => 3,
+        | Builtin::VerifyPassword
+        | Builtin::RegexMatch
+        | Builtin::RegexSplit
+        | Builtin::HmacSha256 => 2,
+        Builtin::DbExec
+        | Builtin::DbQuery
+        | Builtin::HttpServe
+        | Builtin::RegexReplace
+        | Builtin::HmacVerify => 3,
         Builtin::Replace => 3,
     }
 }
@@ -459,6 +485,12 @@ impl BuiltinId {
             55 => Ok(Builtin::FsList),
             56 => Ok(Builtin::HashPassword),
             57 => Ok(Builtin::VerifyPassword),
+            58 => Ok(Builtin::RegexMatch),
+            59 => Ok(Builtin::RegexReplace),
+            60 => Ok(Builtin::RegexSplit),
+            61 => Ok(Builtin::Sha256),
+            62 => Ok(Builtin::HmacSha256),
+            63 => Ok(Builtin::HmacVerify),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -525,6 +557,12 @@ impl From<Builtin> for BuiltinId {
             Builtin::FsList => 55,
             Builtin::HashPassword => 56,
             Builtin::VerifyPassword => 57,
+            Builtin::RegexMatch => 58,
+            Builtin::RegexReplace => 59,
+            Builtin::RegexSplit => 60,
+            Builtin::Sha256 => 61,
+            Builtin::HmacSha256 => 62,
+            Builtin::HmacVerify => 63,
         };
         Self(id)
     }
@@ -2848,6 +2886,12 @@ mod tests {
             Builtin::FsList,
             Builtin::HashPassword,
             Builtin::VerifyPassword,
+            Builtin::RegexMatch,
+            Builtin::RegexReplace,
+            Builtin::RegexSplit,
+            Builtin::Sha256,
+            Builtin::HmacSha256,
+            Builtin::HmacVerify,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

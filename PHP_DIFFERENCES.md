@@ -108,6 +108,12 @@ a semantica for especificada e implementada.
   t<=16, p<=4) — PHP nao documenta teto equivalente.
 - Truncamento bcrypt de 72 bytes herdado (igual ao PHP).
 
+## Regex, hashing e HMAC (RFC 0014, Fase 6)
+
+- Nomes proprios do RHP (`regex_match`, `sha256`, `hmac_*`): sem promessa de compatibilidade 1:1 com `preg_*`/`hash()` do PHP.
+- Regex sem lookaround/backrefs (tempo linear garantido; padrao invalido = erro de compilacao). PHP aceita essas construcoes (com custo ReDoS).
+- `hmac_verify` compara em tempo constante; `sha256`/`hmac_sha256` devolvem hex lowercase.
+
 - Sintaxe comparada (`echo`, `;`, strings) apos ampliacao da linguagem.
 - Sistema de tipos e conversoes.
 - Semantica de `echo`/`print` vs PHP.
