@@ -78,6 +78,7 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 - [x] `static` em funcao (RFC 0010 aceita e implementada: estado por definicao).
 - [x] Re-export seletivo (RFC 0011 aceita e implementada: transitivo, sem `export *`).
 - [x] Builtins `rand`/`rand_range`/`fs_list` (RFC 0012 aceita e implementada).
+- [x] Hashing de senhas (RFC 0013 + ADR 0013 aceitas e implementadas: `hash_password` Argon2id + `verify_password` `$argon2id$`/bcrypt, teto anti-DoS).
 - [x] Closures de primeira classe (RFC 0003 aceita e implementada:
   `fn (params) { }`, captura por valor, `MakeFunc`, `CallValue`).
 

@@ -32,6 +32,10 @@
   `http_fetch` (teto de 10, sem downgrade https->http).
 - `VmLimits` e opt-in (padrao ilimitado); heap sem teto medido em bytes.
 - Sem auditoria externa, fuzz continuo ou testes em Windows.
+- `rand()`/`rand_range()` NAO sao criptograficos (xorshift64; so para
+  sorteio/jogos). Segredos, tokens e CSRF exigem CSPRNG — ainda ausente
+  (sem `random_bytes` nesta leva). Para senhas, use `hash_password`/
+  `verify_password` (Argon2id/bcrypt).
 
 ## Reporte
 

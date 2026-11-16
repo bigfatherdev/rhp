@@ -1,0 +1,6 @@
+// Exemplos de hashing de senhas (RFC 0013 + ADR 0013).
+let h = hash_password("hunter2");
+echo verify_password("hunter2", h);
+echo verify_password("errada", h);
+// Vetor independente ($2a$, ferramenta online): migracao de bancos legados.
+echo verify_password("password", "$2a$04$UuTkLRZZ6QofpDOlMz32MuuxEHA43WOemOYHPz6.SjsVsyO1tDU96");

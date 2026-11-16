@@ -288,6 +288,8 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `fs_list(dir)` | (RFC 0012) Nomes das entradas ordenados (`Array` de `Str`; `[]` se vazio); inexistente/nao-diretorio = erro. |
 | `rand()` | (RFC 0012) `Int` em `[0, i64::MAX]` (xorshift64*; NAO criptografico). |
 | `rand_range(min, max)` | (RFC 0012) `Int` em `[min, max]` (inclusive); `min > max` ou nao-`Int` = erro. |
+| `hash_password(senha)` | (RFC 0013) Argon2id (`$argon2id$v=19$...`, defaults OWASP); `Str` requerida. |
+| `verify_password(senha, hash)` | (RFC 0013) `Bool`; aceita `$argon2id$` e bcrypt `$2a$`/`$2b$`/`$2x$`/`$2y$` (migracao de bancos PHP); resto = erro; teto anti-DoS (m<=64MiB, t<=16, p<=4). |
 | `argv()` | `Array` de `Str` com os argumentos apos o arquivo (`rhp run prog.rhp a b` => `["a", "b"]`). |
 | `env(nome)` | Valor da variavel de ambiente ou `null` se ausente. |
 | `sort(arr)` | Copia ordenada (estavel): numeros (`Int`/`Float`, mistos comparam exato quando possivel), `Str` (ordem lexicografica de bytes UTF-8) ou `Bool` (`false` < `true`); vazio => vazio. Mistura com outros tipos ou nao-array = erro. Nao muta o original (`a = sort(a);`). |

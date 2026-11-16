@@ -127,7 +127,7 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 40 Now 41 Sleep 42 DateStr 43 HttpFetch
 44 DbOpen 45 DbExec 46 DbQuery 47 DbClose
 48 HttpServe 49 Template 50 Map 51 Filter 52 Usort
-53 Rand 54 RandRange 55 FsList`
+53 Rand 54 RandRange 55 FsList 56 HashPassword 57 VerifyPassword`
 (aridades na tabela §6 de `LANGUAGE_SPEC.md`). Ids desconhecidos invalidam
 o chunk; `BuiltinId` tem teste anti-deriva.
 HOFs com callback (`Map`/`Filter`/`Usort`, RFC 0005) nao passam pelo

@@ -2112,6 +2112,47 @@ mod tests {
     }
 
     #[test]
+    fn hashes_and_verifies_passwords() {
+        // Round-trip: formato PHC Argon2id (defaults OWASP); errada => false.
+        let out = run_src("let h = hash_password(\"hunter2\"); echo h; echo verify_password(\"hunter2\", h); echo verify_password(\"errada\", h);")
+            .expect("ok");
+        let mut lines = out.lines();
+        let hash = lines.next().expect("tem hash");
+        assert!(
+            hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "formato inesperado: {hash}"
+        );
+        assert_eq!(lines.collect::<Vec<_>>().join("\n"), "true\nfalse");
+        // Vetores independentes: ferramenta online ($2a$) e Python ($2b$).
+        assert_eq!(
+            run_src("echo verify_password(\"password\", \"$2a$04$UuTkLRZZ6QofpDOlMz32MuuxEHA43WOemOYHPz6.SjsVsyO1tDU96\");")
+                .expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src("echo verify_password(\"correctbatteryhorsestapler\", \"$2b$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie\");")
+                .expect("ok"),
+            "true\n"
+        );
+        // `$2y$` do PHP: mesmo algoritmo, marcador diferente.
+        assert_eq!(
+            run_src("echo verify_password(\"correctbatteryhorsestapler\", \"$2y$04$EGdrhbKUv8Oc9vGiXX0HQOxSg445d458Muh7DAHskb6QbtCvdxcie\");")
+                .expect("ok"),
+            "true\n"
+        );
+        // Erros: hash malformado, algoritmo desconhecido, teto anti-DoS.
+        assert!(run_err("echo verify_password(\"x\", \"nao-e-hash\");").contains("nao suportado"));
+        assert!(
+            run_err("echo verify_password(\"x\", \"$scrypt$n=1$r=8$p=1$c2FsdA$aGFzaA\");")
+                .contains("nao suportado")
+        );
+        assert!(run_err("echo verify_password(\"x\", \"$argon2id$v=19$m=100000,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\");")
+            .contains("acima do teto"));
+        assert!(run_err("echo hash_password(1);").contains("string"));
+        assert!(run_err("echo verify_password(1, \"x\");").contains("strings"));
+    }
+
+    #[test]
     fn runs_match_expression() {
         // Valor retornado; primeiro match vence; sem fallthrough.
         assert_eq!(

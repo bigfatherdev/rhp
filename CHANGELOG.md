@@ -34,6 +34,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   Registro: `changes/2026-11-16-feat-reexport.md`.
 - Builtins `rand`/`rand_range`/`fs_list` (RFC 0012, Fase 4).
   Registro: `changes/2026-11-16-feat-rand-fslist.md`.
+- Hashing de senhas (RFC 0013, Fase 5): `hash_password` (Argon2id) e
+  `verify_password` (`$argon2id$` + bcrypt `$2*$`, migração de bancos PHP).
+  Registro: `changes/2026-11-16-feat-password-hashing.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 
