@@ -41,6 +41,7 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 | `DefineFunc(f)` | Cria `Func{def: funcs[f], env: snapshot}` e declara o nome no escopo atual (RFC 0003: captura uniforme tambem para `fn` nomeada). |
 | `MakeFunc(f)` | Captura o ambiente atual por valor (escopos internos→externos) e empilha `Func{def: funcs[f], env}` (efeito de pilha: +1). |
 | `Call(a)` | `pop` callee + `a` args; ativacao com escopo unico = env capturado + params (params sombreiam); empilha retorno ao fim. Erros: callee nao-funcao, aridade, profundidade >= 512. |
+| `CallMixed(d)` | Como `Call`, mas guiado pelo descritor `constants[d]` (`Array` de `Int(0)`=posicional, `Int(1)`=spread, `Str`=nomeado; RFC 0009): `pop` callee + N valores em ordem do fonte; expande spreads (`Array`, senao erro); liga por nome/posicao com defaults/`...rest`. Validador checa bounds + tipo do descritor e altura `-(N+1)+1`. |
 | `Return` | Retorna `pop` ao chamador. Erro no programa principal. |
 | `Pop` | Descarta topo (instrucao por expressao). |
 | `BuildArray(n)` | `pop` n valores; empilha `Array` (ordem preservada). |
@@ -125,7 +126,8 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 36 Sort 37 Exit 38 JsonParse 39 JsonStringify
 40 Now 41 Sleep 42 DateStr 43 HttpFetch
 44 DbOpen 45 DbExec 46 DbQuery 47 DbClose
-48 HttpServe 49 Template 50 Map 51 Filter 52 Usort`
+48 HttpServe 49 Template 50 Map 51 Filter 52 Usort
+53 Rand 54 RandRange 55 FsList`
 (aridades na tabela §6 de `LANGUAGE_SPEC.md`). Ids desconhecidos invalidam
 o chunk; `BuiltinId` tem teste anti-deriva.
 HOFs com callback (`Map`/`Filter`/`Usort`, RFC 0005) nao passam pelo

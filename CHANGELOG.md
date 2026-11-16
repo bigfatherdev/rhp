@@ -26,6 +26,14 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 - Lote nucleo-2 (RFC 0008, Fase 3): `match` estrito, Elvis `?:`, arrow
   `=>`, `for(;;)`, `break`/`continue N` (`match` vira keyword).
   Registro: `changes/2026-11-16-feat-lote-nucleo-2.md`.
+- Chamadas mistas (RFC 0009, Fase 4): nomeados + spread via `CallMixed`.
+  Registro: `changes/2026-11-16-feat-chamadas-mistas.md`.
+- `static` em funcao (RFC 0010, Fase 4): estado por definicao.
+  Registro: `changes/2026-11-16-feat-static-funcao.md`.
+- Re-export seletivo (RFC 0011, Fase 4): transitivo, sem `export *`.
+  Registro: `changes/2026-11-16-feat-reexport.md`.
+- Builtins `rand`/`rand_range`/`fs_list` (RFC 0012, Fase 4).
+  Registro: `changes/2026-11-16-feat-rand-fslist.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 

@@ -37,6 +37,7 @@ pub enum TokenKind {
     Export,
     Fn,
     Return,
+    Static,
     Import,
     True,
     False,
@@ -614,6 +615,7 @@ fn lex_ident_or_keyword(
         "export" => TokenKind::Export,
         "fn" => TokenKind::Fn,
         "return" => TokenKind::Return,
+        "static" => TokenKind::Static,
         "import" => TokenKind::Import,
         "true" => TokenKind::True,
         "false" => TokenKind::False,
@@ -843,6 +845,7 @@ mod tests {
             kinds("switch case default"),
             vec![TokenKind::Switch, TokenKind::Case, TokenKind::Default]
         );
+        assert_eq!(kinds("static"), vec![TokenKind::Static]);
     }
 
     #[test]

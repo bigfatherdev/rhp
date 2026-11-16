@@ -19,6 +19,8 @@
 3. `Call(a)`: `pop` callee + `a` args (ordem preservada), checa tipo `Func`,
    aridade e profundidade; novo frame com escopo unico (clone do env
    capturado + params vinculados, params sombreiam); continua nele.
+   `CallMixed(d)`: mesmo, guiado pelo descritor (expande spreads, liga
+   nomeados; RFC 0009).
    `MakeFunc(f)`: empilha `Func{def, env: snapshot atual}` (internos→externos).
    `DefineFunc(f)`: idem + declara (captura uniforme para `fn` nomeada).
 - HOFs com callback (RFC 0005): `map`/`filter`/`usort` via protocolo de

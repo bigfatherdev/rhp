@@ -89,6 +89,11 @@ pub enum Stmt {
         name: String,
         init: Expr,
     },
+    /// `static nome = expr;` dentro de funcao (estado por definicao, RFC 0010).
+    Static {
+        name: String,
+        init: Expr,
+    },
     Break,
     Continue,
     /// `break N;` / `continue N;` (N >= 1, literal; ausente = 1; RFC 0008).
@@ -168,6 +173,12 @@ pub enum Stmt {
         path: String,
         names: Vec<ImportName>,
     },
+    /// `export { a, b as c } from "caminho.rhp";` — re-export seletivo
+    /// (RFC 0011; nomes passam aos exports deste modulo).
+    ReExport {
+        path: String,
+        names: Vec<ImportName>,
+    },
     /// `export fn/let/const` (ADR 0009, opt-in; sem `export` = privado).
     /// O linker extrai o nome e remove o marcador; compilar um `Export`
     /// direto da erro (defesa em profundidade).
@@ -207,6 +218,25 @@ pub struct SwitchCase {
 pub enum AssignTarget {
     Var(String),
     Index { name: String, index: Expr },
+}
+
+/// Argumento de chamada (RFC 0009): posicional, nomeado (`x: v`) ou
+/// spread (`...arr`, splice em ordem). `Expr::Call`/`CallValue` guardam
+/// `Vec<CallArg>`; o caso so-posicional compila no `Call` classico.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallArg {
+    Pos(Expr),
+    Named(String, Expr),
+    Spread(Expr),
+}
+
+impl CallArg {
+    /// Expressao do argumento (qualquer forma).
+    pub fn value(&self) -> &Expr {
+        match self {
+            CallArg::Pos(expr) | CallArg::Named(_, expr) | CallArg::Spread(expr) => expr,
+        }
+    }
 }
 
 /// Padrao de destructuring (raso; RFC 0007): por posicao `[a, b]` ou por
@@ -249,7 +279,7 @@ pub enum Expr {
     },
     Call {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<CallArg>,
     },
     /// Chamada de callee arbitrario: `f()(1)`, `(fn(x) { x })(2)`,
     /// `arr[0](x)`. `f(x)` direto continua `Call` (precedencia de builtins
@@ -257,7 +287,7 @@ pub enum Expr {
     /// (o guarda de profundidade assume frames enxutos; ver MAX_PARSE_DEPTH).
     CallValue {
         callee: Box<Expr>,
-        args: Vec<Expr>,
+        args: Vec<CallArg>,
     },
     /// `fn (params) { corpo }` como valor (closure, RFC 0003).
     /// Sem nome: recursao usa o `let` externo (ligacao tardia).
@@ -477,6 +507,7 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::Echo => parse_echo(cursor),
         TokenKind::Let => parse_let(cursor),
         TokenKind::Const => parse_const(cursor),
+        TokenKind::Static => parse_static(cursor),
         TokenKind::Break => {
             cursor.next();
             Ok(parse_break_level(cursor, true)?)
@@ -566,6 +597,21 @@ fn parse_const(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     let init = parse_expr(cursor)?;
     expect_semicolon(cursor)?;
     Ok(Stmt::Const { name, init })
+}
+
+/// `static nome = expr;` (RFC 0010): estado por definicao de funcao.
+/// Init obrigatorio; `static` fora de funcao e erro de compilacao.
+fn parse_static(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let name = expect_ident(cursor)?;
+    expect_token(
+        cursor,
+        &TokenKind::Assign,
+        "esperado `=` apos nome da estatica (init obrigatorio)",
+    )?;
+    let init = parse_expr(cursor)?;
+    expect_semicolon(cursor)?;
+    Ok(Stmt::Static { name, init })
 }
 
 fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -1190,12 +1236,62 @@ fn parse_params_list(
 }
 
 /// Argumentos de chamada `(a, b, ...)`: `(` ja deve ser o proximo token.
-fn parse_call_args(cursor: &mut Cursor<'_>) -> Result<Vec<Expr>, ParseError> {
+/// Argumentos de chamada `(a, x: b, ...c)`: `(` ja deve ser o proximo token.
+/// Retorna `Vec<CallArg>` (RFC 0009). Regras: `x: v` so com `Ident` simples
+/// (`:` apos outra expressao = erro; ternarios consomem o proprio `:`);
+/// posicional apos nomeado e duplicata de nome = erro (visivel no fonte).
+fn parse_call_args(cursor: &mut Cursor<'_>) -> Result<Vec<CallArg>, ParseError> {
     cursor.next();
     let mut args = Vec::new();
+    let mut seen_named = false;
+    let mut seen_names = std::collections::HashSet::new();
     if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RParen)) {
         loop {
-            args.push(parse_expr(cursor)?);
+            if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Ellipsis)) {
+                cursor.next();
+                let value = parse_expr(cursor)?;
+                args.push(CallArg::Spread(value));
+            } else {
+                let expr = parse_expr(cursor)?;
+                match expr {
+                    Expr::Var(name)
+                        if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) =>
+                    {
+                        cursor.next();
+                        if !seen_names.insert(name.clone()) {
+                            let (line, col) = cursor.end_pos();
+                            return Err(ParseError::new(
+                                format!("argumento nomeado duplicado: `{name}`"),
+                                line,
+                                col,
+                            ));
+                        }
+                        seen_named = true;
+                        let value = parse_expr(cursor)?;
+                        args.push(CallArg::Named(name, value));
+                    }
+                    _ => {
+                        if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) {
+                            let tok = cursor.next().expect("peek garantiu `:`");
+                            return Err(ParseError::new(
+                                "nome de argumento esperado antes de `:` (use `nome: valor`)"
+                                    .to_string(),
+                                tok.line,
+                                tok.col,
+                            ));
+                        }
+                        if seen_named {
+                            let (line, col) = cursor.end_pos();
+                            return Err(ParseError::new(
+                                "argumento posicional apos nomeado (reordene: posicionais primeiro)".to_string(),
+                                line,
+                                col,
+                            ));
+                        }
+                        args.push(CallArg::Pos(expr));
+                    }
+                }
+            }
             if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
                 cursor.next();
             } else {
@@ -1349,11 +1445,106 @@ fn parse_import_names(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     Ok(Stmt::ImportNames { path, names })
 }
 
+/// Re-export seletivo (RFC 0011): cursor no `{` apos `export`.
+/// Mesma forma do import seletivo; `from` obrigatorio (sem `from` e erro
+/// claro, nao `export { }` local — RHP nao tem essa forma).
+fn parse_reexport(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next(); // consome `{`
+    let mut names = Vec::new();
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::RBrace)) {
+        let (line, col) = cursor.end_pos();
+        return Err(ParseError::new(
+            "`export { }` vazio: selecione ao menos um nome (ou use `export fn/let/const`)"
+                .to_string(),
+            line,
+            col,
+        ));
+    }
+    loop {
+        let name = expect_ident(cursor)?;
+        let alias = match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::Ident(word)) if word == "as" => {
+                cursor.next();
+                Some(expect_ident(cursor)?)
+            }
+            _ => None,
+        };
+        names.push(ImportName { name, alias });
+        match cursor.next() {
+            Some(t) => match &t.kind {
+                TokenKind::Comma => {}
+                TokenKind::RBrace => break,
+                other => {
+                    return Err(ParseError::new(
+                        format!(
+                            "esperado `,` ou `}}` no re-export, encontrado {}",
+                            describe(other)
+                        ),
+                        t.line,
+                        t.col,
+                    ));
+                }
+            },
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `,` ou `}` no re-export, encontrado fim de arquivo".to_string(),
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    match cursor.peek().map(|t| &t.kind) {
+        Some(TokenKind::Ident(word)) if word == "from" => {
+            cursor.next();
+        }
+        _ => {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                "re-export exige `from \"modulo\"` (ex.: `export { a } from \"lib.rhp\"`)"
+                    .to_string(),
+                line,
+                col,
+            ));
+        }
+    }
+    let path = match cursor.next() {
+        Some(t) => match &t.kind {
+            TokenKind::StringLiteral(s) => s.clone(),
+            other => {
+                return Err(ParseError::new(
+                    format!(
+                        "esperado caminho de modulo (string), encontrado {}",
+                        describe(other)
+                    ),
+                    t.line,
+                    t.col,
+                ));
+            }
+        },
+        None => {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                "esperado caminho de modulo, encontrado fim de arquivo".to_string(),
+                line,
+                col,
+            ));
+        }
+    };
+    expect_semicolon(cursor)?;
+    Ok(Stmt::ReExport { path, names })
+}
+
 fn parse_export(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     let (line, col) = cursor
         .peek()
         .map_or_else(|| cursor.end_pos(), |t| (t.line, t.col));
     cursor.next();
+    // Re-export seletivo: `export { a, b as c } from "mod.rhp";` (RFC 0011).
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBrace)) {
+        return parse_reexport(cursor);
+    }
     // So `fn`/`let`/`const` no nivel em que o `export` aparece (o loader
     // rejeita fora do nivel superior, como faz com `import`).
     let def = match cursor.peek().map(|t| &t.kind) {
@@ -1833,6 +2024,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Export => "`export`".to_string(),
         TokenKind::Fn => "`fn`".to_string(),
         TokenKind::Const => "`const`".to_string(),
+        TokenKind::Static => "`static`".to_string(),
         TokenKind::Break => "`break`".to_string(),
         TokenKind::Continue => "`continue`".to_string(),
         TokenKind::Return => "`return`".to_string(),
@@ -2150,6 +2342,64 @@ mod tests {
         assert!(err.to_string().contains("`)`"), "obteve: {err}");
         // `...` sem nome.
         lex_and_parse("fn f(...) { }").expect_err("`...` sem nome deve falhar");
+    }
+
+    #[test]
+    fn parses_named_and_spread_args() {
+        let program = lex_and_parse("echo f(1, x: 2, ...r);").expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::Echo {
+                expr: Expr::Call {
+                    name: "f".to_string(),
+                    args: vec![
+                        CallArg::Pos(Expr::Int(1)),
+                        CallArg::Named("x".to_string(), Expr::Int(2)),
+                        CallArg::Spread(Expr::Var("r".to_string())),
+                    ],
+                }
+            }]
+        );
+        // Ternario com `:` nao vira nomeado; `:` apos nao-Var e erro.
+        lex_and_parse("echo f(a ? b : c);").expect("ternario deve passar");
+        let err = lex_and_parse("echo f(1 : 2);").expect_err("deve falhar");
+        assert!(
+            err.to_string().contains("nome de argumento"),
+            "obteve: {err}"
+        );
+        // Posicional apos nomeado e duplicata: erros de parse.
+        let err = lex_and_parse("echo f(x: 1, 2);").expect_err("deve falhar");
+        assert!(
+            err.to_string().contains("posicional apos nomeado"),
+            "obteve: {err}"
+        );
+        let err = lex_and_parse("echo f(x: 1, x: 2);").expect_err("deve falhar");
+        assert!(err.to_string().contains("duplicado"), "obteve: {err}");
+    }
+
+    #[test]
+    fn parses_static_statement() {
+        let program =
+            lex_and_parse("fn f() { static n = 0; return n; }").expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::FnDef {
+                name: "f".to_string(),
+                params: vec![],
+                variadic: None,
+                body: vec![
+                    Stmt::Static {
+                        name: "n".to_string(),
+                        init: Expr::Int(0),
+                    },
+                    Stmt::Return {
+                        expr: Some(Expr::Var("n".to_string())),
+                    },
+                ],
+            }]
+        );
+        // Init obrigatorio.
+        lex_and_parse("fn f() { static n; }").expect_err("static sem init deve falhar");
     }
 
     #[test]
@@ -2541,6 +2791,37 @@ mod tests {
         assert!(err.message.contains("`from`"), "obteve: {}", err.message);
         let err = lex_and_parse("import { } from \"m.rhp\";").expect_err("deve falhar");
         assert!(err.message.contains("vazio"), "obteve: {}", err.message);
+    }
+
+    #[test]
+    fn parses_reexport_statement() {
+        let program =
+            lex_and_parse("export { a, b as c } from \"m.rhp\";").expect("parse deve passar");
+        assert_eq!(
+            program.statements,
+            vec![Stmt::ReExport {
+                path: "m.rhp".to_string(),
+                names: vec![
+                    ImportName {
+                        name: "a".to_string(),
+                        alias: None
+                    },
+                    ImportName {
+                        name: "b".to_string(),
+                        alias: Some("c".to_string())
+                    },
+                ],
+            }]
+        );
+        // Erros: vazio, sem `from`, sem caminho.
+        lex_and_parse("export { } from \"m.rhp\";").expect_err("vazio deve falhar");
+        let err = lex_and_parse("export { a };").expect_err("sem from deve falhar");
+        assert!(
+            err.message.contains("exige `from"),
+            "obteve: {}",
+            err.message
+        );
+        lex_and_parse("export { a } from 1;").expect_err("caminho nao-string deve falhar");
     }
 
     #[test]

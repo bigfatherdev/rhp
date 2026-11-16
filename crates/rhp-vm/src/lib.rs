@@ -97,6 +97,9 @@ struct Frame {
     /// HOF com callback em voo (RFC 0005): progresso da iteracao enquanto
     /// as ativacoes do callback executam e retornam. `None` no comum.
     pending: Option<PendingHof>,
+    /// Definicao da funcao desta ativacao (`None` no programa principal).
+    /// Usada pelo estado `static` (RFC 0010: por definicao).
+    func: Option<Rc<FuncDef>>,
 }
 
 /// Estado de `map`/`filter`/`usort` entre chamadas do callback (RFC 0005).
@@ -156,6 +159,14 @@ pub struct Vm {
     program: Option<Arc<Program>>,
     /// Conexoes de banco abertas (`db_open`); chave = handle `Int`.
     db: DbHandles,
+    /// Estado do xorshift64* para `rand`/`rand_range` (RFC 0012; semeado
+    /// uma vez em `new`, com relogio+pid; NAO criptografico).
+    rng: u64,
+    /// Estado `static` por definicao de funcao (RFC 0010): lista de
+    /// `(definicao, variaveis)` comparada por identidade (`Rc::ptr_eq`;
+    /// poucas definicoes usam `static`, busca linear e suficiente).
+    /// Compartilhado entre chamadas e instancias da mesma definicao.
+    statics: Vec<(Rc<FuncDef>, HashMap<String, Value>)>,
 }
 
 /// Conexoes de banco da VM (B2: SQLite; B3: +PostgreSQL).
@@ -172,6 +183,20 @@ enum DbConn {
     Postgres(pg::Connection),
 }
 
+/// Semente do xorshift64* de `rand` (RFC 0012): relogio (ns) misturado com
+/// o pid; zero e evitado (xorshift trava em 0). std-only, sem cripto.
+fn seed_rng() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let pid = std::process::id() as u64;
+    nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(pid.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        | 1
+}
+
 impl Vm {
     #[must_use]
     pub fn new() -> Self {
@@ -183,6 +208,8 @@ impl Vm {
             argv: Vec::new(),
             program: None,
             db: DbHandles::default(),
+            statics: Vec::new(),
+            rng: seed_rng(),
         }
     }
 
@@ -252,6 +279,7 @@ impl Vm {
     fn reset(&mut self, chunk: &Chunk) {
         self.frames.clear();
         self.globals.clear();
+        self.statics.clear();
         self.steps = 0;
         self.frames.push(Frame {
             code: chunk.code.clone(),
@@ -263,6 +291,7 @@ impl Vm {
             scopes: vec![HashMap::new()],
             handlers: Vec::new(),
             pending: None,
+            func: None,
         });
     }
 
@@ -457,6 +486,18 @@ impl Vm {
                 self.declare(idx, &name, value)?;
                 self.frames[idx].ip += 1;
             }
+            Op::DeclareStatic(name_idx) => {
+                // Avaliado a cada chamada, atribuido so na primeira (RFC 0010).
+                let value = self.pop(idx, "declaracao `static`")?;
+                let name = self.name_of(idx, name_idx)?;
+                let Some(func) = self.frames[idx].func.clone() else {
+                    return Err(VmError::new(
+                        "`static` fora de funcao (defesa em profundidade)".to_string(),
+                    ));
+                };
+                self.static_vars(&func).entry(name).or_insert(value);
+                self.frames[idx].ip += 1;
+            }
             Op::EnterScope => {
                 self.frames[idx].scopes.push(HashMap::new());
                 self.frames[idx].ip += 1;
@@ -495,6 +536,9 @@ impl Vm {
             }
             Op::Call(arity) => {
                 self.call(idx, arity)?;
+            }
+            Op::CallMixed(desc_idx) => {
+                self.call_mixed(idx, desc_idx)?;
             }
             Op::Return => {
                 let value = self.pop(idx, "`return`")?;
@@ -650,6 +694,7 @@ impl Vm {
                         &args,
                         &self.argv,
                         &mut self.db,
+                        &mut self.rng,
                         self.program.clone(),
                     )?;
                     self.push_checked(idx, result)?;
@@ -724,7 +769,35 @@ impl Vm {
                 return Some(value.clone());
             }
         }
+        // `static` da funcao atual (RFC 0010): abaixo dos escopos lexicos.
+        if let Some(func) = self.frames[idx].func.clone() {
+            if let Some(value) = self
+                .statics
+                .iter()
+                .find(|(def, _)| Rc::ptr_eq(def, &func))
+                .and_then(|(_, vars)| vars.get(name).cloned())
+            {
+                return Some(value);
+            }
+        }
         self.globals.get(name).cloned()
+    }
+
+    /// Mapa de estaticas da definicao (cria vazio se inedito; RFC 0010).
+    fn static_vars(&mut self, func: &Rc<FuncDef>) -> &mut HashMap<String, Value> {
+        if let Some(pos) = self
+            .statics
+            .iter()
+            .position(|(def, _)| Rc::ptr_eq(def, func))
+        {
+            return &mut self.statics[pos].1;
+        }
+        self.statics.push((func.clone(), HashMap::new()));
+        &mut self
+            .statics
+            .last_mut()
+            .expect("entrada recem-criada existe")
+            .1
     }
 
     /// Atribui a variavel existente; retorna `false` se nao encontrada.
@@ -733,6 +806,20 @@ impl Vm {
             if scope.contains_key(name) {
                 scope.insert(name.to_string(), value);
                 return true;
+            }
+        }
+        // `static` da funcao atual (RFC 0010): abaixo dos escopos lexicos.
+        if let Some(func) = self.frames[idx].func.clone() {
+            if let Some(pos) = self
+                .statics
+                .iter()
+                .position(|(def, _)| Rc::ptr_eq(def, &func))
+            {
+                let vars = &mut self.statics[pos].1;
+                if vars.contains_key(name) {
+                    vars.insert(name.to_string(), value);
+                    return true;
+                }
             }
         }
         if self.globals.contains_key(name) {
@@ -831,22 +918,16 @@ impl Vm {
                 args.len()
             )));
         }
-        if self.frames.len() >= MAX_CALL_DEPTH {
-            return Err(VmError::new(
-                "limite de chamadas excedido (recursao muito profunda?)",
-            ));
-        }
         // Escopo unico da ativacao: ambiente capturado + parametros por
         // cima (parametro sombreia variavel capturada com o mesmo nome).
         // Posicoes ausentes usam o padrao compilado (`null` explicito e valor,
         // nao aciona padrao); excedentes vao para `...rest` (`[]` se nenhum).
-        // Guarda de `ExitScope` preservada: base continua com 1 escopo.
-        let mut scope = func.env.clone();
+        let mut bindings = Vec::with_capacity(total + 1);
         for (i, name) in func.def.params.iter().enumerate() {
             if i < args.len() {
-                scope.insert(name.clone(), args[i].clone());
+                bindings.push((name.clone(), args[i].clone()));
             } else if let Some(default) = &func.def.defaults[i] {
-                scope.insert(name.clone(), default.clone());
+                bindings.push((name.clone(), default.clone()));
             } else {
                 return Err(VmError::new(format!(
                     "funcao `{}` sem valor para `{name}` (bug interno: padrao ausente)",
@@ -860,7 +941,25 @@ impl Vm {
             } else {
                 Vec::new()
             };
-            scope.insert(rest.clone(), Value::Array(extra));
+            bindings.push((rest.clone(), Value::Array(extra)));
+        }
+        self.activate(func, bindings)
+    }
+
+    /// Empilha a ativacao com vinculos ja resolvidos (ordem irrelevante:
+    /// vao direto para o escopo unico). Checa profundidade e preserva a
+    /// guarda de `ExitScope` (base com 1 escopo). Nao avanca o `ip`.
+    fn activate(&mut self, func: FuncValue, bindings: Vec<(String, Value)>) -> Result<(), VmError> {
+        if self.frames.len() >= MAX_CALL_DEPTH {
+            return Err(VmError::new(
+                "limite de chamadas excedido (recursao muito profunda?)",
+            ));
+        }
+        // Escopo unico da ativacao: ambiente capturado + vinculos por cima.
+        // Guarda de `ExitScope` preservada: base continua com 1 escopo.
+        let mut scope = func.env.clone();
+        for (name, value) in bindings {
+            scope.insert(name, value);
         }
         self.frames.push(Frame {
             code: func.def.body.code.clone(),
@@ -878,7 +977,145 @@ impl Vm {
             scopes: vec![scope],
             handlers: Vec::new(),
             pending: None,
+            func: Some(func.def.clone()),
         });
+        Ok(())
+    }
+
+    /// Liga chamada mista (RFC 0009): posicionais em ordem, nomeados por
+    /// nome, spreads ja expandidos em `pos`. Regras: nome desconhecido e
+    /// named repetindo posicao = erro; ausentes usam `defaults`; excedentes
+    /// vao para `...rest` (sem ele = erro).
+    fn push_call_frame_mixed(
+        &mut self,
+        func: FuncValue,
+        pos: Vec<Value>,
+        named: Vec<(String, Value)>,
+    ) -> Result<(), VmError> {
+        let total = func.def.params.len();
+        let required =
+            func.def.params.len() - func.def.defaults.iter().filter(|d| d.is_some()).count();
+        let received = pos.len() + named.len();
+        if received < required {
+            return Err(VmError::new(format!(
+                "funcao `{}` espera ao menos {required} argumentos, recebeu {received}",
+                func.def.name,
+            )));
+        }
+        if pos.len() > total && func.def.variadic.is_none() {
+            return Err(VmError::new(format!(
+                "funcao `{}` espera {total} argumentos, recebeu {received}",
+                func.def.name,
+            )));
+        }
+        let mut bound: Vec<Option<Value>> = vec![None; total];
+        for (i, value) in pos.iter().enumerate() {
+            if i >= total {
+                break;
+            }
+            bound[i] = Some(value.clone());
+        }
+        for (name, value) in &named {
+            match func.def.params.iter().position(|p| p == name) {
+                Some(i) if bound[i].is_some() => {
+                    return Err(VmError::new(format!(
+                        "parametro `{name}` ja preenchido por posicao"
+                    )));
+                }
+                Some(i) => {
+                    bound[i] = Some(value.clone());
+                }
+                None => {
+                    return Err(VmError::new(format!("argumento desconhecido: `{name}`")));
+                }
+            }
+        }
+        let mut bindings = Vec::with_capacity(total + 1);
+        for (i, name) in func.def.params.iter().enumerate() {
+            match bound[i].take() {
+                Some(value) => bindings.push((name.clone(), value)),
+                None => match &func.def.defaults[i] {
+                    Some(default) => bindings.push((name.clone(), default.clone())),
+                    None => {
+                        return Err(VmError::new(format!(
+                            "funcao `{}` espera ao menos {required} argumentos, recebeu {received}",
+                            func.def.name,
+                        )));
+                    }
+                },
+            }
+        }
+        if let Some(rest) = &func.def.variadic {
+            let extra = if pos.len() > total {
+                pos[total..].to_vec()
+            } else {
+                Vec::new()
+            };
+            bindings.push((rest.clone(), Value::Array(extra)));
+        }
+        self.activate(func, bindings)
+    }
+
+    /// Executa `Op::CallMixed` (RFC 0009): le o descritor, desempilha callee
+    /// + valores em ordem do fonte, expande spreads e liga por nome/posicao.
+    fn call_mixed(&mut self, idx: usize, desc_idx: u32) -> Result<(), VmError> {
+        let desc = match self.frames[idx].constants.get(desc_idx as usize) {
+            Some(Value::Array(items)) => items.clone(),
+            _ => {
+                return Err(VmError::new(format!(
+                    "bytecode invalido: descritor de chamada mista {desc_idx} invalido"
+                )));
+            }
+        };
+        let n = desc.len();
+        if self.frames[idx].stack.len() < n + 1 {
+            return Err(VmError::new("pilha insuficiente para chamada"));
+        }
+        let mut values = Vec::with_capacity(n);
+        for _ in 0..n {
+            if let Some(value) = self.frames[idx].stack.pop() {
+                values.push(value);
+            }
+        }
+        values.reverse();
+        let callee = self.frames[idx]
+            .stack
+            .pop()
+            .ok_or_else(|| VmError::new("pilha insuficiente para chamada"))?;
+        let func = match callee {
+            Value::Func(func) => func,
+            other => {
+                return Err(VmError::new(format!(
+                    "tentativa de chamar {} como funcao",
+                    type_name(&other)
+                )));
+            }
+        };
+        let mut pos = Vec::new();
+        let mut named = Vec::new();
+        for (marker, value) in desc.iter().zip(values) {
+            match marker {
+                Value::Int(0) => pos.push(value),
+                Value::Int(1) => match value {
+                    Value::Array(items) => pos.extend(items),
+                    other => {
+                        return Err(VmError::new(format!(
+                            "spread exige array, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                },
+                Value::Str(name) => named.push((name.clone(), value)),
+                other => {
+                    return Err(VmError::new(format!(
+                        "bytecode invalido: marcador de chamada mista invalido ({})",
+                        type_name(other)
+                    )));
+                }
+            }
+        }
+        self.push_call_frame_mixed(func, pos, named)?;
+        self.frames[idx].ip += 1;
         Ok(())
     }
 
@@ -1773,6 +2010,105 @@ mod tests {
         let program = parse_source("const [c] = [1]; c = 2;").expect("parse deve passar");
         let err = rhp_bytecode::compile(&program).expect_err("atribuicao a const deve falhar");
         assert!(err.message.contains("constante"), "obteve: {}", err.message);
+    }
+
+    #[test]
+    fn runs_named_and_spread_calls() {
+        // Ordem irrelevante; posicional + nomeado mistos.
+        assert_eq!(
+            run_src("fn soma(a, b) { return a + b; } echo soma(b: 2, a: 1); echo soma(10, 20);")
+                .expect("ok"),
+            "3\n30\n"
+        );
+        // Defaults + variadico combinados.
+        assert_eq!(
+            run_src("fn f(a, b = 5, ...rest) { echo a; echo b; echo rest; } f(a: 1); f(1, 2, 3);")
+                .expect("ok"),
+            "1\n5\n[]\n1\n2\n[3]\n"
+        );
+        // Spread: splice em ordem, multiplo, com posicional e nomeado.
+        assert_eq!(
+            run_src("fn soma(a, b) { return a + b; } let t = [7, 8]; echo soma(...t); echo soma(100, ...[1]);")
+                .expect("ok"),
+            "15\n101\n"
+        );
+        assert_eq!(
+            run_src("fn g(a, b, c) { return a + b + c; } echo g(...[1, 2], c: 30);").expect("ok"),
+            "33\n"
+        );
+        // `null` explicito nao aciona default; callee arbitrario funciona.
+        assert_eq!(
+            run_src("fn f(a = 1) { return a; } echo f(a: null); let g = fn (x, y) { return x - y; }; echo g(y: 10, x: 3); echo g(...[20, 4]);")
+                .expect("ok"),
+            "null\n-7\n16\n"
+        );
+        // Erros de runtime: desconhecido, conflito posicional+nomeado, spread nao-array.
+        assert!(run_err("fn f(a) { return a; } echo f(x: 1);").contains("desconhecido"));
+        assert!(run_err("fn f(a) { return a; } echo f(1, a: 2);").contains("ja preenchido"));
+        assert!(run_err("fn f(a) { return a; } echo f(...1);").contains("spread exige array"));
+        assert!(run_err("fn f(a, b) { return a; } echo f(1);").contains("ao menos"));
+    }
+
+    #[test]
+    fn runs_function_statics() {
+        // Contador persiste entre chamadas; por definicao (outra funcao isolada).
+        assert_eq!(
+            run_src("fn c() { static n = 0; n = n + 1; return n; } echo c(); echo c(); echo c();")
+                .expect("ok"),
+            "1\n2\n3\n"
+        );
+        assert_eq!(
+            run_src("fn a() { static n = 0; return n + 1; } fn b() { static n = 100; return n + 1; } echo a(); echo b();")
+                .expect("ok"),
+            "1\n101\n"
+        );
+        // Instancias da mesma closure compartilham (mesma definicao).
+        assert_eq!(
+            run_src("let mk = fn () { static c = 0; c = c + 1; return c; }; let f = mk; let g = mk; echo f(); echo g();")
+                .expect("ok"),
+            "1\n2\n"
+        );
+        // Init roda por chamada, mas so a primeira atribui (documentado).
+        assert_eq!(
+            run_src("let n = 0; fn p() { n = n + 1; return n * 100; } fn f() { static v = p(); return v; } echo f(); echo f(); echo n;")
+                .expect("ok"),
+            "100\n100\n2\n"
+        );
+        // Leitura sem declaracao executada = erro; fora de funcao = compilacao.
+        assert!(
+            run_err("fn f() { if false { static n = 1; } echo n; } f();").contains("nao definida")
+        );
+        let program = parse_source("static x = 1;").expect("parse deve passar");
+        let err = rhp_bytecode::compile(&program).expect_err("static fora deve falhar");
+        assert!(
+            err.message.contains("fora de funcao"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn runs_rand_builtin() {
+        // Faixa e tipo: 100 sorteios em `[0, i64::MAX]`, todos `Int`.
+        for _ in 0..100 {
+            match run_src("echo rand();").expect("ok").trim().parse::<i64>() {
+                Ok(n) => assert!(n >= 0, "fora da faixa: {n}"),
+                Err(e) => panic!("rand nao devolveu Int: {e}"),
+            }
+        }
+        // `rand_range`: incluso nos limites; `min == max` devolve ele.
+        for _ in 0..200 {
+            let n: i64 = run_src("echo rand_range(1, 6);")
+                .expect("ok")
+                .trim()
+                .parse()
+                .expect("deve ser Int");
+            assert!((1..=6).contains(&n), "fora da faixa: {n}");
+        }
+        assert_eq!(run_src("echo rand_range(5, 5);").expect("ok"), "5\n");
+        // Erros: min > max, nao-int.
+        assert!(run_err("echo rand_range(2, 1);").contains("min <="));
+        assert!(run_err("echo rand_range(\"a\", 1);").contains("inteiros"));
     }
 
     #[test]

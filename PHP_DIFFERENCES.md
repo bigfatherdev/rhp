@@ -62,12 +62,38 @@ a semantica for especificada e implementada.
   constantes, compostos de constantes), como no PHP; avaliados em compilação.
 - Sem spread em chamada, sem named arguments (fases futuras).
 
+## Chamadas mistas (RFC 0009, Fase 4)
+
+- Mesma sintaxe do PHP (`f(x: 1)`, `f(...arr)`); colecao de args igual.
+- Estrito onde o PHP erra em runtime: posicional apos nomeado, duplicata
+  e builtin com named/spread = erro de compilacao.
+- Sem spread em literal de array (`[...a]` — futuro, exige maquinaria propria).
+
 ## Destructuring (RFC 0007, Fase 2)
 
 - `let [a, b]` / `let {x}` / `let {k: v}` (e `const`); PHP usa `[$a, $b]` /
   `['k' => $v]` (com `$`, sem `const` desestruturado).
 - Raso apenas (aninhado = erro de parse); sem `[, b]` nem `[a = 1]`.
 - Estrito: posição/chave ausente = erro (PHP dá `null` + aviso).
+
+## `static` (RFC 0010, Fase 4)
+
+- Mesma sintaxe e semantica base do PHP (`static n = expr;` por definicao,
+  primeira atribuicao vence). Init obrigatorio; fora de funcao = erro.
+- Divergencia: init com efeito colateral roda por chamada (PHP avalia uma
+  vez); o valor mantido e sempre o da primeira. Evite side effects no init.
+
+## Re-export (RFC 0011, Fase 4)
+
+- `export { a, b as c } from` (barris); transitivo; sem `export *`.
+- Melhoria sobre o legado: aliases iguais da mesma origem nao duplicam
+  (diamante funciona); origem distinta continua erro de colisao.
+
+## `rand`/`fs_list` (RFC 0012, Fase 4)
+
+- `rand()` sem args e `rand_range(min, max)` (o PHP dobra em `rand()`).
+- `rand` NAO e criptografico (xorshift; sem `random_bytes` nesta leva).
+- `fs_list` raso e ordenado (sem flag de recursao por ora).
 
 - Sintaxe comparada (`echo`, `;`, strings) apos ampliacao da linguagem.
 - Sistema de tipos e conversoes.

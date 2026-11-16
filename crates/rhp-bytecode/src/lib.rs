@@ -5,7 +5,8 @@
 //! baseada em pilha e valida o chunk (recursivamente) antes de executar.
 
 use rhp_parser::{
-    AssignTarget, BinOp, DestructureTarget, Expr, MatchArm, Program, Stmt, SwitchCase, UnaryOp,
+    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, MatchArm, Program, Stmt, SwitchCase,
+    UnaryOp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -157,6 +158,12 @@ pub enum Builtin {
     Filter,
     /// `usort(arr, cmp)` — insertion sort estavel via `cmp(a, b): Int` (RFC 0005).
     Usort,
+    /// `rand()` — `Int` em `[0, i64::MAX]` (xorshift64*; NAO criptografico; RFC 0012).
+    Rand,
+    /// `rand_range(min, max)` — `Int` em `[min, max]` (inclusive; RFC 0012).
+    RandRange,
+    /// `fs_list(dir)` — nomes de entradas ordenados (`[]` se vazio; RFC 0012).
+    FsList,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -216,6 +223,9 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "map" => Some(Builtin::Map),
         "filter" => Some(Builtin::Filter),
         "usort" => Some(Builtin::Usort),
+        "rand" => Some(Builtin::Rand),
+        "rand_range" => Some(Builtin::RandRange),
+        "fs_list" => Some(Builtin::FsList),
         _ => None,
     }
 }
@@ -223,7 +233,7 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
 #[must_use]
 pub const fn builtin_arity(builtin: Builtin) -> usize {
     match builtin {
-        Builtin::Argv | Builtin::Now => 0,
+        Builtin::Argv | Builtin::Now | Builtin::Rand => 0,
         Builtin::Len
         | Builtin::Pop
         | Builtin::Keys
@@ -252,7 +262,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Sleep
         | Builtin::DateStr
         | Builtin::DbOpen
-        | Builtin::DbClose => 1,
+        | Builtin::DbClose
+        | Builtin::FsList => 1,
         Builtin::Push
         | Builtin::Contains
         | Builtin::StartsWith
@@ -270,7 +281,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Template
         | Builtin::Map
         | Builtin::Filter
-        | Builtin::Usort => 2,
+        | Builtin::Usort
+        | Builtin::RandRange => 2,
         Builtin::DbExec | Builtin::DbQuery | Builtin::HttpServe => 3,
         Builtin::Replace => 3,
     }
@@ -323,6 +335,11 @@ pub enum Op {
     StoreName(u32),
     /// Desempilha e declara `names[idx]` no escopo atual.
     DeclareName(u32),
+    /// Desempilha e declara a estatica `names[idx]` da funcao atual
+    /// (primeira atribuicao vence; RFC 0010). Erro fora de funcao.
+    /// Leituras/escritas usam `LoadName`/`StoreName` com fallback em runtime
+    /// (sem ops dedicados — sem codigo morto).
+    DeclareStatic(u32),
     /// Abre um escopo de bloco.
     EnterScope,
     /// Fecha o escopo de bloco atual.
@@ -335,6 +352,10 @@ pub enum Op {
     MakeFunc(u32),
     /// Chama a funcao no topo (apos `aridade` argumentos); empilha retorno.
     Call(u32),
+    /// Chamada mista (RFC 0009): callee + valores em ordem do fonte; o
+    /// descritor `constants[idx]` (`Array` de `Int(0)`=posicional,
+    /// `Int(1)`=spread, `Str`=nomeado) guia a ligacao em runtime.
+    CallMixed(u32),
     /// Retorna da funcao com o valor no topo da pilha.
     Return,
     /// Descarta o valor no topo da pilha.
@@ -425,6 +446,9 @@ impl BuiltinId {
             50 => Ok(Builtin::Map),
             51 => Ok(Builtin::Filter),
             52 => Ok(Builtin::Usort),
+            53 => Ok(Builtin::Rand),
+            54 => Ok(Builtin::RandRange),
+            55 => Ok(Builtin::FsList),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -486,6 +510,9 @@ impl From<Builtin> for BuiltinId {
             Builtin::Map => 50,
             Builtin::Filter => 51,
             Builtin::Usort => 52,
+            Builtin::Rand => 53,
+            Builtin::RandRange => 54,
+            Builtin::FsList => 55,
         };
         Self(id)
     }
@@ -562,6 +589,7 @@ impl Chunk {
                 Op::LoadName(idx)
                 | Op::StoreName(idx)
                 | Op::DeclareName(idx)
+                | Op::DeclareStatic(idx)
                 | Op::StoreIndex(idx)
                     if (idx as usize) >= self.names.len() =>
                 {
@@ -587,11 +615,32 @@ impl Chunk {
                 Op::CallBuiltin(id) => {
                     id.resolve()?;
                 }
+                Op::CallMixed(desc) => {
+                    // Descritor existe; o tipo e checado em `call_mixed_slots`.
+                    call_mixed_slots(&self.constants, desc, context)?;
+                }
                 _ => {}
             }
         }
-        check_stack_flow(&self.code, context)?;
+        check_stack_flow(&self.code, &self.constants, context)?;
         Ok(())
+    }
+}
+
+/// Numero de slots do descritor de `CallMixed` (RFC 0009): `constants[idx]`
+/// deve ser `Array` de `Int(0|1)` (posicional/spread) ou `Str` (nomeado).
+fn call_mixed_slots(constants: &[Value], desc: u32, context: &str) -> Result<usize, CompileError> {
+    match constants.get(desc as usize) {
+        Some(Value::Array(items))
+            if items
+                .iter()
+                .all(|m| matches!(m, Value::Int(0) | Value::Int(1) | Value::Str(_))) =>
+        {
+            Ok(items.len())
+        }
+        _ => Err(CompileError::new(format!(
+            "chunk invalido em `{context}`: descritor de chamada mista {desc} invalido"
+        ))),
     }
 }
 
@@ -628,7 +677,7 @@ fn check_constant_depth(value: &Value) -> Result<(), CompileError> {
 /// `validate`, para o chunk raiz e cada corpo de funcao (pilha zerada).
 /// Codigo inalancavel apos `Return`/`Jump` e ignorado (mas continua sujeito
 /// as checagens estruturais de `validate_shallow`).
-fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
+fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(), CompileError> {
     let mut entry: Vec<Option<i64>> = vec![None; code.len()];
     entry[0] = Some(0);
     let mut worklist = vec![0usize];
@@ -638,7 +687,7 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
         // Retorna (altura apos a instrucao, alvos; `None` = terminal).
         let (after, targets): (i64, Option<Vec<usize>>) = match op {
             Op::Constant(_) | Op::LoadName(_) => (height + 1, Some(vec![ip + 1])),
-            Op::Print | Op::Pop | Op::StoreName(_) | Op::DeclareName(_) => {
+            Op::Print | Op::Pop | Op::StoreName(_) | Op::DeclareName(_) | Op::DeclareStatic(_) => {
                 check_depth(height, 1, op, context)?;
                 (height - 1, Some(vec![ip + 1]))
             }
@@ -698,6 +747,11 @@ fn check_stack_flow(code: &[Op], context: &str) -> Result<(), CompileError> {
                 let arity = arity as usize;
                 check_depth(height, arity as i64 + 1, op, context)?;
                 (height - arity as i64, Some(vec![ip + 1]))
+            }
+            Op::CallMixed(desc) => {
+                let slots = call_mixed_slots(constants, desc, context)? as i64;
+                check_depth(height, slots + 1, op, context)?;
+                (height - slots, Some(vec![ip + 1]))
             }
             Op::CallBuiltin(id) => {
                 // `validate_shallow` ja rejeitou ids desconhecidos.
@@ -1612,6 +1666,39 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compila chamada com nomeados/spread (RFC 0009): callee, valores em
+    /// ordem do fonte e descritor nas constantes (`Int(0)` = posicional,
+    /// `Int(1)` = spread, `Str` = nomeado); ligacao em runtime via
+    /// `Op::CallMixed`. Chamadas so-posicionais usam o `Call` classico.
+    fn compile_call_mixed(&mut self, callee: &Expr, args: &[CallArg]) -> Result<(), CompileError> {
+        match callee {
+            Expr::Var(name) => {
+                let name_idx = self.intern_name(name)?;
+                self.emit(Op::LoadName(name_idx));
+            }
+            other => {
+                self.compile_expr(other)?;
+            }
+        }
+        for arg in args {
+            self.compile_expr(arg.value())?;
+        }
+        if args.len() > u32::MAX as usize {
+            return Err(CompileError::new("numero de argumentos excedido"));
+        }
+        let desc: Vec<Value> = args
+            .iter()
+            .map(|arg| match arg {
+                CallArg::Pos(_) => Value::Int(0),
+                CallArg::Spread(_) => Value::Int(1),
+                CallArg::Named(name, _) => Value::Str(name.clone()),
+            })
+            .collect();
+        let desc_idx = self.add_constant(Value::Array(desc))?;
+        self.emit(Op::CallMixed(desc_idx));
+        Ok(())
+    }
+
     /// Compila `match` (RFC 0008): sujeito avaliado uma vez; testes em
     /// ordem (`Dup + braco + StrictEq`, `JumpIfFalse` para o proximo;
     /// `default` desvia incondicional) e corpos-expressao em sequencia.
@@ -1752,6 +1839,16 @@ impl Compiler {
                 let name_idx = self.intern_name(name)?;
                 self.emit(Op::DeclareName(name_idx));
                 self.declare_const(name);
+            }
+            Stmt::Static { name, init } => {
+                if !self.in_function {
+                    return Err(CompileError::new(
+                        "`static` fora de funcao (estado por definicao)".to_string(),
+                    ));
+                }
+                self.compile_expr(init)?;
+                let name_idx = self.intern_name(name)?;
+                self.emit(Op::DeclareStatic(name_idx));
             }
             Stmt::Destructure {
                 target,
@@ -1940,6 +2037,13 @@ impl Compiler {
                     "`export` fora de modulo: use o loader (`rhp run`/`rhp check`)".to_string(),
                 ));
             }
+            Stmt::ReExport { .. } => {
+                // Como `Export`: so o loader resolve.
+                return Err(CompileError::new(
+                    "`export from` fora de modulo: use o loader (`rhp run`/`rhp check`)"
+                        .to_string(),
+                ));
+            }
             Stmt::ExprStmt { expr } => {
                 self.compile_expr(expr)?;
                 self.emit(Op::Pop);
@@ -2066,6 +2170,11 @@ impl Compiler {
             }
             Expr::Call { name, args } => {
                 if let Some(builtin) = builtin_by_name(name) {
+                    if args.iter().any(|a| !matches!(a, CallArg::Pos(_))) {
+                        return Err(CompileError::new(format!(
+                            "builtin `{name}` nao aceita argumentos nomeados nem spread"
+                        )));
+                    }
                     if args.len() != builtin_arity(builtin) {
                         return Err(CompileError::new(format!(
                             "`{name}` espera {} argumentos, recebeu {}",
@@ -2074,19 +2183,21 @@ impl Compiler {
                         )));
                     }
                     for arg in args {
-                        self.compile_expr(arg)?;
+                        self.compile_expr(arg.value())?;
                     }
                     self.emit(Op::CallBuiltin(BuiltinId::from(builtin)));
-                } else {
+                } else if args.iter().all(|a| matches!(a, CallArg::Pos(_))) {
                     let name_idx = self.intern_name(name)?;
                     self.emit(Op::LoadName(name_idx));
                     for arg in args {
-                        self.compile_expr(arg)?;
+                        self.compile_expr(arg.value())?;
                     }
                     if args.len() > u32::MAX as usize {
                         return Err(CompileError::new("numero de argumentos excedido"));
                     }
                     self.emit(Op::Call(args.len() as u32));
+                } else {
+                    self.compile_call_mixed(&Expr::Var(name.clone()), args)?;
                 }
             }
             Expr::CallValue { callee, args } => {
@@ -2097,15 +2208,17 @@ impl Compiler {
                         name: name.clone(),
                         args: args.clone(),
                     })?;
-                } else {
+                } else if args.iter().all(|a| matches!(a, CallArg::Pos(_))) {
                     self.compile_expr(callee)?;
                     for arg in args {
-                        self.compile_expr(arg)?;
+                        self.compile_expr(arg.value())?;
                     }
                     if args.len() > u32::MAX as usize {
                         return Err(CompileError::new("numero de argumentos excedido"));
                     }
                     self.emit(Op::Call(args.len() as u32));
+                } else {
+                    self.compile_call_mixed(callee, args)?;
                 }
             }
             Expr::Closure(data) => {
@@ -2301,6 +2414,68 @@ mod tests {
         let program = parse_source("const {x} = {x: 1}; x = 2;").expect("parse deve passar");
         let err = compile(&program).expect_err("atribuicao a const deve falhar");
         assert!(err.message.contains("constante"));
+    }
+
+    #[test]
+    fn compiles_mixed_calls() {
+        // Nomeado/spread viram `CallMixed` com descritor (`[0, "x", 1]`).
+        let chunk = compile_src("echo f(1, x: 2, ...r);");
+        assert!(chunk.code.iter().any(|op| matches!(op, Op::CallMixed(_))));
+        chunk.validate().expect("CallMixed deve validar");
+        let desc_idx = chunk
+            .code
+            .iter()
+            .find_map(|op| match op {
+                Op::CallMixed(d) => Some(*d as usize),
+                _ => None,
+            })
+            .expect("tem CallMixed");
+        assert_eq!(
+            chunk.constants[desc_idx],
+            Value::Array(vec![
+                Value::Int(0),
+                Value::Str("x".to_string()),
+                Value::Int(1),
+            ])
+        );
+        // So-posicional preserva o `Call` classico.
+        let chunk = compile_src("echo f(1, 2);");
+        assert!(chunk.code.contains(&Op::Call(2)));
+        assert!(!chunk.code.iter().any(|op| matches!(op, Op::CallMixed(_))));
+        // Builtin com nomeado/spread: erro de compilacao.
+        let program = parse_source("echo len(x: [1]);").expect("parse deve passar");
+        let err = compile(&program).expect_err("builtin com nomeado deve falhar");
+        assert!(
+            err.message.contains("nao aceita"),
+            "obteve: {}",
+            err.message
+        );
+        let program = parse_source("echo len(...[1]);").expect("parse deve passar");
+        let err = compile(&program).expect_err("builtin com spread deve falhar");
+        assert!(
+            err.message.contains("nao aceita"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn compiles_static_statement() {
+        // 3 ops novos, validados; `static` fora de funcao = erro.
+        let chunk = compile_src("fn f() { static n = 0; echo n; n = 1; }");
+        chunk.validate().expect("static deve validar");
+        assert!(chunk.funcs[0]
+            .body
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::DeclareStatic(_))));
+        let program = parse_source("static x = 1;").expect("parse deve passar");
+        let err = compile(&program).expect_err("static fora deve falhar");
+        assert!(
+            err.message.contains("fora de funcao"),
+            "obteve: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -2656,6 +2831,9 @@ mod tests {
             Builtin::Map,
             Builtin::Filter,
             Builtin::Usort,
+            Builtin::Rand,
+            Builtin::RandRange,
+            Builtin::FsList,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);
@@ -2679,6 +2857,18 @@ mod tests {
         };
         let err = chunk.validate().expect_err("deve falhar");
         assert!(err.message.contains("builtin"));
+    }
+
+    #[test]
+    fn rejects_direct_reexport_compile() {
+        // Re-export so via loader (como `export`/`import`).
+        let program = parse_source("export { a } from \"m.rhp\";").expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(
+            err.message.contains("fora de modulo"),
+            "obteve: {}",
+            err.message
+        );
     }
 
     #[test]

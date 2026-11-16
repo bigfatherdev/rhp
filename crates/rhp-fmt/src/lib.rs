@@ -5,7 +5,9 @@
 //! exatamente uma quebra de linha. O formatador e idempotente:
 //! `format(parse(format(p))) == format(p)`.
 
-use rhp_parser::{AssignTarget, BinOp, DestructureTarget, Expr, Param, Program, Stmt, UnaryOp};
+use rhp_parser::{
+    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, Param, Program, Stmt, UnaryOp,
+};
 use std::fmt::Write as _;
 
 /// Formata o programa no estilo canonico.
@@ -57,6 +59,10 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
         Stmt::Const { name, init } => {
             indent(level, out);
             let _ = writeln!(out, "const {name} = {};", fmt_expr(init, 0));
+        }
+        Stmt::Static { name, init } => {
+            indent(level, out);
+            let _ = writeln!(out, "static {name} = {};", fmt_expr(init, 0));
         }
         Stmt::Destructure {
             target,
@@ -254,6 +260,17 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
                 })
                 .collect();
             let _ = writeln!(out, "import {{{}}} from {path:?};", parts.join(", "));
+        }
+        Stmt::ReExport { path, names } => {
+            indent(level, out);
+            let parts: Vec<String> = names
+                .iter()
+                .map(|n| match &n.alias {
+                    Some(alias) => format!("{} as {alias}", n.name),
+                    None => n.name.clone(),
+                })
+                .collect();
+            let _ = writeln!(out, "export {{{}}} from {path:?};", parts.join(", "));
         }
         Stmt::Export { def } => {
             indent(level, out);
@@ -454,11 +471,11 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             }
         }
         Expr::Call { name, args } => {
-            let inner: Vec<String> = args.iter().map(|arg| fmt_expr(arg, 0)).collect();
+            let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
             format!("{name}({})", inner.join(", "))
         }
         Expr::CallValue { callee, args } => {
-            let inner: Vec<String> = args.iter().map(|arg| fmt_expr(arg, 0)).collect();
+            let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
             format!("{}({})", fmt_atom(callee), inner.join(", "))
         }
         Expr::Closure(data) => {
@@ -486,6 +503,16 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             out.push('}');
             out
         }
+    }
+}
+
+/// Argumento de chamada canonico (RFC 0009): posicional, `nome: expr`
+/// ou `...expr`.
+fn fmt_call_arg(arg: &CallArg) -> String {
+    match arg {
+        CallArg::Pos(expr) => fmt_expr(expr, 0),
+        CallArg::Named(name, expr) => format!("{name}: {}", fmt_expr(expr, 0)),
+        CallArg::Spread(expr) => format!("...{}", fmt_expr(expr, 0)),
     }
 }
 
@@ -606,6 +633,31 @@ mod tests {
             "echo match x { 1 => match y { 1 => \"a\", default => \"b\" }, default => \"c\" };",
         );
         check_idempotent("let v = match f(1) { 1 => [1], default => [] };");
+    }
+
+    #[test]
+    fn formats_mixed_calls() {
+        assert_eq!(fmt("echo f(1,x:2,...r);"), "echo f(1, x: 2, ...r);\n");
+        check_idempotent("echo f(...a, ...b);");
+        check_idempotent("echo f(x: g(1), y: [1, {k: 2}]);");
+    }
+
+    #[test]
+    fn formats_static_statement() {
+        assert_eq!(
+            fmt("fn f(){static n=0;echo n;}"),
+            "fn f() {\n  static n = 0;\n  echo n;\n}\n"
+        );
+        check_idempotent("fn f() { static n = [1, {x: 2}]; return n; }");
+    }
+
+    #[test]
+    fn formats_reexport_statement() {
+        assert_eq!(
+            fmt("export{a,b as c}from\"m.rhp\";"),
+            "export {a, b as c} from \"m.rhp\";\n"
+        );
+        check_idempotent("export { a } from \"lib.rhp\";");
     }
 
     #[test]

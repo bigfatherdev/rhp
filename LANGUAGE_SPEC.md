@@ -21,6 +21,9 @@ Block   := "{" Stmt* "}"
   - `import { a, b as c } from "m.rhp";` importa SO nomes exportados
     (outros = erro "`x` nao e exportado"); `b as c` vincula com alias.
     `from`/`as` sao contextuais (identificadores comuns fora do `import`).
+    `export { a, b as c } from "m.rhp";` re-exporta (RFC 0011, so nivel
+    superior): nomes passam aos exports deste modulo (transitivo, inclusive
+    em cadeias; ciclo = "importacao circular").
   - `import "m.rhp"` (bare) mantem a semantica legada: vincula todos os
     nomes de topo (publicos e privados).
   - Colisao: so entre nomes visiveis vinculados (erro alto, como antes).
@@ -51,8 +54,8 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 ```text
 Stmt       := LetStmt | ConstStmt | DestructureStmt | AssignStmt | EchoStmt
            | IfStmt | WhileStmt | ForStmt | ForCStmt | SwitchStmt | TryStmt
-           | ThrowStmt | BreakStmt | ContinueStmt | FnDef | ReturnStmt
-           | Block | ImportStmt | ImportNames | Export | ExprStmt
+           | ThrowStmt | BreakStmt | ContinueStmt | FnDef | StaticStmt | ReturnStmt
+           | Block | ImportStmt | ImportNames | Export | ReExport | ExprStmt
 LetStmt    := "let" Ident ("=" Expr)? ";"
 ConstStmt  := "const" Ident "=" Expr ";"
 DestructureStmt := ("let" | "const") ("[" Ident ("," Ident)* "]"
@@ -78,11 +81,18 @@ FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" Block
 Param      := Ident ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
 ReturnStmt := "return" Expr? ";"
 ImportStmt := "import" String ";"
+StaticStmt := "static" Ident "=" Expr ";"   // so dentro de funcao
+ReExportStmt := "export" "{" (Ident ("as" Ident)?) ("," ...)* "}" "from" String ";"
 ExprStmt   := Expr ";"
 ```
 
 - `let x = e;` declara no escopo atual (`let x;` inicializa com `null`).
   Redeclarar no mesmo escopo e erro em runtime.
+- `static n = e;` dentro de funcao (RFC 0010): estado por definicao,
+  avaliado a cada chamada mas atribuido so na primeira; visivel no corpo
+  inteiro (lookup: escopos, statics, globais); fora de funcao = erro.
+- `export { a, b as c } from "mod.rhp";` re-exporta (RFC 0011): nomes passam
+  aos exports deste modulo (transitivo); `export * from` nao existe.
 - `let [a, b] = e;` / `let {x} = e;` / `let {k: v} = e;` (e formas `const`,
   que congelam todos; RFC 0007): avalia `e` uma vez e desempacota por
   posicao (array) ou chave (mapa; `{x}` = chave `"x"`). Indice fora dos
@@ -146,7 +156,10 @@ ExprStmt   := Expr ";"
   obrigatorios (iniciais; obrigatorio apos opcional e erro de parse);
   `...rest` (no maximo um, por ultimo) coleta excedentes em `Array`
   (`[]` se nenhum). Ausentes usam o padrao compilado (`null` explicito
-  e valor, nao aciona padrao). `return e;` sai da funcao com o valor (`return;`
+  e valor, nao aciona padrao). Nomeados (`f(x: 1)`, qualquer ordem) e
+  spread (`f(...arr)`, splice em ordem; RFC 0009) ligam em runtime:
+  desconhecido, conflito posicional+nomeado e spread nao-`Array` = erro.
+  `return e;` sai da funcao com o valor (`return;``
   retorna `null`); fim do corpo sem `return` tambem retorna `null`.
   `return` fora de funcao e erro de compilacao. Recursao permitida ate
   `MAX_CALL_DEPTH = 512` (erro apos o limite). Funcoes enxergam parametros,
@@ -181,6 +194,10 @@ Array     := "[" (Expr ("," Expr)*)? "]"
 Map       := "{" ((String | Ident) ":" Expr ("," ...)*)? "}"
 Call      := Ident "(" (Expr ("," Expr)*)? ")"
 CallValue := Postfix "(" (Expr ("," Expr)*)? ")" // callee arbitrario
+CallArg   := Expr | Ident ":" Expr | "..." Expr // posicional, nomeado, spread
+// Nomeado/spread compilam para `CallMixed` (descritor); so-posicional usa o
+// `Call` classico. Posicional apos nomeado, duplicata e builtin com
+// nomeado/spread = erro de compilacao.
 // Posfixo: Primary (("[" Expr "]") | ("(" Args ")"))* (indexacao e
 // chamada encadeadas; callee `Ident` simples usa `Call` classico)
 ```
@@ -268,6 +285,9 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `fs_read(caminho)` | Conteudo do arquivo (`Str` UTF-8); erro de I/O ou > 8 MiB = erro. |
 | `fs_write(caminho, texto)` / `fs_append(caminho, texto)` | Escreve/anexa; retorna bytes escritos. Caminhos relativos resolvem no diretorio atual; roda com as permissoes do usuario. |
 | `fs_exists(caminho)` | `true` se legivel (qualquer falha = `false`). |
+| `fs_list(dir)` | (RFC 0012) Nomes das entradas ordenados (`Array` de `Str`; `[]` se vazio); inexistente/nao-diretorio = erro. |
+| `rand()` | (RFC 0012) `Int` em `[0, i64::MAX]` (xorshift64*; NAO criptografico). |
+| `rand_range(min, max)` | (RFC 0012) `Int` em `[min, max]` (inclusive); `min > max` ou nao-`Int` = erro. |
 | `argv()` | `Array` de `Str` com os argumentos apos o arquivo (`rhp run prog.rhp a b` => `["a", "b"]`). |
 | `env(nome)` | Valor da variavel de ambiente ou `null` se ausente. |
 | `sort(arr)` | Copia ordenada (estavel): numeros (`Int`/`Float`, mistos comparam exato quando possivel), `Str` (ordem lexicografica de bytes UTF-8) ou `Bool` (`false` < `true`); vazio => vazio. Mistura com outros tipos ou nao-array = erro. Nao muta o original (`a = sort(a);`). |

@@ -21,6 +21,7 @@ pub(super) fn call_builtin(
     args: &[Value],
     argv: &[String],
     db: &mut DbHandles,
+    rng: &mut u64,
     program: Option<Arc<rhp_parser::Program>>,
 ) -> Result<Value, VmError> {
     match builtin {
@@ -497,6 +498,41 @@ pub(super) fn call_builtin(
         Builtin::Map | Builtin::Filter | Builtin::Usort => Err(VmError::new(
             "HOF com callback fora do protocolo de execucao (bug interno)".to_string(),
         )),
+        // xorshift64* (RFC 0012): rapido, std-only, NAO criptografico.
+        // `>> 1` limita a `[0, i64::MAX]` (u64 cru estouraria o `Int`).
+        Builtin::Rand => Ok(Value::Int((next_rand(rng) >> 1) as i64)),
+        Builtin::RandRange => match (&args[0], &args[1]) {
+            (Value::Int(min), Value::Int(max)) if min <= max => {
+                let span = (*max as i128 - *min as i128 + 1) as u128;
+                let draw = (next_rand(rng) as u128) % span;
+                Ok(Value::Int((*min as i128 + draw as i128) as i64))
+            }
+            (Value::Int(_), Value::Int(_)) => {
+                Err(VmError::new("`rand_range` exige min <= max".to_string()))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`rand_range` exige (min, max) inteiros, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::FsList => match &args[0] {
+            Value::Str(path) => {
+                let entries = std::fs::read_dir(path)
+                    .map_err(|e| VmError::new(format!("`fs_list` falhou em `{path}`: {e}")))?;
+                let mut names: Vec<String> = Vec::new();
+                for entry in entries {
+                    let entry = entry
+                        .map_err(|e| VmError::new(format!("`fs_list` falhou em `{path}`: {e}")))?;
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                names.sort();
+                Ok(Value::Array(names.into_iter().map(Value::Str).collect()))
+            }
+            other => Err(VmError::new(format!(
+                "`fs_list` exige diretorio (string), encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::FsRead => match &args[0] {
             Value::Str(path) => {
                 let bytes = std::fs::read(path)
@@ -591,6 +627,17 @@ pub(super) fn call_builtin(
 /// (`Int`/`Float` misturados comparam exato quando possivel), `Str`
 /// (ordem lexicografica de bytes UTF-8) ou `Bool` (`false` < `true`) —
 /// e o array vazio. Qualquer mistura com outros tipos e erro.
+/// Passo do xorshift64* (RFC 0012): avanca o estado e devolve `u64`.
+/// Rapido e std-only; NAO criptografico (documentado em `rand`).
+fn next_rand(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
 fn sort_array(items: &[Value]) -> Result<Vec<Value>, VmError> {
     let numeric = items
         .iter()
