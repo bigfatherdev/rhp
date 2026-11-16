@@ -1,0 +1,11 @@
+// Exemplos de regex, hashing e HMAC (RFC 0014 + ADR 0014).
+// Sem lookaround/backrefs (tempo linear garantido); sha256/hmac via
+// RustCrypto puro.
+echo regex_match("abc123", "[a-z]+[0-9]+");
+echo regex_replace("2026-11-16", "([0-9]+)-([0-9]+)-([0-9]+)", "$3/$2/$1");
+echo regex_split("a,b,c", ",");
+echo sha256("abc");
+let tag = hmac_sha256("chave", "mensagem");
+echo tag;
+echo hmac_verify("chave", "mensagem", tag);
+echo hmac_verify("outra", "mensagem", tag);

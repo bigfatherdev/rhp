@@ -2153,6 +2153,48 @@ mod tests {
     }
 
     #[test]
+    fn runs_regex_and_hashing_builtins() {
+        // regex_match: encontra / nao encontra; padrao invalido = erro claro.
+        assert_eq!(
+            run_src("echo regex_match(\"abc123\", \"[a-z]+[0-9]+\");").expect("ok"),
+            "true\n"
+        );
+        assert_eq!(
+            run_src("echo regex_match(\"abc\", \"^[0-9]+$\");").expect("ok"),
+            "false\n"
+        );
+        assert!(run_err("echo regex_match(\"abc\", \"([a-z]\");").contains("regex invalida"));
+        assert!(run_err("echo regex_match(\"abc\", \"(?=a)b\");").contains("regex invalida"));
+        // regex_replace com grupos ($1) e regex_split.
+        assert_eq!(
+            run_src(
+                "echo regex_replace(\"2026-11-16\", \"([0-9]+)-([0-9]+)-([0-9]+)\", \"$3/$2/$1\");"
+            )
+            .expect("ok"),
+            "16/11/2026\n"
+        );
+        assert_eq!(
+            run_src("echo regex_split(\"a,b,c\", \",\");").expect("ok"),
+            "[a, b, c]\n"
+        );
+        // sha256: vetor canonico ("abc").
+        assert_eq!(
+            run_src("echo sha256(\"abc\");").expect("ok"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
+        );
+        // hmac: round-trip + verificacao em tempo constante.
+        assert_eq!(
+            run_src("let t = hmac_sha256(\"chave\", \"msg\"); echo hmac_verify(\"chave\", \"msg\", t); echo hmac_verify(\"outra\", \"msg\", t); echo hmac_verify(\"chave\", \"msg\", \"00\");").expect("ok"),
+            "true\nfalse\nfalse\n"
+        );
+        // Tipos: exige strings.
+        assert!(run_err("echo regex_match(1, \"a\");").contains("strings"));
+        assert!(run_err("echo sha256(1);").contains("string"));
+        assert!(run_err("echo hmac_sha256(\"k\", 1);").contains("strings"));
+        assert!(run_err("echo hmac_verify(\"k\", \"m\", \"zz\");").contains("hexadecimal"));
+    }
+
+    #[test]
     fn runs_match_expression() {
         // Valor retornado; primeiro match vence; sem fallthrough.
         assert_eq!(

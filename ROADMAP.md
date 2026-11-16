@@ -79,6 +79,7 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 - [x] Re-export seletivo (RFC 0011 aceita e implementada: transitivo, sem `export *`).
 - [x] Builtins `rand`/`rand_range`/`fs_list` (RFC 0012 aceita e implementada).
 - [x] Hashing de senhas (RFC 0013 + ADR 0013 aceitas e implementadas: `hash_password` Argon2id + `verify_password` `$argon2id$`/bcrypt, teto anti-DoS).
+- [x] Regex, hashing e HMAC (RFC 0014 + ADR 0014 aceitas e implementadas: `regex_*` sem lookaround/backrefs, `sha256`, `hmac_sha256`/`hmac_verify`).
 - [x] Closures de primeira classe (RFC 0003 aceita e implementada:
   `fn (params) { }`, captura por valor, `MakeFunc`, `CallValue`).
 

@@ -13,6 +13,11 @@ rhp-parser = { path = "../rhp-parser" }
 argon2 = "0.6"
 bcrypt = "0.19"
 password-hash = "0.6"
+# Regex + hashing geral (ADR 0014): `regex` (tempo linear garantido),
+# `sha2` + `hmac` (RustCrypto, puros Rust, sem C).
+regex = "1"
+sha2 = "0.11"
+hmac = "0.13"
 # TLS (ADR 0012): rustls puro + raizes embutidas; ring via cc.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"

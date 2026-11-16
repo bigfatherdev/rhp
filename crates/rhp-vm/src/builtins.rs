@@ -533,6 +533,87 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+        Builtin::RegexMatch => match (&args[0], &args[1]) {
+            (Value::Str(haystack), Value::Str(pattern)) => {
+                let re = compile_regex(pattern)?;
+                Ok(Value::Bool(re.is_match(haystack)))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`regex_match` exige (texto, padrao) em strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::RegexReplace => match (&args[0], &args[1], &args[2]) {
+            (Value::Str(haystack), Value::Str(pattern), Value::Str(replacement)) => {
+                let re = compile_regex(pattern)?;
+                Ok(Value::Str(
+                    re.replace_all(haystack, replacement.as_str()).into_owned(),
+                ))
+            }
+            (other, _, _) => Err(VmError::new(format!(
+                "`regex_replace` exige (texto, padrao, substituicao) em strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::RegexSplit => match (&args[0], &args[1]) {
+            (Value::Str(haystack), Value::Str(pattern)) => {
+                let re = compile_regex(pattern)?;
+                Ok(Value::Array(
+                    re.split(haystack)
+                        .map(|s| Value::Str(s.to_string()))
+                        .collect(),
+                ))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`regex_split` exige (texto, padrao) em strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::Sha256 => match &args[0] {
+            Value::Str(text) => {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(text.as_bytes());
+                Ok(Value::Str(hex_encode(&hasher.finalize())))
+            }
+            other => Err(VmError::new(format!(
+                "`sha256` exige string, encontrada {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::HmacSha256 => match (&args[0], &args[1]) {
+            (Value::Str(key), Value::Str(message)) => {
+                use hmac::{Hmac, KeyInit, Mac};
+                use sha2::Sha256;
+                type HmacSha256 = Hmac<Sha256>;
+                let mut mac = HmacSha256::new_from_slice(key.as_bytes())
+                    .map_err(|_| VmError::new("`hmac_sha256`: chave invalida".to_string()))?;
+                mac.update(message.as_bytes());
+                Ok(Value::Str(hex_encode(&mac.finalize().into_bytes())))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`hmac_sha256` exige (chave, mensagem) em strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::HmacVerify => match (&args[0], &args[1], &args[2]) {
+            (Value::Str(key), Value::Str(message), Value::Str(tag)) => {
+                use hmac::{Hmac, KeyInit, Mac};
+                use sha2::Sha256;
+                type HmacSha256 = Hmac<Sha256>;
+                let mut mac = HmacSha256::new_from_slice(key.as_bytes())
+                    .map_err(|_| VmError::new("`hmac_verify`: chave invalida".to_string()))?;
+                mac.update(message.as_bytes());
+                let expected = hex_decode(tag).ok_or_else(|| {
+                    VmError::new("`hmac_verify`: tag nao e hexadecimal valido".to_string())
+                })?;
+                Ok(Value::Bool(mac.verify_slice(&expected).is_ok()))
+            }
+            (other, _, _) => Err(VmError::new(format!(
+                "`hmac_verify` exige (chave, mensagem, tag) em strings, encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::HashPassword => match &args[0] {
             Value::Str(password) => {
                 use argon2::{Argon2, PasswordHasher};
@@ -681,6 +762,44 @@ fn next_rand(state: &mut u64) -> u64 {
     x ^= x >> 27;
     *state = x;
     x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+/// Compila padrao regex com teto anti-DoS (RFC 0014): programa compilado
+/// limitado a 1 MiB. Erro inclui o motivo (ex.: lookaround nao suportado).
+fn compile_regex(pattern: &str) -> Result<regex::Regex, VmError> {
+    const MAX_REGEX_BYTES: usize = 1 << 20;
+    regex::RegexBuilder::new(pattern)
+        .size_limit(MAX_REGEX_BYTES)
+        .build()
+        .map_err(|e| VmError::new(format!("regex invalida: {e}")))
+}
+
+/// Codifica bytes em hexadecimal minusculo (sem crate extra).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xF) as usize] as char);
+    }
+    out
+}
+
+/// Decodifica hexadecimal (`None` se impar ou com digito invalido).
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let raw = text.as_bytes();
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    let mut i = 0;
+    while i < raw.len() {
+        let hi = (raw[i] as char).to_digit(16)?;
+        let lo = (raw[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
 }
 
 /// Tetos anti-DoS para verificacao Argon2 (RFC 0013): os parametros vem do

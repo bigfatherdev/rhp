@@ -53,7 +53,7 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 | `TryEnd` | Remove o handler (caminho normal). Sem handler = erro. |
 | `Throw` | Desempilha valor e inicia unwinding (frame atual para a base). |
 | `Rethrow` | Relanca o erro em propagacao (fim de `finally` sem `catch`). |
-| `CallBuiltin(id)` | Executa builtin de id 0–52 com aridade fixa (tabela §4).
+| `CallBuiltin(id)` | Executa builtin de id 0–63 com aridade fixa (tabela §4).
   HOFs com callback (`Map`/`Filter`/`Usort`, RFC 0005) nao passam pelo
   `call_builtin` sincrono: o `step` intercepta, guarda `PendingHof` no frame
   e empilha ativacoes; o `Return` retoma (`advance_hof`). |
@@ -127,7 +127,8 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 40 Now 41 Sleep 42 DateStr 43 HttpFetch
 44 DbOpen 45 DbExec 46 DbQuery 47 DbClose
 48 HttpServe 49 Template 50 Map 51 Filter 52 Usort
-53 Rand 54 RandRange 55 FsList 56 HashPassword 57 VerifyPassword`
+53 Rand 54 RandRange 55 FsList 56 HashPassword 57 VerifyPassword
+58 RegexMatch 59 RegexReplace 60 RegexSplit 61 Sha256 62 HmacSha256 63 HmacVerify`
 (aridades na tabela §6 de `LANGUAGE_SPEC.md`). Ids desconhecidos invalidam
 o chunk; `BuiltinId` tem teste anti-deriva.
 HOFs com callback (`Map`/`Filter`/`Usort`, RFC 0005) nao passam pelo
