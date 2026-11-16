@@ -1,0 +1,2 @@
+echo match 2 { 1 => "um", 2 => "dois", default => "outro" };
+echo match 9 { 1 => "um", default => "outro" };

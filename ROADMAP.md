@@ -83,6 +83,16 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 - [x] Closures de primeira classe (RFC 0003 aceita e implementada:
   `fn (params) { }`, captura por valor, `MakeFunc`, `CallValue`).
 
+## Etapas 3–5 — Suporte, DevX e grandes (pós PHP-100 funcional)
+
+- [ ] Etapa 3 (suporte, em andamento): suite de conformidade
+  (`tests/conformance/`), property tests std-only ampliados; pendentes:
+  teto de heap em bytes, fuzz contínuo, otimizações com antes/depois.
+- [ ] Etapa 4 (DevX): `rhp fmt` preservando comentários, stack traces,
+  REPL, debugger/LSP.
+- [ ] Etapa 5 (grandes, cada item com RFC/ADR + aprovação): tipos, OO/
+  classes, geradores, async, Redis/MySQL/sockets.
+
 ## Fases A–D — RHP para sites/sistemas (plano aprovado, em andamento)
 
 - [x] A1: RFC 0001 — exceções (`RFCs/0001-excecoes.md`, aceita e implementada).

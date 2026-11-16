@@ -1,0 +1,8 @@
+fn contador() {
+  static n = 0;
+  n = n + 1;
+  return n;
+}
+echo contador();
+echo contador();
+echo contador();

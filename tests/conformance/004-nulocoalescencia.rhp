@@ -1,0 +1,6 @@
+echo true ? "s" : "n";
+echo false ? "s" : "n";
+echo null ?? "padrao";
+echo 0 ?? "padrao";
+echo "" ?: "caiu";
+echo null ?: "caiu";
