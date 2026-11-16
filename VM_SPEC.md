@@ -21,6 +21,10 @@
    capturado + params vinculados, params sombreiam); continua nele.
    `MakeFunc(f)`: empilha `Func{def, env: snapshot atual}` (internos→externos).
    `DefineFunc(f)`: idem + declara (captura uniforme para `fn` nomeada).
+- HOFs com callback (RFC 0005): `map`/`filter`/`usort` via protocolo de
+  chamada pendente — o frame chamador guarda `pending: PendingHof` e o
+  `Return` do callback retoma (`advance_hof`) até finalizar. Sem ops novos;
+  `max_steps`/`max_collection_len` continuam valendo.
 4. Fim do codigo sem `Halt`/`Return` alcancado => erro (defesa em
    profundidade; chunks validados nao atingem).
 

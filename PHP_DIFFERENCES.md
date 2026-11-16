@@ -30,6 +30,16 @@ a semantica for especificada e implementada.
 - Sem `break N` (RHP nao tem `break` com argumento); `break` sai do
   `switch` mais interno, `continue` mira o laco externo.
 
+## `map`/`filter`/`usort` (RFC 0005, Fase 2)
+
+- Nomes curtos e colecao primeiro (`map(arr, f)`), convenção dos builtins
+  RHP (`push`, `sort`); PHP usa `array_map(f, arr)` / `array_filter` /
+  `usort(arr, cmp)` (ordem e nomes diferentes).
+- Callbacks recebem exatamente os args documentados (1 para `map`/`filter`,
+  2 para `usort`); RHP exige aridade exata, sem o relaxamento do PHP.
+- `filter` exige retorno `Bool` (erro senão); PHP usa truthiness (RHP não tem).
+- `usort` é estável (insertion sort); comparador deve retornar `Int`.
+
 - Sintaxe comparada (`echo`, `;`, strings) apos ampliacao da linguagem.
 - Sistema de tipos e conversoes.
 - Semantica de `echo`/`print` vs PHP.

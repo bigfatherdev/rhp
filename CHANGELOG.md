@@ -14,6 +14,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   posição livre), `break`/`continue`, escopo por ramo, comparação `==`.
   `switch`/`case`/`default` viram keywords.
   Registro: `changes/2026-11-16-feat-switch.md`.
+- HOFs com callback (RFC 0005, Fase 2): `map`/`filter`/`usort` via
+  protocolo de chamada pendente na VM (`usort` estável).
+  Registro: `changes/2026-11-16-feat-hofs-callback.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 

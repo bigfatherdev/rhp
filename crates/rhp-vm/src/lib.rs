@@ -4,7 +4,7 @@
 //! globais compartilhadas. O bytecode e tratado como entrada potencialmente
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
-use rhp_bytecode::{builtin_arity, Chunk, FuncDef, FuncValue, Op, Value};
+use rhp_bytecode::{builtin_arity, Builtin, Chunk, FuncDef, FuncValue, Op, Value};
 use rhp_parser::Program;
 use std::collections::HashMap;
 use std::fmt;
@@ -94,6 +94,39 @@ struct Frame {
     scopes: Vec<HashMap<String, Value>>,
     /// Pilha de handlers de `try` (RFC 0001); o mais interno por ultimo.
     handlers: Vec<Handler>,
+    /// HOF com callback em voo (RFC 0005): progresso da iteracao enquanto
+    /// as ativacoes do callback executam e retornam. `None` no comum.
+    pending: Option<PendingHof>,
+}
+
+/// Estado de `map`/`filter`/`usort` entre chamadas do callback (RFC 0005).
+/// O frame chamador guarda o progresso; cada retorno do callback avanca
+/// (`advance_hof`) ate finalizar com o resultado empilhado.
+#[derive(Debug, Clone)]
+enum PendingHof {
+    /// `map`: aplica `func` a cada item, acumulando resultados.
+    Map {
+        func: FuncValue,
+        items: Vec<Value>,
+        /// Indice do item cuja chamada esta em voo.
+        next: usize,
+        acc: Vec<Value>,
+    },
+    /// `filter`: como `map`, mas so acumula quando o retorno e `Bool(true)`.
+    Filter {
+        func: FuncValue,
+        items: Vec<Value>,
+        next: usize,
+        acc: Vec<Value>,
+    },
+    /// `usort`: insertion sort estavel dirigido por comparacoes.
+    Sort {
+        func: FuncValue,
+        sorted: Vec<Value>,
+        /// Proximo par a comparar: `(sorted[j], sorted[j-1])`, `j = max(1, ..)`.
+        i: usize,
+        j: usize,
+    },
 }
 
 /// Handler de `try`: para onde saltar e com que escopos/pilha.
@@ -229,6 +262,7 @@ impl Vm {
             stack: Vec::new(),
             scopes: vec![HashMap::new()],
             handlers: Vec::new(),
+            pending: None,
         });
     }
 
@@ -466,7 +500,13 @@ impl Vm {
                 }
                 self.frames.pop();
                 let caller = self.frames.len() - 1;
-                self.push_checked(caller, value)?;
+                // Retomada de HOF (RFC 0005): o valor e o retorno do callback;
+                // sem HOF pendente, entrega normal ao chamador.
+                if let Some(pending) = self.frames[caller].pending.take() {
+                    self.advance_hof(caller, pending, value)?;
+                } else {
+                    self.push_checked(caller, value)?;
+                }
             }
             Op::Pop => {
                 self.pop(idx, "descarte de valor")?;
@@ -597,15 +637,21 @@ impl Vm {
                     }
                 }
                 args.reverse();
-                let result = call_builtin(
-                    builtin,
-                    &args,
-                    &self.argv,
-                    &mut self.db,
-                    self.program.clone(),
-                )?;
-                self.push_checked(idx, result)?;
-                self.frames[idx].ip += 1;
+                // HOFs com callback (RFC 0005): protocolo de chamada pendente
+                // (nunca passam pelo `call_builtin` sincrono).
+                if matches!(builtin, Builtin::Map | Builtin::Filter | Builtin::Usort) {
+                    self.hof_begin(idx, builtin, args)?;
+                } else {
+                    let result = call_builtin(
+                        builtin,
+                        &args,
+                        &self.argv,
+                        &mut self.db,
+                        self.program.clone(),
+                    )?;
+                    self.push_checked(idx, result)?;
+                    self.frames[idx].ip += 1;
+                }
             }
         }
         self.check_stack_depth(idx)?;
@@ -751,12 +797,23 @@ impl Vm {
                 )));
             }
         };
-        if func.def.params.len() != arity {
+        self.push_call_frame(func, args)?;
+        self.frames[idx].ip += 1;
+        Ok(())
+    }
+
+    /// Empilha a ativacao de `func` com `args` (checa aridade e profundidade;
+    /// escopo unico = clone do env + params). NAO avanca o `ip` do chamador:
+    /// quem chama avanca exatamente uma vez (no HOF, so na primeira chamada;
+    /// as seguintes retomam do `Return` com o `ip` ja posicionado).
+    /// Usado por `Call` e pelo protocolo de HOFs (RFC 0005).
+    fn push_call_frame(&mut self, func: FuncValue, args: Vec<Value>) -> Result<(), VmError> {
+        if func.def.params.len() != args.len() {
             return Err(VmError::new(format!(
                 "funcao `{}` espera {} argumentos, recebeu {}",
                 func.def.name,
                 func.def.params.len(),
-                arity
+                args.len()
             )));
         }
         if self.frames.len() >= MAX_CALL_DEPTH {
@@ -771,7 +828,6 @@ impl Vm {
         for (param, arg) in func.def.params.iter().zip(args) {
             scope.insert(param.clone(), arg);
         }
-        self.frames[idx].ip += 1;
         self.frames.push(Frame {
             code: func.def.body.code.clone(),
             constants: func.def.body.constants.clone(),
@@ -787,8 +843,178 @@ impl Vm {
             stack: Vec::new(),
             scopes: vec![scope],
             handlers: Vec::new(),
+            pending: None,
         });
         Ok(())
+    }
+
+    /// Inicia `map`/`filter`/`usort` (RFC 0005): valida `(colecao, funcao)`,
+    /// guarda o progresso em `pending` e empilha a primeira ativacao do
+    /// callback. Array vazio finaliza sem chamar.
+    fn hof_begin(&mut self, idx: usize, builtin: Builtin, args: Vec<Value>) -> Result<(), VmError> {
+        let name = match builtin {
+            Builtin::Map => "map",
+            Builtin::Filter => "filter",
+            _ => "usort",
+        };
+        let (func, items) = match (&args[0], &args[1]) {
+            (Value::Array(items), Value::Func(func)) => (func.clone(), items.clone()),
+            (arr, f) => {
+                return Err(VmError::new(format!(
+                    "`{name}` exige (array, funcao), encontrado ({}, {})",
+                    type_name(arr),
+                    type_name(f)
+                )));
+            }
+        };
+        if items.is_empty() {
+            self.push_checked(idx, Value::Array(Vec::new()))?;
+            self.frames[idx].ip += 1;
+            return Ok(());
+        }
+        match builtin {
+            Builtin::Map | Builtin::Filter => {
+                let first = items[0].clone();
+                let pending = if matches!(builtin, Builtin::Map) {
+                    PendingHof::Map {
+                        func: func.clone(),
+                        items,
+                        next: 0,
+                        acc: Vec::new(),
+                    }
+                } else {
+                    PendingHof::Filter {
+                        func: func.clone(),
+                        items,
+                        next: 0,
+                        acc: Vec::new(),
+                    }
+                };
+                self.frames[idx].pending = Some(pending);
+                self.push_call_frame(func, vec![first])?;
+                self.frames[idx].ip += 1;
+                Ok(())
+            }
+            // Insertion sort passo a passo: primeira comparacao do par (1, 0).
+            _ => {
+                if items.len() < 2 {
+                    self.push_checked(idx, Value::Array(items))?;
+                    self.frames[idx].ip += 1;
+                    return Ok(());
+                }
+                let a = items[1].clone();
+                let b = items[0].clone();
+                self.frames[idx].pending = Some(PendingHof::Sort {
+                    func: func.clone(),
+                    sorted: items,
+                    i: 1,
+                    j: 1,
+                });
+                self.push_call_frame(func, vec![a, b])?;
+                self.frames[idx].ip += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Avanca o HOF com o retorno do callback: acumula e empilha a proxima
+    /// chamada, ou finaliza empilhando o resultado. Chamado no `Return`.
+    fn advance_hof(&mut self, idx: usize, pending: PendingHof, ret: Value) -> Result<(), VmError> {
+        match pending {
+            PendingHof::Map {
+                func,
+                items,
+                mut next,
+                mut acc,
+            } => {
+                acc.push(ret);
+                next += 1;
+                if next < items.len() {
+                    let arg = items[next].clone();
+                    self.frames[idx].pending = Some(PendingHof::Map {
+                        func: func.clone(),
+                        items,
+                        next,
+                        acc,
+                    });
+                    self.push_call_frame(func, vec![arg])
+                } else {
+                    self.push_checked(idx, Value::Array(acc))
+                }
+            }
+            PendingHof::Filter {
+                func,
+                items,
+                mut next,
+                mut acc,
+            } => {
+                match ret {
+                    Value::Bool(true) => acc.push(items[next].clone()),
+                    Value::Bool(false) => {}
+                    other => {
+                        return Err(VmError::new(format!(
+                            "`filter` exige retorno bool, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                }
+                next += 1;
+                if next < items.len() {
+                    let arg = items[next].clone();
+                    self.frames[idx].pending = Some(PendingHof::Filter {
+                        func: func.clone(),
+                        items,
+                        next,
+                        acc,
+                    });
+                    self.push_call_frame(func, vec![arg])
+                } else {
+                    self.push_checked(idx, Value::Array(acc))
+                }
+            }
+            PendingHof::Sort {
+                func,
+                mut sorted,
+                mut i,
+                mut j,
+            } => {
+                let cmp = match ret {
+                    Value::Int(c) => c,
+                    other => {
+                        return Err(VmError::new(format!(
+                            "comparador de `usort` deve retornar int, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                };
+                let n = sorted.len();
+                if cmp < 0 {
+                    sorted.swap(j, j - 1);
+                    if j > 1 {
+                        j -= 1;
+                    } else {
+                        i += 1;
+                        j = i;
+                    }
+                } else {
+                    i += 1;
+                    j = i;
+                }
+                if i < n {
+                    let a = sorted[j].clone();
+                    let b = sorted[j - 1].clone();
+                    self.frames[idx].pending = Some(PendingHof::Sort {
+                        func: func.clone(),
+                        sorted,
+                        i,
+                        j,
+                    });
+                    self.push_call_frame(func, vec![a, b])
+                } else {
+                    self.push_checked(idx, Value::Array(sorted))
+                }
+            }
+        }
     }
 
     /// Desenrola frames ate o handler de `try` mais interno.
@@ -1339,6 +1565,84 @@ mod tests {
         let fib =
             "fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } echo fib(10);";
         assert_eq!(run_src(fib).expect("ok"), "55\n");
+    }
+
+    #[test]
+    fn runs_map_with_callback() {
+        assert_eq!(
+            run_src("echo map([1, 2, 3], fn (x) { return x * 2; });").expect("ok"),
+            "[2, 4, 6]\n"
+        );
+        // Callback captura o ambiente (closure de verdade, nao funcao solta).
+        assert_eq!(
+            run_src("let k = 10; echo map([1, 2], fn (x) { return x + k; });").expect("ok"),
+            "[11, 12]\n"
+        );
+        // Vazio nao chama; aninhado funciona (`pending` e por frame).
+        assert_eq!(
+            run_src("echo map([], fn (x) { return x; });").expect("ok"),
+            "[]\n"
+        );
+        assert_eq!(
+            run_src(
+                "echo map([[1, 2], [3]], fn (r) { return map(r, fn (x) { return x * 10; }); });"
+            )
+            .expect("ok"),
+            "[[10, 20], [30]]\n"
+        );
+        // Erros claros: tipos e aridade do callback.
+        assert!(run_err("echo map(1, fn (x) { return x; });").contains("array, funcao"));
+        assert!(run_err("echo map([1], 42);").contains("array, funcao"));
+        assert!(run_err("echo map([1], fn (a, b) { return a; });").contains("espera 2"));
+        // `throw` no callback propaga (estado pendente descartado com o frame).
+        assert_eq!(
+            run_src("try { echo map([1], fn (x) { throw \"boom\"; }); } catch e { echo e; }")
+                .expect("ok"),
+            "boom\n"
+        );
+    }
+
+    #[test]
+    fn runs_filter_with_callback() {
+        assert_eq!(
+            run_src("echo filter([1, 2, 3, 4], fn (x) { return x > 2; });").expect("ok"),
+            "[3, 4]\n"
+        );
+        assert_eq!(
+            run_src("echo filter([], fn (x) { return true; });").expect("ok"),
+            "[]\n"
+        );
+        // Sem truthiness: retorno nao-bool e erro (divergencia PHP documentada).
+        assert!(run_err("echo filter([1], fn (x) { return x; });").contains("bool"));
+    }
+
+    #[test]
+    fn runs_usort_with_comparator() {
+        assert_eq!(
+            run_src("echo usort([3, 1, 2], fn (a, b) { return a - b; });").expect("ok"),
+            "[1, 2, 3]\n"
+        );
+        assert_eq!(
+            run_src("echo usort([1, 2, 3], fn (a, b) { return b - a; });").expect("ok"),
+            "[3, 2, 1]\n"
+        );
+        // Estavel: empates mantem a ordem original.
+        assert_eq!(
+            run_src("echo usort([{k: 1, v: \"a\"}, {k: 1, v: \"b\"}, {k: 0, v: \"c\"}], fn (x, y) { return x[\"k\"] - y[\"k\"]; });")
+                .expect("ok"),
+            "[{k: 0, v: c}, {k: 1, v: a}, {k: 1, v: b}]\n"
+        );
+        assert_eq!(
+            run_src("echo usort([], fn (a, b) { return 0; });").expect("ok"),
+            "[]\n"
+        );
+        assert_eq!(
+            run_src("echo usort([5], fn (a, b) { return 0; });").expect("ok"),
+            "[5]\n"
+        );
+        // Comparador deve retornar int.
+        assert!(run_err("echo usort([2, 1], fn (a, b) { return true; });").contains("int"));
+        assert!(run_err("echo usort(1, fn (a, b) { return 0; });").contains("array, funcao"));
     }
 
     #[test]

@@ -145,6 +145,12 @@ pub enum Builtin {
     HttpServe,
     /// `template(texto, valores)` — interpola `{{chave}}` com escape HTML.
     Template,
+    /// `map(arr, f)` — aplica `f(elem)` e empilha array de resultados (RFC 0005).
+    Map,
+    /// `filter(arr, f)` — `f(elem)` deve ser `Bool`; empilha filtrados (RFC 0005).
+    Filter,
+    /// `usort(arr, cmp)` — insertion sort estavel via `cmp(a, b): Int` (RFC 0005).
+    Usort,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -201,6 +207,9 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "db_close" => Some(Builtin::DbClose),
         "http_serve" => Some(Builtin::HttpServe),
         "template" => Some(Builtin::Template),
+        "map" => Some(Builtin::Map),
+        "filter" => Some(Builtin::Filter),
+        "usort" => Some(Builtin::Usort),
         _ => None,
     }
 }
@@ -252,7 +261,10 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::FsWrite
         | Builtin::FsAppend
         | Builtin::HttpFetch
-        | Builtin::Template => 2,
+        | Builtin::Template
+        | Builtin::Map
+        | Builtin::Filter
+        | Builtin::Usort => 2,
         Builtin::DbExec | Builtin::DbQuery | Builtin::HttpServe => 3,
         Builtin::Replace => 3,
     }
@@ -401,6 +413,9 @@ impl BuiltinId {
             47 => Ok(Builtin::DbClose),
             48 => Ok(Builtin::HttpServe),
             49 => Ok(Builtin::Template),
+            50 => Ok(Builtin::Map),
+            51 => Ok(Builtin::Filter),
+            52 => Ok(Builtin::Usort),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -459,6 +474,9 @@ impl From<Builtin> for BuiltinId {
             Builtin::DbClose => 47,
             Builtin::HttpServe => 48,
             Builtin::Template => 49,
+            Builtin::Map => 50,
+            Builtin::Filter => 51,
+            Builtin::Usort => 52,
         };
         Self(id)
     }
@@ -1813,6 +1831,21 @@ mod tests {
     }
 
     #[test]
+    fn compiles_hofs_with_callback() {
+        // `map`/`filter`/`usort` viram `CallBuiltin` com ids estaveis; aridade 2.
+        let chunk = compile_src("echo map([1], fn (x) { return x; });");
+        assert!(chunk.code.contains(&Op::CallBuiltin(BuiltinId(50))));
+        let chunk = compile_src("echo filter([1], fn (x) { return true; });");
+        assert!(chunk.code.contains(&Op::CallBuiltin(BuiltinId(51))));
+        let chunk = compile_src("echo usort([2, 1], fn (a, b) { return a - b; });");
+        assert!(chunk.code.contains(&Op::CallBuiltin(BuiltinId(52))));
+        // Aridade checada em compilacao (regra dos builtins).
+        let program = parse_source("echo map([1]);").expect("parse deve passar");
+        let err = compile(&program).expect_err("aridade deve falhar");
+        assert!(err.message.contains("espera 2"));
+    }
+
+    #[test]
     fn compiles_closure_and_general_calls() {
         // Closure vira `MakeFunc` (valor); `f(1)` direto preserva `Call`.
         let chunk = compile_src("let f = fn (x) { return x; }; echo f(1);");
@@ -2124,6 +2157,9 @@ mod tests {
             Builtin::DbClose,
             Builtin::HttpServe,
             Builtin::Template,
+            Builtin::Map,
+            Builtin::Filter,
+            Builtin::Usort,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

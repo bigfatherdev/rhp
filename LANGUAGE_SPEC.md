@@ -233,6 +233,9 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `argv()` | `Array` de `Str` com os argumentos apos o arquivo (`rhp run prog.rhp a b` => `["a", "b"]`). |
 | `env(nome)` | Valor da variavel de ambiente ou `null` se ausente. |
 | `sort(arr)` | Copia ordenada (estavel): numeros (`Int`/`Float`, mistos comparam exato quando possivel), `Str` (ordem lexicografica de bytes UTF-8) ou `Bool` (`false` < `true`); vazio => vazio. Mistura com outros tipos ou nao-array = erro. Nao muta o original (`a = sort(a);`). |
+| `map(arr, f)` | (RFC 0005) Aplica `f(elem)` a cada elemento e devolve array de resultados (mesma ordem); vazio => `[]` sem chamar. `f` declara exatamente 1 param. |
+| `filter(arr, f)` | (RFC 0005) Devolve elementos cujo `f(elem)` retorna `Bool(true)` (ordem preservada); vazio => `[]`. Retorno nao-`Bool` = erro (sem truthiness). `f` declara exatamente 1 param. |
+| `usort(arr, cmp)` | (RFC 0005) Copia ordenada por `cmp(a, b): Int` (`< 0`: `a` antes; `> 0`: depois; `0`: empate, estavel — insertion sort). Retorno nao-`Int` = erro. Vazio/unitario nao chama. Nao muta o original. |
 | `exit(codigo)` | Encerra o programa com codigo 0-255 (fora disso ou nao-`Int` = erro). Desenrola chamadas; em `rhp test`, conta como falha do arquivo. |
 | `now()` | Segundos desde 1970-01-01T00:00:00Z (`Int`; relogio do sistema). |
 | `sleep(s)` | Bloqueia `s` segundos (`Int`/`Float`; fracao = sub-segundo). Negativo, nao-finito ou > 3600 = erro. Devolve `null`. VM single-thread: tudo para junto. |
