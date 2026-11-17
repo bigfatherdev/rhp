@@ -55,12 +55,11 @@ ou nos logs (login via `secrets.*`, fora de PR não há login).
 - CI no proprio PR validou o workflow (2 falhas rapidas encontradas e
   corrigidas aqui: toolchain sem `rustfmt`/`clippy` — adicionados
   `components:`; tags vazias em PR — adicionado `type=ref,event=pr`).
-- Suite do projeto: 324 passed, 0 failed (inclui 3 testes novos desta
-  leva? nao — esta leva nao adiciona testes Rust; o gate roda a suite
-  existente como regressao).
-- amd64 validado localmente; arm64: build sob QEMU local em andamento
-  + garantido no CI do PR (workflow constroi as 2 arquiteturas em todo
-  push/PR) — nunca afirmar sem evidencia.
+- Suite do projeto: 324 passed, 0 failed (o gate roda a suite existente
+  como regressao; esta leva nao adiciona testes Rust).
+- amd64 validado localmente (build + `rhp --version` + `run` com volume
+  + usuario nao-root); arm64 validado no CI do proprio PR (job
+  `build + push (amd64, arm64)` verde, run 44114897303).
 
 ## Limitações e riscos conhecidos
 
