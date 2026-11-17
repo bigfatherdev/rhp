@@ -1123,6 +1123,28 @@ fn rhp_run_reports_runtime_type_error() {
 }
 
 #[test]
+fn rhp_run_error_shows_call_stack() {
+    // Etapa 4: stack trace da mais interna para a mais externa; erro no
+    // nivel superior nao imprime pilha.
+    let output = run_temp_source(
+        "trace.rhp",
+        "fn f() {\n  g();\n}\nfn g() {\n  x_indefinida;\n}\nf();\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let pos_g = stderr.find("em g").expect("trace deveria ter `em g`");
+    let pos_f = stderr.find("em f").expect("trace deveria ter `em f`");
+    assert!(pos_g < pos_f, "ordem interna->externa, obteve: {stderr}");
+    let flat = run_temp_source("flat.rhp", "x_indefinida;\n");
+    assert!(!flat.status.success());
+    let flat_err = String::from_utf8_lossy(&flat.stderr);
+    assert!(
+        !flat_err.contains("  em "),
+        "nivel superior nao tem pilha, obteve: {flat_err}"
+    );
+}
+
+#[test]
 fn rhp_run_resolves_imports() {
     let dir = std::env::temp_dir().join(format!("rhp-test-import-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");

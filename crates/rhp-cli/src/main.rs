@@ -495,7 +495,13 @@ fn run_tests(target: &Path) -> Result<(), String> {
             // `exit(codigo)` em teste nao mata o corredor: vira falha do arquivo.
             vm.run(&chunk, &mut sink).map_err(|e| match e.exit_code() {
                 Some(code) => LoadError::Plain(format!("exit({code})")),
-                None => LoadError::Plain(format!("erro de execucao: {e}")),
+                None => {
+                    let mut message = format!("erro de execucao: {e}");
+                    for name in e.trace() {
+                        message.push_str(&format!("\n  em {name}"));
+                    }
+                    LoadError::Plain(message)
+                }
             })
         }) {
             Ok(()) => println!("ok {}", file.display()),
@@ -618,11 +624,13 @@ fn run_program(
         Some(code) => Fail::Exit(code),
         None => {
             let (code, help) = rhp_diagnostic::runtime_code(&e.to_string());
-            Fail::Msg(with_code(
-                code,
-                help,
-                &format!("{origin}: erro de execucao: {e}"),
-            ))
+            // Stack trace (Etapa 4): pilha de chamadas, da mais interna
+            // para a mais externa. Ausente no nivel superior (sem ruido).
+            let mut message = format!("{origin}: erro de execucao: {e}");
+            for name in e.trace() {
+                message.push_str(&format!("\n  em {name}"));
+            }
+            Fail::Msg(with_code(code, help, &message))
         }
     })
 }

@@ -43,12 +43,17 @@ pub struct VmLimits {
 }
 
 /// Erro de runtime da VM.
+///
+/// `message` e estavel (vira valor em `try`/`catch`); `trace` e so
+/// diagnostico da CLI (pilha de chamadas, da mais interna para a mais
+/// externa; Etapa 4, DevX).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmError {
     pub message: String,
     /// Codigo de `exit(codigo)` quando o erro e um pedido de saida;
     /// `None` para erros comuns. Leitura publica; construcao interna.
     exit_code: Option<i32>,
+    trace: Vec<String>,
 }
 
 impl VmError {
@@ -56,6 +61,7 @@ impl VmError {
         Self {
             message: message.into(),
             exit_code: None,
+            trace: Vec::new(),
         }
     }
 
@@ -65,6 +71,7 @@ impl VmError {
         Self {
             message: format!("exit({code})"),
             exit_code: Some(code),
+            trace: Vec::new(),
         }
     }
 
@@ -72,6 +79,19 @@ impl VmError {
     #[must_use]
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// Pilha de chamadas no momento do erro (nomes de funcao, da mais
+    /// interna para a mais externa; vazia no nivel superior).
+    #[must_use]
+    pub fn trace(&self) -> &[String] {
+        &self.trace
+    }
+
+    /// Anexa a pilha de chamadas (uso interno do `run`).
+    fn with_trace(mut self, trace: Vec<String>) -> Self {
+        self.trace = trace;
+        self
     }
 }
 
@@ -255,12 +275,23 @@ impl Vm {
 
         while !self.frames.is_empty() {
             let idx = self.frames.len() - 1;
-            match self.step(idx, output)? {
-                Step::Continue => {}
-                Step::Done => return Ok(()),
+            match self.step(idx, output) {
+                Ok(Step::Continue) => {}
+                Ok(Step::Done) => return Ok(()),
+                Err(error) => return Err(error.with_trace(self.call_stack())),
             }
         }
         Err(VmError::new("execucao terminou sem `Halt`"))
+    }
+
+    /// Pilha de chamadas ativas (nomes de funcao, da mais interna para a
+    /// mais externa). Frames sem funcao (nivel superior) nao aparecem.
+    fn call_stack(&self) -> Vec<String> {
+        self.frames
+            .iter()
+            .rev()
+            .filter_map(|frame| frame.func.as_ref().map(|def| def.name.clone()))
+            .collect()
     }
 
     /// Executa o chunk e devolve o valor no topo da pilha (`Null` se vazia).
@@ -273,12 +304,13 @@ impl Vm {
 
         while !self.frames.is_empty() {
             let idx = self.frames.len() - 1;
-            match self.step(idx, output)? {
-                Step::Continue => {}
-                Step::Done => {
+            match self.step(idx, output) {
+                Ok(Step::Continue) => {}
+                Ok(Step::Done) => {
                     let value = self.frames[idx].stack.pop().unwrap_or(Value::Null);
                     return Ok(value);
                 }
+                Err(error) => return Err(error.with_trace(self.call_stack())),
             }
         }
         Err(VmError::new("execucao terminou sem `Halt`"))
@@ -2905,6 +2937,23 @@ mod tests {
         // Sem limite, programa finito passa normalmente.
         let out = run_src("let i = 0; while i < 3 { i = i + 1; } echo i;").expect("ok");
         assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn error_carries_call_stack() {
+        // Etapa 4: pilha da mais interna para a mais externa; vazia no
+        // nivel superior; `message` intacta (vira valor em `try`/`catch`).
+        let chunk = compile_src("fn f() { g(); } fn g() { x_indefinida; } f();");
+        let err = Vm::new().run_to_string(&chunk).expect_err("deve falhar");
+        assert_eq!(err.trace(), &["g".to_string(), "f".to_string()]);
+        assert!(err.message.contains("nao definida"));
+        let top = compile_src("x_indefinida;");
+        let err = Vm::new().run_to_string(&top).expect_err("deve falhar");
+        assert!(err.trace().is_empty());
+        // Capturado por `try`: mensagem preservada, sem trace no valor.
+        let out = run_src("fn f() { x_indefinida; } try { f(); } catch e { echo e[\"tipo\"]; }")
+            .expect("catch passa");
+        assert_eq!(out, "runtime\n");
     }
 
     #[test]
