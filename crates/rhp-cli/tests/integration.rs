@@ -29,6 +29,18 @@ fn run_temp_source(name: &str, source: &str) -> std::process::Output {
     run_file(&file)
 }
 
+fn run_temp_source_trace(name: &str, source: &str) -> std::process::Output {
+    let dir = std::env::temp_dir().join(format!("rhp-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    let file = dir.join(name);
+    std::fs::write(&file, source).expect("nao foi possivel escrever programa temporario");
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    Command::new(rhp_bin)
+        .args(["run", "--trace", &file.to_string_lossy()])
+        .output()
+        .expect("falha ao executar o binario rhp")
+}
+
 #[test]
 fn rhp_run_hello_rhp_prints_expected_output() {
     let hello = workspace_root().join("hello.rhp");
@@ -1141,6 +1153,19 @@ fn rhp_run_error_shows_call_stack() {
         !flat_err.contains("  em "),
         "nivel superior nao tem pilha, obteve: {flat_err}"
     );
+}
+
+#[test]
+fn rhp_run_trace_prints_ops_to_stderr() {
+    // Etapa 4: `rhp run --trace` despeja `ip` + op em stderr; a saida do
+    // programa continua intacta em stdout.
+    let output = run_temp_source_trace("trace.rhp", "echo 1 + 2;\n");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"3\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[trace]"), "obteve: {stderr}");
+    assert!(stderr.contains("Constant"), "obteve: {stderr}");
+    assert!(stderr.contains("Halt"), "obteve: {stderr}");
 }
 
 #[test]

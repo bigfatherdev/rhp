@@ -177,6 +177,9 @@ pub struct Vm {
     globals: HashMap<String, Value>,
     limits: VmLimits,
     steps: u64,
+    /// Traco de execucao (`rhp run --trace`, Etapa 4): imprime `ip` + op
+    /// em stderr a cada passo. So diagnostico; nao afeta a semantica.
+    trace: bool,
     argv: Vec<String>,
     /// Programa-fonte (AST) para recompilacao por thread (`http_serve`;
     /// so dados owned, `Send+Sync`).
@@ -232,6 +235,7 @@ impl Vm {
             globals: HashMap::new(),
             limits: VmLimits::default(),
             steps: 0,
+            trace: false,
             argv: Vec::new(),
             program: None,
             db: DbHandles::default(),
@@ -239,6 +243,11 @@ impl Vm {
             rng: seed_rng(),
             heap_since_check: 0,
         }
+    }
+
+    /// Liga/desliga o traco de execucao (`rhp run --trace`).
+    pub fn set_trace(&mut self, trace: bool) {
+        self.trace = trace;
     }
 
     /// Define os argumentos de linha de comando visiveis via `argv()`.
@@ -398,17 +407,21 @@ impl Vm {
                 )));
             }
         }
-        let op = {
+        let (ip, op) = {
             let frame = self
                 .frames
                 .get(idx)
                 .ok_or_else(|| VmError::new("frame de execucao inexistente"))?;
-            *frame
+            let op = *frame
                 .chunk
                 .code
                 .get(frame.ip)
-                .ok_or_else(|| VmError::new("ponteiro de instrucao fora do codigo"))?
+                .ok_or_else(|| VmError::new("ponteiro de instrucao fora do codigo"))?;
+            (frame.ip, op)
         };
+        if self.trace {
+            eprintln!("[trace] f{idx}:{ip} {op:?}");
+        }
         match op {
             Op::Constant(const_idx) => {
                 let value = self.frames[idx]

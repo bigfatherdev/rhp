@@ -13,7 +13,7 @@ use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt, StmtNode};
 
 mod pkg;
 
-const USAGE: &str = "uso: rhp run [--max-steps N] [--max-heap-bytes N] <arquivo.rhp> [args] | rhp repl | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
+const USAGE: &str = "uso: rhp run [--max-steps N] [--max-heap-bytes N] [--trace] <arquivo.rhp> [args] | rhp repl | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -31,6 +31,7 @@ fn main() -> ExitCode {
                             max_steps: Some(max_steps),
                             ..Default::default()
                         },
+                        false,
                     ) {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(Fail::Exit(code)) => ExitCode::from(code as u8),
@@ -62,6 +63,7 @@ fn main() -> ExitCode {
                             max_heap_bytes: Some(max_heap_bytes),
                             ..Default::default()
                         },
+                        false,
                     ) {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(Fail::Exit(code)) => ExitCode::from(code as u8),
@@ -77,6 +79,25 @@ fn main() -> ExitCode {
                         "rhp: valor invalido para --max-heap-bytes: `{value}` (use inteiro > 0)"
                     );
                     ExitCode::from(2)
+                }
+            }
+        }
+        // `--trace` (Etapa 4, DevX): traco de execucao em stderr (`ip` +
+        // op a cada passo). Exclusivo com os tetos (mesma limitacao do
+        // parser da CLI para `--max-steps`).
+        [_, cmd, flag, path, rest @ ..] if cmd == "run" && flag == "--trace" => {
+            match run_file_limited(
+                path,
+                rest,
+                &mut std::io::stdout(),
+                rhp_vm::VmLimits::default(),
+                true,
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(Fail::Exit(code)) => ExitCode::from(code as u8),
+                Err(Fail::Msg(message)) => {
+                    let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                    ExitCode::from(1)
                 }
             }
         }
@@ -593,7 +614,7 @@ impl Fail {
 
 /// Executa um arquivo `.rhp`, repassando argumentos extras para `argv()`.
 fn run_file_with_args(path: &str, args: &[String], output: &mut dyn Write) -> Result<(), Fail> {
-    run_file_limited(path, args, output, rhp_vm::VmLimits::default())
+    run_file_limited(path, args, output, rhp_vm::VmLimits::default(), false)
 }
 
 /// REPL interativo (Etapa 4, DevX): le linhas do stdin, compila e executa
@@ -648,9 +669,10 @@ fn run_file_limited(
     args: &[String],
     output: &mut dyn Write,
     limits: rhp_vm::VmLimits,
+    trace: bool,
 ) -> Result<(), Fail> {
     let program = load_program(path).map_err(|e| Fail::Msg(e.human()))?;
-    run_program(&program, path, args, output, limits)
+    run_program(&program, path, args, output, limits, trace)
 }
 
 /// Pipeline programa -> bytecode -> VM (erros com codigo estavel).
@@ -660,6 +682,7 @@ fn run_program(
     args: &[String],
     output: &mut dyn Write,
     limits: rhp_vm::VmLimits,
+    trace: bool,
 ) -> Result<(), Fail> {
     let chunk = rhp_bytecode::compile(program).map_err(|e| {
         let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
@@ -671,6 +694,7 @@ fn run_program(
     })?;
     let mut vm = rhp_vm::Vm::new();
     vm.set_limits(limits);
+    vm.set_trace(trace);
     vm.set_argv(args.to_vec());
     vm.set_program(Arc::new(program.clone()));
     vm.run(&chunk, output).map_err(|e| match e.exit_code() {
@@ -714,11 +738,17 @@ fn parse_with_diagnostics(origin: &str, source: &str) -> Result<Program, LoadErr
 #[cfg(test)]
 fn run_source(source: &str, origin: &str, output: &mut dyn Write) -> Result<(), String> {
     let program = rhp_parser::parse_source(source).map_err(|e| format!("{origin}:{e}"))?;
-    run_program(&program, origin, &[], output, rhp_vm::VmLimits::default()).map_err(|fail| {
-        match fail {
-            Fail::Msg(message) => message,
-            Fail::Exit(code) => format!("exit({code})"),
-        }
+    run_program(
+        &program,
+        origin,
+        &[],
+        output,
+        rhp_vm::VmLimits::default(),
+        false,
+    )
+    .map_err(|fail| match fail {
+        Fail::Msg(message) => message,
+        Fail::Exit(code) => format!("exit({code})"),
     })
 }
 
@@ -2463,6 +2493,7 @@ mod tests {
                 max_steps: Some(500),
                 ..Default::default()
             },
+            false,
         )
         .expect_err("deve falhar")
         .into_message();
@@ -2486,6 +2517,7 @@ mod tests {
                 max_heap_bytes: Some(512),
                 ..Default::default()
             },
+            false,
         )
         .expect_err("deve falhar")
         .into_message();
