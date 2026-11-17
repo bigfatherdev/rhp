@@ -11,6 +11,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Fixed
 
+- `async_spawn` sem programa-fonte no REPL e no `rhp test` (so `rhp run`
+  definia; worker precisa recompilar). Achado na verificação pós-merge.
+  Registro: `changes/2026-11-17-fix-async-program-context.md`.
 - Panic com `max_stack_depth` + `return` (Etapa 3, achado do fuzz):
   `Return` remove o frame e a checagem final de profundidade usava
   índice obsoleto; agora tolera frame removido (topo corrente medido

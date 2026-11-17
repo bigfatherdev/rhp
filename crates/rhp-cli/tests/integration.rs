@@ -1201,6 +1201,31 @@ fn rhp_repl_keeps_state_across_lines() {
 }
 
 #[test]
+fn rhp_repl_async_sees_previous_lines() {
+    // Regressao: `async_spawn` no REPL precisa do programa acumulado
+    // (senao: "sem programa-fonte").
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let mut child = Command::new(rhp_bin)
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("falha ao iniciar rhp repl");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin do repl")
+        .write_all(b"fn f() { return 7; }\nlet h = async_spawn(\"f\");\necho async_join(h);\n")
+        .expect("escrever no stdin do repl");
+    let output = child.wait_with_output().expect("aguardar repl");
+    assert!(output.status.success(), "repl nao deveria falhar");
+    assert_eq!(output.stdout, b"7\n", "stdout={:?}", output.stdout);
+}
+
+#[test]
 fn rhp_run_resolves_imports() {
     let dir = std::env::temp_dir().join(format!("rhp-test-import-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
@@ -1268,6 +1293,28 @@ fn rhp_test_runs_test_files() {
         .output()
         .expect("rhp test arquivo");
     assert!(single.status.success(), "a_test deveria passar");
+}
+
+#[test]
+fn rhp_test_supports_async() {
+    // Regressao: `rhp test` define o programa (senao `async_spawn`
+    // falha com "sem programa-fonte").
+    let dir = std::env::temp_dir().join(format!("rhp-test-async-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    std::fs::write(
+        dir.join("async_test.rhp"),
+        "fn f() { return 7; }\nlet h = async_spawn(\"f\");\nassert(async_join(h) == 7);\n",
+    )
+    .expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .args(["test", &dir.join("async_test.rhp").to_string_lossy()])
+        .output()
+        .expect("rhp test async");
+    assert!(
+        out.status.success(),
+        "async em teste deveria passar: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
