@@ -48,17 +48,19 @@ ou nos logs (login via `secrets.*`, fora de PR não há login).
 ## Testes e validação
 
 - `docker build -t rhp:local .`: OK (achou e corrigiu 2 gaps reais:
-  `include_str!` de `examples/` e `hello.rhp`/`tests/conformance`
-  usados por testes de integração — incluídos no contexto).
-- Dentro do container: `rhp --version` => `rhp 0.1.0`; `run` com
-  volume montado (sort/json/tipos/funcoes); usuário `uid=10001(rhp)`;
-  `rhp -e`? não aplicável (CLI sem modo eval; `run`/`repl` cobrem).
+  `include_str!` de `examples/` e `hello.rhp`/`tests/conformance`/`editors/`
+  exigidos por testes de integracao — incluidos no contexto).
+- Dentro do container: `rhp --version` (= `rhp 0.1.0`); `run` com
+  volume montado (sort/json/tipos/funcoes); usuario `uid=10001(rhp)`.
+- CI no proprio PR validou o workflow (2 falhas rapidas encontradas e
+  corrigidas aqui: toolchain sem `rustfmt`/`clippy` — adicionados
+  `components:`; tags vazias em PR — adicionado `type=ref,event=pr`).
 - Suite do projeto: 324 passed, 0 failed (inclui 3 testes novos desta
-  leva? não — esta leva não adiciona testes Rust; o gate roda a suite
-  existente como regressão).
-- amd64 validado localmente; arm64: build em andamento sob QEMU
-  (verificar conclusão antes de declarar; caso contrário, validado
-  no CI — nunca afirmar sem evidência).
+  leva? nao — esta leva nao adiciona testes Rust; o gate roda a suite
+  existente como regressao).
+- amd64 validado localmente; arm64: build sob QEMU local em andamento
+  + garantido no CI do PR (workflow constroi as 2 arquiteturas em todo
+  push/PR) — nunca afirmar sem evidencia.
 
 ## Limitações e riscos conhecidos
 
