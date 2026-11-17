@@ -83,6 +83,9 @@ pub enum TokenKind {
     RBrace,
     LBracket,
     RBracket,
+    /// Comentario de linha `//` (texto sem `//` nem quebra; Etapa 4).
+    /// Trivia: o parser o ignora na gramatica, mas o coleta para o `fmt`.
+    Comment(String),
 }
 
 /// Um token com posicao de inicio (linha/coluna, base 1).
@@ -232,8 +235,12 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             '/' => {
                 chars.next();
                 col += 1;
-                // Comentario de linha `//`: ignora ate o fim da linha.
+                // Comentario de linha `//`: emite como trivia (Etapa 4)
+                // em vez de descartar; o parser o coleta para o `fmt`.
                 if chars.peek().copied().is_some_and(|(_, c)| c == '/') {
+                    let comment_line = line;
+                    let start_col = col - 1;
+                    let mut text = String::new();
                     for (_, c) in chars.by_ref() {
                         col += 1;
                         if c == '\n' {
@@ -241,7 +248,15 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                             col = 1;
                             break;
                         }
+                        text.push(c);
                     }
+                    // Remove a segunda `/` inicial do texto.
+                    let text = text.strip_prefix('/').unwrap_or(&text).to_string();
+                    tokens.push(Token::new(
+                        TokenKind::Comment(text),
+                        comment_line,
+                        start_col,
+                    ));
                 } else {
                     tokens.push(Token::new(TokenKind::Slash, line, col - 1));
                 }
@@ -850,14 +865,23 @@ mod tests {
 
     #[test]
     fn ignores_line_comments() {
+        // Etapa 4: comentarios viram trivia `Comment` (o parser os filtra
+        // da gramatica e o `fmt` os preserva).
         assert_eq!(
             kinds("// comentario\necho 1; // fim"),
             vec![
+                TokenKind::Comment(" comentario".to_string()),
                 TokenKind::Echo,
                 TokenKind::IntLiteral(1),
                 TokenKind::Semicolon,
+                TokenKind::Comment(" fim".to_string()),
             ]
         );
+        // Linha e coluna do comentario: onde `//` comeca.
+        let tokens = lex("// ola\necho 1;").expect("lex deve passar");
+        assert!(matches!(&tokens[0].kind, TokenKind::Comment(t) if t == " ola"));
+        assert_eq!((tokens[0].line, tokens[0].col), (1, 1));
+        assert_eq!((tokens[1].line, tokens[1].col), (2, 1));
     }
 
     #[test]

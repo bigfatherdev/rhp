@@ -5,8 +5,8 @@
 //! baseada em pilha e valida o chunk (recursivamente) antes de executar.
 
 use rhp_parser::{
-    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, MatchArm, Program, Stmt, SwitchCase,
-    UnaryOp,
+    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, MatchArm, Program, Stmt, StmtNode,
+    SwitchCase, UnaryOp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -929,7 +929,7 @@ struct Compiler {
 /// que o cruzam: fechar handler e rodar `finally` antes do desvio).
 struct PendingTry {
     /// Corpo do `finally` (clonado) para duplicar nas saidas.
-    finally_body: Option<Vec<Stmt>>,
+    finally_body: Option<Vec<StmtNode>>,
     /// `true` enquanto o corpo protegido compila (handler ativo no
     /// runtime); `false` nas regioes de `catch`/`finally` (handler ja
     /// consumido pelo unwinding ou pelo `TryEnd` do caminho normal).
@@ -1227,9 +1227,9 @@ impl Compiler {
         }
     }
 
-    fn compile_stmts(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
-        for stmt in stmts {
-            self.compile_stmt(stmt)?;
+    fn compile_stmts(&mut self, stmts: &[StmtNode]) -> Result<(), CompileError> {
+        for node in stmts {
+            self.compile_stmt(&node.stmt)?;
         }
         Ok(())
     }
@@ -1243,7 +1243,7 @@ impl Compiler {
         name: &str,
         params: &[rhp_parser::Param],
         variadic: Option<&str>,
-        body: &[Stmt],
+        body: &[StmtNode],
     ) -> Result<u32, CompileError> {
         let mut seen = std::collections::HashSet::new();
         let mut names = Vec::with_capacity(params.len());
@@ -1307,7 +1307,12 @@ impl Compiler {
     /// indice, como um `while` com incremento. `VAR` e declarada a cada
     /// iteracao no escopo do corpo. `break` fecha corpo + laco; `continue`
     /// salta ao incremento.
-    fn compile_for(&mut self, var: &str, iter: &Expr, body: &[Stmt]) -> Result<(), CompileError> {
+    fn compile_for(
+        &mut self,
+        var: &str,
+        iter: &Expr,
+        body: &[StmtNode],
+    ) -> Result<(), CompileError> {
         self.emit_scope_open();
         let for_depth = self.scopes.len();
         let list_name = self.hidden_for_name("lista");
@@ -1384,7 +1389,7 @@ impl Compiler {
     /// `try`: caminho normal ou desvio abrupto). Codigo de corpo e neutro
     /// na pilha de operandos; `break`/`continue`/`return` dentro da copia
     /// nao disparam nova duplicacao (substituem o fluxo em curso).
-    fn emit_finally_copy(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
+    fn emit_finally_copy(&mut self, body: &[StmtNode]) -> Result<(), CompileError> {
         self.emit_scope_open();
         self.emitting_finally += 1;
         let saved = self.scopes.clone();
@@ -1407,7 +1412,7 @@ impl Compiler {
         // Do mais interno para fora. `TryEnd` marca o handler como
         // consumido NESTE caminho: copias de `finally` emitidas a seguir
         // (que podem conter novos desvios) nao o repetem.
-        let mut copies: Vec<Vec<Stmt>> = Vec::new();
+        let mut copies: Vec<Vec<StmtNode>> = Vec::new();
         let mut i = self.pending_trys.len();
         while i > 0 {
             i -= 1;
@@ -1447,10 +1452,10 @@ impl Compiler {
     /// `finally` via `emit_abrupt_exits` (braco respectivo).
     fn compile_try(
         &mut self,
-        body: &[Stmt],
+        body: &[StmtNode],
         catch_var: &Option<String>,
-        catch_body: &Option<Vec<Stmt>>,
-        finally_body: &Option<Vec<Stmt>>,
+        catch_body: &Option<Vec<StmtNode>>,
+        finally_body: &Option<Vec<StmtNode>>,
     ) -> Result<(), CompileError> {
         let handler_jump = self.emit(Op::TryBegin(u32::MAX));
         self.emit_scope_open();
@@ -1508,8 +1513,8 @@ impl Compiler {
     fn compile_if(
         &mut self,
         cond: &Expr,
-        then_branch: &[Stmt],
-        else_branch: &Option<Vec<Stmt>>,
+        then_branch: &[StmtNode],
+        else_branch: &Option<Vec<StmtNode>>,
     ) -> Result<(), CompileError> {
         self.compile_expr(cond)?;
         let else_jump = self.emit(Op::JumpIfFalse(u32::MAX));
@@ -1818,14 +1823,14 @@ impl Compiler {
     /// `cond` ausente = sempre verdadeiro.
     fn compile_for_c(
         &mut self,
-        init: &Option<Box<Stmt>>,
+        init: &Option<Box<StmtNode>>,
         cond: &Option<Expr>,
-        step: &Option<Box<Stmt>>,
-        body: &[Stmt],
+        step: &Option<Box<StmtNode>>,
+        body: &[StmtNode],
     ) -> Result<(), CompileError> {
         self.emit_scope_open();
         if let Some(init) = init {
-            self.compile_stmt(init)?;
+            self.compile_stmt(&init.stmt)?;
         }
         let loop_start = self.chunk.code.len() as u32;
         let exit_jump = match cond {
@@ -1851,7 +1856,7 @@ impl Compiler {
         let continue_target = self.chunk.code.len() as u32;
         self.emit_scope_close()?;
         if let Some(step) = step {
-            self.compile_stmt(step)?;
+            self.compile_stmt(&step.stmt)?;
         }
         self.emit(Op::Jump(loop_start));
         let exit_target = self.chunk.code.len() as u32;
@@ -2297,8 +2302,8 @@ impl Compiler {
 /// Indica se a execucao nunca passa do fim desta lista de instrucoes
 /// (termina em `break`, `continue` ou `return`, considerando `if`/`{}`).
 /// Usado para nao emitir fechamento de escopo em codigo inalancavel.
-fn diverges(stmts: &[Stmt]) -> bool {
-    match stmts.last() {
+fn diverges(nodes: &[StmtNode]) -> bool {
+    match nodes.last().map(|node| &node.stmt) {
         Some(Stmt::Break)
         | Some(Stmt::BreakN(_))
         | Some(Stmt::Continue)
@@ -2342,9 +2347,10 @@ mod tests {
     #[test]
     fn compiles_echo_hello() {
         let program = Program {
-            statements: vec![Stmt::Echo {
+            statements: vec![StmtNode::from(Stmt::Echo {
                 expr: Expr::StringLiteral("Hello from RHP!".to_string()),
-            }],
+            })],
+            trailing_comments: vec![],
         };
         let chunk = compile(&program).expect("compile deve passar");
         assert_eq!(
@@ -2356,7 +2362,11 @@ mod tests {
 
     #[test]
     fn compiles_empty_program_to_halt_only() {
-        let chunk = compile(&Program { statements: vec![] }).expect("deve passar");
+        let chunk = compile(&Program {
+            statements: vec![],
+            trailing_comments: vec![],
+        })
+        .expect("deve passar");
         assert!(chunk.constants.is_empty());
         assert_eq!(chunk.code, vec![Op::Halt]);
     }

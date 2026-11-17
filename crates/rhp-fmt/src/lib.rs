@@ -6,20 +6,45 @@
 //! `format(parse(format(p))) == format(p)`.
 
 use rhp_parser::{
-    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, Param, Program, Stmt, UnaryOp,
+    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, Param, Program, Stmt, StmtNode, UnaryOp,
 };
 use std::fmt::Write as _;
 
 /// Formata o programa no estilo canonico.
 ///
-/// A saida termina sempre com exatamente um `\n` (programa vazio => `""`).
+/// Comentarios e linhas em branco (Etapa 4): cada statement reemite seus
+/// `leading` (um por linha), `trailing` (fim da linha final) e ate uma
+/// linha em branco antes; comentarios apos o ultimo statement vao ao fim.
+/// Idempotente: `format(parse(format(p))) == format(p)`.
 #[must_use]
 pub fn format(program: &Program) -> String {
     let mut out = String::new();
-    for stmt in &program.statements {
-        fmt_stmt(stmt, 0, &mut out);
+    for (i, node) in program.statements.iter().enumerate() {
+        fmt_node(node, 0, i > 0, &mut out);
+    }
+    for text in &program.trailing_comments {
+        let _ = writeln!(out, "//{text}");
     }
     out
+}
+
+/// Statement com decoracao (comentarios + linha em branco).
+fn fmt_node(node: &StmtNode, level: usize, not_first: bool, out: &mut String) {
+    if not_first && node.blank_before {
+        out.push('\n');
+    }
+    for text in &node.leading {
+        indent(level, out);
+        let _ = writeln!(out, "//{text}");
+    }
+    fmt_stmt(&node.stmt, level, out);
+    if let Some(text) = node.trailing.as_ref() {
+        // Todo braco de `fmt_stmt` termina a linha com `\n`: reinsere o
+        // comentario de fim de linha antes dela.
+        debug_assert!(out.ends_with('\n'));
+        out.pop();
+        let _ = writeln!(out, " //{text}");
+    }
 }
 
 /// Formata fonte RHP (atalho lex+parse+format).
@@ -278,7 +303,7 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             // `def` e `fn`/`let`/`const`: formata sem indentacao extra e
             // troca a quebra final por `;`/bloco na mesma linha logica.
             let mut inner = String::new();
-            fmt_stmt(def, 0, &mut inner);
+            fmt_node(def, 0, false, &mut inner);
             let inner = inner.trim_end();
             let _ = writeln!(out, "{inner}");
         }
@@ -296,9 +321,9 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
     }
 }
 
-fn fmt_block(stmts: &[Stmt], level: usize, out: &mut String) {
-    for stmt in stmts {
-        fmt_stmt(stmt, level, out);
+fn fmt_block(stmts: &[StmtNode], level: usize, out: &mut String) {
+    for (i, node) in stmts.iter().enumerate() {
+        fmt_node(node, level, i > 0, out);
     }
 }
 
@@ -328,15 +353,15 @@ fn fmt_stmt_one_line(stmt: &Stmt) -> String {
 
 /// Cabecalho `for init; cond; passo` (partes vazias ok; RFC 0008).
 fn fmt_for_c_head(
-    init: &Option<Box<Stmt>>,
+    init: &Option<Box<StmtNode>>,
     cond: &Option<Expr>,
-    step: &Option<Box<Stmt>>,
+    step: &Option<Box<StmtNode>>,
 ) -> String {
     let mut head = String::from("for");
     match init {
-        Some(stmt) => {
+        Some(node) => {
             head.push(' ');
-            head.push_str(&fmt_stmt_one_line(stmt));
+            head.push_str(&fmt_stmt_one_line(&node.stmt));
         }
         None => head.push_str(" ;"),
     }
@@ -348,9 +373,13 @@ fn fmt_for_c_head(
         }
         None => head.push_str(" ;"),
     }
-    if let Some(stmt) = step {
+    if let Some(node) = step {
         head.push(' ');
-        head.push_str(fmt_stmt_one_line(stmt).trim_end_matches(';').trim_end());
+        head.push_str(
+            fmt_stmt_one_line(&node.stmt)
+                .trim_end_matches(';')
+                .trim_end(),
+        );
     }
     head
 }
@@ -792,5 +821,43 @@ mod tests {
     #[test]
     fn reports_syntax_errors() {
         assert!(format_source("echo \"x\"").is_err());
+    }
+
+    #[test]
+    fn preserves_line_comments() {
+        // Etapa 4: comentarios de linha propria, trailing e de fim de
+        // arquivo sobrevivem ao fmt, na ordem relativa.
+        let src = "// cabecalho\nlet x = 1; // fim da linha\necho x;\n// eof\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "// cabecalho\nlet x = 1; // fim da linha\necho x;\n// eof\n"
+        );
+        check_idempotent(src);
+    }
+
+    #[test]
+    fn preserves_comments_in_blocks() {
+        let src = "if true {\n  // dentro\n  echo 1;\n} // fim\n";
+        let out = fmt(src);
+        assert_eq!(out, "if true {\n  // dentro\n  echo 1;\n} // fim\n");
+        check_idempotent(src);
+    }
+
+    #[test]
+    fn preserves_single_blank_line() {
+        let src = "echo 1;\n\n\necho 2;\n";
+        assert_eq!(fmt(src), "echo 1;\n\necho 2;\n");
+        check_idempotent(src);
+    }
+
+    #[test]
+    fn comments_do_not_change_semantics() {
+        // Mesmo AST com e sem comentarios (comparacao estrutural).
+        let with = rhp_parser::parse_source("// c\necho 1; // t\n").expect("parse deve passar");
+        let without = rhp_parser::parse_source("echo 1;\n").expect("parse deve passar");
+        let ws: Vec<_> = with.statements.iter().map(|n| &n.stmt).collect();
+        let wo: Vec<_> = without.statements.iter().map(|n| &n.stmt).collect();
+        assert_eq!(ws, wo);
     }
 }

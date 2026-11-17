@@ -58,12 +58,54 @@
 //! ```
 
 use rhp_lexer::{Token, TokenKind};
+use std::cell::{Cell, RefCell};
 use std::fmt;
 
 /// Programa RHP: sequencia de instrucoes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
-    pub statements: Vec<Stmt>,
+    pub statements: Vec<StmtNode>,
+    /// Comentarios `//` apos o ultimo statement (nunca perdidos; Etapa 4).
+    pub trailing_comments: Vec<String>,
+}
+
+/// Statement com comentarios e espacamento associados (Etapa 4, DevX).
+///
+/// O `fmt` os reemite na mesma ordem relativa sem precisar de spans na
+/// AST: a associacao e por ordem de statement, nao por linha.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StmtNode {
+    /// Comentarios `//` de linha propria que precedem o statement.
+    pub leading: Vec<String>,
+    /// Comentario `//` na mesma linha do fim do statement, se houver.
+    pub trailing: Option<String>,
+    /// Linha em branco antes (o `fmt` preserva no maximo 1).
+    pub blank_before: bool,
+    pub stmt: Stmt,
+}
+
+/// Igualdade estrutural ignorando comentarios (Etapa 4): permite aos
+/// testes legados comparar `Vec<StmtNode>` com arvores `Stmt` puras via
+/// `assert_eq!`. A comparacao desce recursivamente (corpos aninhados usam
+/// o mesmo `impl` atraves do `PartialEq` cruzado de `Vec`).
+impl PartialEq<Stmt> for StmtNode {
+    fn eq(&self, other: &Stmt) -> bool {
+        self.stmt == *other
+    }
+}
+
+/// Statement sem comentarios (sub-parses que nao passam por `parse_stmt`,
+/// nos sinteticos da VM, arvores esperadas nos testes). Comentarios ali
+/// dentro sao preservados via o proximo statement.
+impl From<Stmt> for StmtNode {
+    fn from(stmt: Stmt) -> Self {
+        StmtNode {
+            leading: Vec::new(),
+            trailing: None,
+            blank_before: false,
+            stmt,
+        }
+    }
 }
 
 /// Instrucao do RHP.
@@ -107,12 +149,12 @@ pub enum Stmt {
     },
     If {
         cond: Expr,
-        then_branch: Vec<Stmt>,
-        else_branch: Option<Vec<Stmt>>,
+        then_branch: Vec<StmtNode>,
+        else_branch: Option<Vec<StmtNode>>,
     },
     While {
         cond: Expr,
-        body: Vec<Stmt>,
+        body: Vec<StmtNode>,
     },
     /// `for VAR in ITER BLOCO` — itera elementos de array ou chaves
     /// ordenadas de mapa. `ITER` e avaliado uma vez (snapshot por valor);
@@ -121,16 +163,16 @@ pub enum Stmt {
     For {
         var: String,
         iter: Expr,
-        body: Vec<Stmt>,
+        body: Vec<StmtNode>,
     },
     /// `for init; cond; passo { corpo }` (partes opcionais; RFC 0008).
     /// `init`/`passo`: qualquer statement (`None` = ausente);
     /// `cond`: `None` = `true`. Compilacao propria: `continue` salta ao passo.
     ForC {
-        init: Option<Box<Stmt>>,
+        init: Option<Box<StmtNode>>,
         cond: Option<Expr>,
-        step: Option<Box<Stmt>>,
-        body: Vec<Stmt>,
+        step: Option<Box<StmtNode>>,
+        body: Vec<StmtNode>,
     },
     /// `switch EXPR { (case EXPR { ... } | default { ... })* }` (RFC 0004).
     /// Comparacao frouxa `==`, fallthrough, `default` unico em qualquer
@@ -144,10 +186,10 @@ pub enum Stmt {
     /// Ao menos um de `catch`/`finally` e obrigatorio (checado no parse).
     /// `catch` presente com corpo vazio (`catch e { }`) consome o erro.
     Try {
-        body: Vec<Stmt>,
+        body: Vec<StmtNode>,
         catch_var: Option<String>,
-        catch_body: Option<Vec<Stmt>>,
-        finally_body: Option<Vec<Stmt>>,
+        catch_body: Option<Vec<StmtNode>>,
+        finally_body: Option<Vec<StmtNode>>,
     },
     /// `throw EXPR;` — lanca o valor como erro (RFC 0001).
     Throw {
@@ -158,7 +200,7 @@ pub enum Stmt {
         params: Vec<Param>,
         /// `...rest` (no maximo um, por ultimo; RFC 0006).
         variadic: Option<String>,
-        body: Vec<Stmt>,
+        body: Vec<StmtNode>,
     },
     Return {
         expr: Option<Expr>,
@@ -183,9 +225,9 @@ pub enum Stmt {
     /// O linker extrai o nome e remove o marcador; compilar um `Export`
     /// direto da erro (defesa em profundidade).
     Export {
-        def: Box<Stmt>,
+        def: Box<StmtNode>,
     },
-    Block(Vec<Stmt>),
+    Block(Vec<StmtNode>),
     ExprStmt {
         expr: Expr,
     },
@@ -210,7 +252,7 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwitchCase {
     pub cond: Option<Expr>,
-    pub body: Vec<Stmt>,
+    pub body: Vec<StmtNode>,
 }
 
 /// Alvo de atribuicao: variavel ou elemento `nome[indice]` (um nivel).
@@ -315,7 +357,7 @@ pub struct ClosureData {
     pub params: Vec<Param>,
     /// `...rest` (no maximo um, por ultimo; RFC 0006).
     pub variadic: Option<String>,
-    pub body: Vec<Stmt>,
+    pub body: Vec<StmtNode>,
 }
 
 /// Operador binario.
@@ -376,8 +418,13 @@ impl std::error::Error for ParseError {}
 
 struct Cursor<'a> {
     tokens: &'a [Token],
-    pos: usize,
+    pos: Cell<usize>,
     depth: u32,
+    /// Comentarios `//` pulados (linha, texto), drenados por statement.
+    /// `RefCell`/`Cell` para `peek` continuar `&self` (Etapa 4).
+    pending: RefCell<Vec<(usize, String)>>,
+    /// Linha do ultimo token consumido (0 = nenhum; Etapa 4).
+    last_line: Cell<usize>,
 }
 
 /// Profundidade sintatica maxima (protecao contra estouro de pilha com
@@ -390,24 +437,77 @@ impl<'a> Cursor<'a> {
     fn new(tokens: &'a [Token]) -> Self {
         Self {
             tokens,
-            pos: 0,
+            pos: Cell::new(0),
             depth: 0,
+            pending: RefCell::new(Vec::new()),
+            last_line: Cell::new(0),
+        }
+    }
+
+    /// Pula comentarios `//` coletando-os em `pending` (ordem do fonte).
+    fn skip_comments(&self) {
+        while let Some(tok) = self.tokens.get(self.pos.get()) {
+            match &tok.kind {
+                TokenKind::Comment(text) => {
+                    self.pending.borrow_mut().push((tok.line, text.clone()));
+                    self.pos.set(self.pos.get() + 1);
+                }
+                _ => break,
+            }
         }
     }
 
     fn peek(&self) -> Option<&'a Token> {
-        self.tokens.get(self.pos)
+        self.skip_comments();
+        self.tokens.get(self.pos.get())
     }
 
     /// Lookahead de N tokens (para desambiguar `for x in` vs `for init;`).
+    /// Pula comentarios sem consumi-los (coleta acontece no `peek`/`next`).
     fn peek_at(&self, offset: usize) -> Option<&'a Token> {
-        self.tokens.get(self.pos + offset)
+        let mut idx = self.pos.get();
+        let mut seen = 0;
+        loop {
+            let tok = self.tokens.get(idx)?;
+            if matches!(tok.kind, TokenKind::Comment(_)) {
+                idx += 1;
+                continue;
+            }
+            if seen == offset {
+                return Some(tok);
+            }
+            seen += 1;
+            idx += 1;
+        }
     }
 
     fn next(&mut self) -> Option<&'a Token> {
-        let tok = self.tokens.get(self.pos)?;
-        self.pos += 1;
+        self.skip_comments();
+        let tok = self.tokens.get(self.pos.get())?;
+        self.pos.set(self.pos.get() + 1);
+        self.last_line.set(tok.line);
         Some(tok)
+    }
+
+    /// Linha do ultimo token consumido (0 se nenhum).
+    fn last_consumed_line(&self) -> usize {
+        self.last_line.get()
+    }
+
+    /// Drena comentarios pendentes, opcionalmente so os da `line`.
+    /// Devolve `(linha, texto)` para o chamador decidir o vinculo.
+    fn take_pending(&self, line: Option<usize>) -> Vec<(usize, String)> {
+        let mut pending = self.pending.borrow_mut();
+        let mut out = Vec::new();
+        pending.retain(|(l, text)| {
+            if line.is_none_or(|want| *l == want) {
+                out.push((*l, text.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        out
     }
 
     fn end_pos(&self) -> (usize, usize) {
@@ -491,11 +591,46 @@ pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
         statements.push(parse_stmt(&mut cursor)?);
     }
 
-    Ok(Program { statements })
+    Ok(Program {
+        statements,
+        trailing_comments: cursor
+            .take_pending(None)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect(),
+    })
 }
 
-fn parse_stmt(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
-    cursor.nest("instrucao", parse_stmt_inner)
+fn parse_stmt(cursor: &mut Cursor<'_>) -> Result<StmtNode, ParseError> {
+    // Linha em branco antes: linhas vazias entre o ultimo token consumido
+    // e o primeiro deste statement, descontando as dos comentarios
+    // precedentes (cada `//` ocupa exatamente a sua linha).
+    let prev = cursor.last_consumed_line();
+    let first = cursor.peek().map(|t| t.line).unwrap_or(prev + 1);
+    let pending = cursor.take_pending(None);
+    let in_range = pending
+        .iter()
+        .filter(|(l, _)| *l > prev && *l < first)
+        .count();
+    let blank_before = first
+        .saturating_sub(prev)
+        .saturating_sub(1)
+        .saturating_sub(in_range)
+        > 0;
+    let leading: Vec<String> = pending.into_iter().map(|(_, text)| text).collect();
+    let stmt = cursor.nest("instrucao", parse_stmt_inner)?;
+    // Forca a coleta do que segue (o `peek` pula comentarios para
+    // `pending`); o comentario na mesma linha do fim e trailing deste
+    // statement, o resto fica pendente para o proximo.
+    let _ = cursor.peek();
+    let end = cursor.last_consumed_line();
+    let trailing = cursor.take_pending(Some(end)).pop().map(|(_, text)| text);
+    Ok(StmtNode {
+        leading,
+        trailing,
+        blank_before,
+        stmt,
+    })
 }
 
 fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -848,9 +983,9 @@ fn parse_for_c(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         None
     } else {
         match cursor.peek().map(|t| &t.kind) {
-            Some(TokenKind::Let) => Some(Box::new(parse_let(cursor)?)),
-            Some(TokenKind::Const) => Some(Box::new(parse_const(cursor)?)),
-            _ => Some(Box::new(parse_assign_or_expr_stmt(cursor)?)),
+            Some(TokenKind::Let) => Some(Box::new(StmtNode::from(parse_let(cursor)?))),
+            Some(TokenKind::Const) => Some(Box::new(StmtNode::from(parse_const(cursor)?))),
+            _ => Some(Box::new(StmtNode::from(parse_assign_or_expr_stmt(cursor)?))),
         }
     };
     let cond = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Semicolon)) {
@@ -907,12 +1042,12 @@ fn parse_for_c(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
             };
             cursor.next(); // consome `=`
             let value = parse_expr(cursor)?;
-            Some(Box::new(Stmt::Assign {
+            Some(Box::new(StmtNode::from(Stmt::Assign {
                 target,
                 expr: value,
-            }))
+            })))
         } else {
-            Some(Box::new(Stmt::ExprStmt { expr }))
+            Some(Box::new(StmtNode::from(Stmt::ExprStmt { expr })))
         }
     };
     let body = parse_block(cursor)?;
@@ -1097,7 +1232,7 @@ fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
     let body = parse_block(cursor)?;
     let mut catch_var = None;
-    let mut catch_body: Option<Vec<Stmt>> = None;
+    let mut catch_body: Option<Vec<StmtNode>> = None;
     if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Catch)) {
         cursor.next();
         // `catch` com ou sem variavel: `catch e { }` ou `catch { }`.
@@ -1143,7 +1278,7 @@ fn parse_fn_body(
         return Ok(Expr::Closure(Box::new(ClosureData {
             params,
             variadic,
-            body: vec![Stmt::Return { expr: Some(value) }],
+            body: vec![StmtNode::from(Stmt::Return { expr: Some(value) })],
         })));
     }
     let body = parse_block(cursor)?;
@@ -1559,10 +1694,12 @@ fn parse_export(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
             ));
         }
     };
-    Ok(Stmt::Export { def: Box::new(def) })
+    Ok(Stmt::Export {
+        def: Box::new(StmtNode::from(def)),
+    })
 }
 
-fn parse_block(cursor: &mut Cursor<'_>) -> Result<Vec<Stmt>, ParseError> {
+fn parse_block(cursor: &mut Cursor<'_>) -> Result<Vec<StmtNode>, ParseError> {
     expect_token(cursor, &TokenKind::LBrace, "esperado `{`")?;
     let mut statements = Vec::new();
     loop {
@@ -2064,6 +2201,9 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::LtEq => "`<=`".to_string(),
         TokenKind::Gt => "`>`".to_string(),
         TokenKind::GtEq => "`>=`".to_string(),
+        // Inalcancavel na pratica (o `Cursor` filtra comentarios), mas o
+        // match precisa ser exaustivo.
+        TokenKind::Comment(_) => "comentario".to_string(),
     }
 }
 
@@ -2090,12 +2230,10 @@ mod tests {
     fn parses_echo_hello() {
         let program = lex_and_parse("echo \"Hello from RHP!\";").expect("parse deve passar");
         assert_eq!(
-            program,
-            Program {
-                statements: vec![Stmt::Echo {
-                    expr: Expr::StringLiteral("Hello from RHP!".to_string()),
-                }],
-            }
+            program.statements,
+            vec![Stmt::Echo {
+                expr: Expr::StringLiteral("Hello from RHP!".to_string()),
+            }],
         );
     }
 
@@ -2116,7 +2254,7 @@ mod tests {
         // `1 + 2 * 3` => Add(1, Mul(2, 3))
         let program = lex_and_parse("echo 1 + 2 * 3;").expect("parse deve passar");
         assert_eq!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Echo {
                 expr: Expr::Binary {
                     op: BinOp::Add,
@@ -2134,7 +2272,7 @@ mod tests {
     #[test]
     fn parses_parens_and_unary() {
         let program = lex_and_parse("echo -(1 + 2) * -3;").expect("parse deve passar");
-        assert!(matches!(program.statements[0], Stmt::Echo { expr: _ }));
+        assert!(matches!(program.statements[0].stmt, Stmt::Echo { expr: _ }));
     }
 
     #[test]
@@ -2210,13 +2348,13 @@ mod tests {
         .expect("parse deve passar");
         assert_eq!(program.statements.len(), 2);
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::If {
                 else_branch: Some(_),
                 ..
             }
         ));
-        assert!(matches!(program.statements[1], Stmt::While { .. }));
+        assert!(matches!(program.statements[1].stmt, Stmt::While { .. }));
     }
 
     #[test]
@@ -2227,9 +2365,9 @@ mod tests {
             vec![Stmt::For {
                 var: "x".to_string(),
                 iter: Expr::Array(vec![Expr::Int(1), Expr::Int(2)]),
-                body: vec![Stmt::Echo {
+                body: vec![StmtNode::from(Stmt::Echo {
                     expr: Expr::Var("x".to_string()),
-                }],
+                })],
             }]
         );
     }
@@ -2247,21 +2385,21 @@ mod tests {
                 cases: vec![
                     SwitchCase {
                         cond: Some(Expr::Int(1)),
-                        body: vec![Stmt::Echo {
+                        body: vec![StmtNode::from(Stmt::Echo {
                             expr: Expr::StringLiteral("a".to_string()),
-                        }],
+                        })],
                     },
                     SwitchCase {
                         cond: None,
-                        body: vec![Stmt::Echo {
+                        body: vec![StmtNode::from(Stmt::Echo {
                             expr: Expr::StringLiteral("d".to_string()),
-                        }],
+                        })],
                     },
                     SwitchCase {
                         cond: Some(Expr::Int(2)),
-                        body: vec![Stmt::Echo {
+                        body: vec![StmtNode::from(Stmt::Echo {
                             expr: Expr::StringLiteral("b".to_string()),
-                        }],
+                        })],
                     },
                 ],
             }]
@@ -2311,15 +2449,15 @@ mod tests {
                     },
                 ],
                 variadic: Some("rest".to_string()),
-                body: vec![Stmt::Return {
+                body: vec![StmtNode::from(Stmt::Return {
                     expr: Some(Expr::Var("a".to_string())),
-                }],
+                })],
             }]
         );
         // Closure aceita a mesma forma.
         let program =
             lex_and_parse("let f = fn (a = \"x\") { return a; };").expect("parse deve passar");
-        match &program.statements[0] {
+        match &program.statements[0].stmt {
             Stmt::Let {
                 init: Some(Expr::Closure(data)),
                 ..
@@ -2388,13 +2526,13 @@ mod tests {
                 params: vec![],
                 variadic: None,
                 body: vec![
-                    Stmt::Static {
+                    StmtNode::from(Stmt::Static {
                         name: "n".to_string(),
                         init: Expr::Int(0),
-                    },
-                    Stmt::Return {
+                    }),
+                    StmtNode::from(Stmt::Return {
                         expr: Some(Expr::Var("n".to_string())),
-                    },
+                    }),
                 ],
             }]
         );
@@ -2446,7 +2584,7 @@ mod tests {
         let program = lex_and_parse("let x = match v { 1 => \"um\", _ => \"outro\" };")
             .expect("parse deve passar");
         // `_` nao e default: e variavel; valor e `match` com 2 bracos.
-        match &program.statements[0] {
+        match &program.statements[0].stmt {
             Stmt::Let {
                 init: Some(Expr::Match { arms, .. }),
                 ..
@@ -2479,7 +2617,7 @@ mod tests {
         );
         // Arrow vira closure com `return` unico.
         let program = lex_and_parse("let f = fn (x) => x + 1;").expect("parse deve passar");
-        match &program.statements[0] {
+        match &program.statements[0].stmt {
             Stmt::Let {
                 init: Some(Expr::Closure(data)),
                 ..
@@ -2503,15 +2641,15 @@ mod tests {
     fn parses_for_c_and_break_levels() {
         let program =
             lex_and_parse("for i = 0; i < 3; i = i + 1 { echo i; }").expect("parse deve passar");
-        assert!(matches!(program.statements[0], Stmt::ForC { .. }));
+        assert!(matches!(program.statements[0].stmt, Stmt::ForC { .. }));
         let program = lex_and_parse("for ;; { break; }").expect("deve passar");
-        assert!(matches!(program.statements[0], Stmt::ForC { .. }));
+        assert!(matches!(program.statements[0].stmt, Stmt::ForC { .. }));
         // `for x in` continua for-in (lookahead preservado).
         let program = lex_and_parse("for x in [1] { echo x; }").expect("deve passar");
-        assert!(matches!(program.statements[0], Stmt::For { .. }));
+        assert!(matches!(program.statements[0].stmt, Stmt::For { .. }));
         // Niveis.
         let program = lex_and_parse("while true { break 2; }").expect("deve passar");
-        assert!(matches!(program.statements[0], Stmt::While { .. }));
+        assert!(matches!(program.statements[0].stmt, Stmt::While { .. }));
         let program = lex_and_parse("break 2;").expect("deve passar");
         assert_eq!(program.statements, vec![Stmt::BreakN(2)]);
         let program = lex_and_parse("continue;").expect("deve passar");
@@ -2524,7 +2662,7 @@ mod tests {
     fn keeps_in_as_plain_identifier_elsewhere() {
         // `in` so tem sentido apos `for VAR`; no resto, e identificador comum.
         let program = lex_and_parse("let in = 1; echo in;").expect("parse deve passar");
-        assert!(matches!(program.statements[0], Stmt::Let { .. }));
+        assert!(matches!(program.statements[0].stmt, Stmt::Let { .. }));
     }
 
     #[test]
@@ -2552,8 +2690,8 @@ mod tests {
         let program = lex_and_parse("fn soma(a, b) { return a + b; } echo soma(1, 2);")
             .expect("parse deve passar");
         assert_eq!(program.statements.len(), 2);
-        assert!(matches!(program.statements[0], Stmt::FnDef { .. }));
-        assert!(matches!(program.statements[1], Stmt::Echo { .. }));
+        assert!(matches!(program.statements[0].stmt, Stmt::FnDef { .. }));
+        assert!(matches!(program.statements[1].stmt, Stmt::Echo { .. }));
     }
 
     #[test]
@@ -2561,7 +2699,7 @@ mod tests {
         // `let f = fn (x) { return x; };`
         let program = lex_and_parse("let f = fn (x) { return x; };").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Let {
                 init: Some(Expr::Closure(_)),
                 ..
@@ -2570,7 +2708,7 @@ mod tests {
         // Chamada direta de literal: IIFE.
         let program = lex_and_parse("echo (fn (x) { return x; })(41);").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Echo {
                 expr: Expr::CallValue { .. }
             }
@@ -2578,7 +2716,7 @@ mod tests {
         // `f(x)` direto continua `Call` (precedencia de builtins).
         let program = lex_and_parse("echo soma(1);").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Echo {
                 expr: Expr::Call { .. }
             }
@@ -2586,7 +2724,7 @@ mod tests {
         // Chamada encadeada e por indice: `CallValue`.
         let program = lex_and_parse("echo f(1)(2);").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Echo {
                 expr: Expr::CallValue { .. }
             }
@@ -2648,7 +2786,7 @@ mod tests {
         // `1 | 2 & 3` => BitOr(1, BitAnd(2, 3)); `1 + 2 << 3` => Shl(Add(1,2),3)
         let program = lex_and_parse("echo 1 | 2 & 3;").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Echo {
                 expr: Expr::Binary {
                     op: BinOp::BitOr,
@@ -2658,7 +2796,7 @@ mod tests {
         ));
         let program = lex_and_parse("echo 1 + 2 << 3;").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Echo {
                 expr: Expr::Binary { op: BinOp::Shl, .. }
             }
@@ -2669,14 +2807,14 @@ mod tests {
     fn parses_ternary_and_null_coalescing() {
         let program = lex_and_parse("echo true ? 1 : 2;").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Echo {
                 expr: Expr::Ternary { .. }
             }
         ));
         let program = lex_and_parse("echo a ?? b;").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Echo {
                 expr: Expr::Binary {
                     op: BinOp::NullCoalesce,
@@ -2691,14 +2829,17 @@ mod tests {
         let program = lex_and_parse("while true { break; } while true { continue; } const N = 10;")
             .expect("parse deve passar");
         assert_eq!(program.statements.len(), 3);
-        assert!(matches!(program.statements[0], Stmt::While { .. }));
-        assert!(matches!(program.statements[2], Stmt::Const { .. }));
+        assert!(matches!(program.statements[0].stmt, Stmt::While { .. }));
+        assert!(matches!(program.statements[2].stmt, Stmt::Const { .. }));
     }
 
     #[test]
     fn parses_import() {
         let program = lex_and_parse("import \"lib.rhp\"; echo 1;").expect("parse deve passar");
-        assert_eq!(program.statements[0], Stmt::Import("lib.rhp".to_string()));
+        assert_eq!(
+            program.statements[0].stmt,
+            Stmt::Import("lib.rhp".to_string())
+        );
     }
 
     #[test]
@@ -2710,12 +2851,12 @@ mod tests {
             program.statements,
             vec![
                 Stmt::Try {
-                    body: vec![Stmt::Echo { expr: Expr::Int(1) }],
+                    body: vec![StmtNode::from(Stmt::Echo { expr: Expr::Int(1) })],
                     catch_var: Some("e".to_string()),
-                    catch_body: Some(vec![Stmt::Echo {
+                    catch_body: Some(vec![StmtNode::from(Stmt::Echo {
                         expr: Expr::Var("e".to_string()),
-                    }]),
-                    finally_body: Some(vec![Stmt::Echo { expr: Expr::Int(2) }]),
+                    })]),
+                    finally_body: Some(vec![StmtNode::from(Stmt::Echo { expr: Expr::Int(2) })]),
                 },
                 Stmt::Throw {
                     expr: Expr::StringLiteral("x".to_string()),
@@ -2726,7 +2867,7 @@ mod tests {
         let program =
             lex_and_parse("try { echo 1; } catch { echo 2; }").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Try {
                 catch_var: None,
                 finally_body: None,
@@ -2736,7 +2877,7 @@ mod tests {
         let program =
             lex_and_parse("try { echo 1; } finally { echo 2; }").expect("parse deve passar");
         assert!(matches!(
-            program.statements[0],
+            program.statements[0].stmt,
             Stmt::Try {
                 catch_var: None,
                 finally_body: Some(_),
@@ -2755,7 +2896,7 @@ mod tests {
     fn parses_export_prefix_and_selective_import() {
         let program = lex_and_parse("export fn dobro(x) { return x; } export let base = 40;")
             .expect("parse deve passar");
-        assert!(matches!(program.statements[0], Stmt::Export { .. }));
+        assert!(matches!(program.statements[0].stmt, Stmt::Export { .. }));
         let program = lex_and_parse("import { dobro, base as b } from \"mat.rhp\";")
             .expect("parse deve passar");
         assert_eq!(

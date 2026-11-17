@@ -12,7 +12,7 @@
 
 use rhp_bytecode::{compile, Value};
 use rhp_parser::Program as AstProgram;
-use rhp_parser::{CallArg, Expr, Program, Stmt};
+use rhp_parser::{CallArg, Expr, Program, Stmt, StmtNode};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -316,7 +316,7 @@ fn preflight(program: &AstProgram, handler: &str) -> Result<(), VmError> {
     let found = program
         .statements
         .iter()
-        .any(|stmt| matches!(stmt, Stmt::FnDef { name, .. } if name == handler));
+        .any(|node| matches!(&node.stmt, Stmt::FnDef { name, .. } if name == handler));
     if !found {
         return Err(VmError::new(format!(
             "`http_serve`: handler `{handler}` nao definido"
@@ -333,19 +333,27 @@ fn synthetic_program(
     handler: &str,
     request: &Value,
 ) -> Result<Program, String> {
-    let mut statements: Vec<Stmt> = program
+    let mut statements: Vec<StmtNode> = program
         .statements
         .iter()
-        .filter(|stmt| matches!(stmt, Stmt::FnDef { .. }))
+        .filter(|node| matches!(&node.stmt, Stmt::FnDef { .. }))
         .cloned()
         .collect();
-    statements.push(Stmt::ExprStmt {
-        expr: Expr::Call {
-            name: handler.to_string(),
-            args: vec![CallArg::Pos(expr_from_value(request)?)],
+    statements.push(StmtNode {
+        leading: Vec::new(),
+        trailing: None,
+        blank_before: false,
+        stmt: Stmt::ExprStmt {
+            expr: Expr::Call {
+                name: handler.to_string(),
+                args: vec![CallArg::Pos(expr_from_value(request)?)],
+            },
         },
     });
-    Ok(Program { statements })
+    Ok(Program {
+        statements,
+        trailing_comments: Vec::new(),
+    })
 }
 
 /// Valor RHP => literal AST (request; `Func` nao atravessa).

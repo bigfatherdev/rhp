@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt};
+use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt, StmtNode};
 
 mod pkg;
 
@@ -669,7 +669,8 @@ pub const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 struct ModuleFile {
     canonical: PathBuf,
     shown: String,
-    statements: Vec<Stmt>,
+    statements: Vec<StmtNode>,
+    trailing_comments: Vec<String>,
     /// Imports na ordem do fonte, ja com caminho resolvido.
     imports: Vec<ResolvedImport>,
     /// Re-exports (`export { } from`) na ordem do fonte, resolvidos.
@@ -712,8 +713,11 @@ fn load_program(entry: &str) -> Result<Program, LoadError> {
         &mut by_canonical,
         &mut modules,
     )?;
-    let statements = link_modules(&modules).map_err(LoadError::Plain)?;
-    Ok(Program { statements })
+    let (statements, trailing_comments) = link_modules(&modules).map_err(LoadError::Plain)?;
+    Ok(Program {
+        statements,
+        trailing_comments,
+    })
 }
 
 /// Resolve uma dependencia (`import` ou re-export): junta ao diretorio base,
@@ -826,6 +830,7 @@ fn collect_module(
         canonical,
         shown,
         statements: program.statements,
+        trailing_comments: program.trailing_comments,
         imports,
         reexports,
     });
@@ -844,7 +849,7 @@ fn collect_module(
 ///   (legado); seletivo so exportados (privacidade real).
 /// - Repetir o mesmo import nao reemite nada; nomes ja vinculados sao
 ///   pulados (colisao real continua erro, como hoje).
-fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
+fn link_modules(modules: &[ModuleFile]) -> Result<(Vec<StmtNode>, Vec<String>), String> {
     let index_of: HashMap<&PathBuf, usize> = modules
         .iter()
         .enumerate()
@@ -856,10 +861,10 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
     // Passo 1: exports + nomes de topo por modulo.
     for (idx, module) in modules.iter().enumerate() {
         for stmt in &module.statements {
-            let def_name = match stmt {
+            let def_name = match &stmt.stmt {
                 Stmt::Let { name, .. } | Stmt::Const { name, .. } => Some(name.clone()),
                 Stmt::FnDef { name, .. } => Some(name.clone()),
-                Stmt::Export { def } => match def.as_ref() {
+                Stmt::Export { def } => match &def.stmt {
                     Stmt::FnDef { name, .. }
                     | Stmt::Let { name, .. }
                     | Stmt::Const { name, .. } => Some(name.clone()),
@@ -884,8 +889,8 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
                 // runtime, como no merge legado.
                 tops[idx].push(name);
             }
-            if let Stmt::Export { def } = stmt {
-                let name = match def.as_ref() {
+            if let Stmt::Export { def } = &stmt.stmt {
+                let name = match &def.stmt {
                     Stmt::FnDef { name, .. }
                     | Stmt::Let { name, .. }
                     | Stmt::Const { name, .. } => name.clone(),
@@ -935,7 +940,8 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
         }
     }
     // Passo 2: prefixos (entry sem prefixo) e fusao em pos-ordem.
-    let mut out: Vec<Stmt> = Vec::new();
+    let mut out: Vec<StmtNode> = Vec::new();
+    let mut trailing: Vec<String> = Vec::new();
     // Nome visivel global -> (modulo de origem, nome original): mesma origem
     // = repeticao (pula, ex.: diamante com a mesma origem); origem distinta
     // = colisao (erro de loader). Global pois aliases vivem no escopo global
@@ -958,23 +964,25 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
         // `bound` e global por nome visivel: aliases vivem no escopo global
         // do bundle (RFC 0011: barris e diamantes com a mesma origem nao
         // reemitem; origem distinta = colisao, erro de loader).
-        let mut emit =
-            |visible: &str, dep: usize, origin: &str, out: &mut Vec<Stmt>| -> Result<(), String> {
-                match bound.get(visible) {
-                    Some((same_dep, same_origin)) if *same_dep == dep && *same_origin == origin => {
-                    }
-                    Some(_) => {
-                        return Err(format!(
-                            "colisao de importacao: `{visible}` ja vinculado (de outro modulo)"
-                        ));
-                    }
-                    None => {
-                        bound.insert(visible.to_string(), (dep, origin.to_string()));
-                        out.push(alias_let(visible, origin));
-                    }
+        let mut emit = |visible: &str,
+                        dep: usize,
+                        origin: &str,
+                        out: &mut Vec<StmtNode>|
+         -> Result<(), String> {
+            match bound.get(visible) {
+                Some((same_dep, same_origin)) if *same_dep == dep && *same_origin == origin => {}
+                Some(_) => {
+                    return Err(format!(
+                        "colisao de importacao: `{visible}` ja vinculado (de outro modulo)"
+                    ));
                 }
-                Ok(())
-            };
+                None => {
+                    bound.insert(visible.to_string(), (dep, origin.to_string()));
+                    out.push(alias_let(visible, origin));
+                }
+            }
+            Ok(())
+        };
         // Atravessa re-exports (RFC 0011): (dep, nome) pode ser um repasse;
         // resolve ate a origem definitiva (cadeia sempre desce de indice).
         let resolve = |mut target: (usize, String),
@@ -1053,15 +1061,21 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
         }
         // Proprios statements: `export` desembrulha a definicao (que e
         // renomeada e fundida como as demais); imports/marcas somem.
-        let own: Vec<Stmt> = module
+        // A decoracao (comentarios) atravessa o renomeador junto (Etapa 4).
+        let own: Vec<StmtNode> = module
             .statements
             .iter()
-            .filter_map(|s| match s {
+            .filter_map(|node| match &node.stmt {
                 Stmt::Import(_) | Stmt::ImportNames { .. } | Stmt::ReExport { .. } => None,
-                Stmt::Export { def } => Some(def.as_ref().clone()),
-                _ => Some(s.clone()),
+                Stmt::Export { def } => {
+                    let mut inner = def.as_ref().clone();
+                    inner.leading = node.leading.iter().chain(&inner.leading).cloned().collect();
+                    Some(inner)
+                }
+                _ => Some(node.clone()),
             })
             .collect();
+        trailing.extend(module.trailing_comments.iter().cloned());
         if is_entry {
             out.extend(own);
         } else {
@@ -1069,7 +1083,7 @@ fn link_modules(modules: &[ModuleFile]) -> Result<Vec<Stmt>, String> {
             out.extend(rename_module(&own, &top_set, &hidden_prefix(idx)));
         }
     }
-    Ok(out)
+    Ok((out, trailing))
 }
 
 /// Nome efetivo no modulo fundido (entry = simples; demais = mangled).
@@ -1081,11 +1095,11 @@ fn mangled_name(dep_idx: usize, original: &str, mangled: &[HashMap<String, Strin
 }
 
 /// `let visivel = origem;` (ponte do linker; sem saida nem efeito).
-fn alias_let(visible: &str, origin: &str) -> Stmt {
-    Stmt::Let {
+fn alias_let(visible: &str, origin: &str) -> StmtNode {
+    StmtNode::from(Stmt::Let {
         name: visible.to_string(),
         init: Some(rhp_parser::Expr::Var(origin.to_string())),
-    }
+    })
 }
 
 /// Prefixo de isolamento entre modulos: identificador valido (para o
@@ -1105,7 +1119,7 @@ const RESERVED_PREFIX: &str = "__rhp_mod_";
 /// Espelha as regras de escopo do compilador: referencias que resolvem
 /// para o topo sao renomeadas; sombras lexicas (`let` interno, params,
 /// var de `for`/`catch`) preservam o nome simples.
-fn rename_module(statements: &[Stmt], top: &HashSet<String>, prefix: &str) -> Vec<Stmt> {
+fn rename_module(statements: &[StmtNode], top: &HashSet<String>, prefix: &str) -> Vec<StmtNode> {
     let mut renamer = Renamer {
         top,
         prefix,
@@ -1156,8 +1170,8 @@ impl Renamer<'_> {
         name.to_string()
     }
 
-    fn stmt(&mut self, stmt: &Stmt) -> Stmt {
-        match stmt {
+    fn stmt(&mut self, node: &StmtNode) -> StmtNode {
+        let stmt = match &node.stmt {
             Stmt::Echo { expr } => Stmt::Echo {
                 expr: self.expr(expr),
             },
@@ -1241,7 +1255,7 @@ impl Renamer<'_> {
                 self.scopes.pop();
                 let else_branch = else_branch.as_ref().map(|branch| {
                     self.scopes.push(HashSet::new());
-                    let renamed: Vec<Stmt> = branch.iter().map(|s| self.stmt(s)).collect();
+                    let renamed: Vec<StmtNode> = branch.iter().map(|s| self.stmt(s)).collect();
                     self.scopes.pop();
                     renamed
                 });
@@ -1373,7 +1387,7 @@ impl Renamer<'_> {
                 };
                 let renamed_finally = finally_body.as_ref().map(|fin| {
                     self.scopes.push(HashSet::new());
-                    let renamed: Vec<Stmt> = fin.iter().map(|s| self.stmt(s)).collect();
+                    let renamed: Vec<StmtNode> = fin.iter().map(|s| self.stmt(s)).collect();
                     self.scopes.pop();
                     renamed
                 });
@@ -1394,8 +1408,14 @@ impl Renamer<'_> {
                 expr: self.expr(expr),
             },
             // O linker remove antes de renomear; defesa em profundidade.
-            Stmt::Import(_) | Stmt::ImportNames { .. } | Stmt::Export { .. } => stmt.clone(),
-            Stmt::ReExport { .. } => stmt.clone(),
+            Stmt::Import(_) | Stmt::ImportNames { .. } | Stmt::Export { .. } => node.stmt.clone(),
+            Stmt::ReExport { .. } => node.stmt.clone(),
+        };
+        StmtNode {
+            leading: node.leading.clone(),
+            trailing: node.trailing.clone(),
+            blank_before: node.blank_before,
+            stmt,
         }
     }
 
@@ -1496,11 +1516,11 @@ type RawImports = Vec<(String, Option<Vec<ImportName>>)>;
 /// Re-exports brutos: (caminho, nomes). `export * from` nao existe (RFC 0011).
 type RawReExports = Vec<(String, Vec<ImportName>)>;
 
-fn collect_imports(statements: &[Stmt]) -> Result<(RawImports, RawReExports), LoadError> {
+fn collect_imports(statements: &[StmtNode]) -> Result<(RawImports, RawReExports), LoadError> {
     let mut imports = Vec::new();
     let mut reexports = Vec::new();
-    for stmt in statements {
-        match stmt {
+    for node in statements {
+        match &node.stmt {
             Stmt::Import(path) => imports.push((path.clone(), None)),
             Stmt::ImportNames { path, names } => imports.push((path.clone(), Some(names.clone()))),
             Stmt::ReExport { path, names } => reexports.push((path.clone(), names.clone())),
@@ -1620,9 +1640,9 @@ fn check_expr_imports(expr: &rhp_parser::Expr) -> Result<(), LoadError> {
     }
 }
 
-fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
-    for stmt in statements {
-        match stmt {
+fn check_no_nested_imports(statements: &[StmtNode]) -> Result<(), LoadError> {
+    for node in statements {
+        match &node.stmt {
             Stmt::Import(_)
             | Stmt::ImportNames { .. }
             | Stmt::Export { .. }
@@ -1648,13 +1668,13 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
                 // `init`/`step` sao `let`/`const`/atribuicao/expressao:
                 // reutiliza o varredor de expressoes.
                 if let Some(init) = init {
-                    check_stmt_expr_imports(init)?;
+                    check_stmt_expr_imports(&init.stmt)?;
                 }
                 if let Some(cond) = cond {
                     check_expr_imports(cond)?;
                 }
                 if let Some(step) = step {
-                    check_stmt_expr_imports(step)?;
+                    check_stmt_expr_imports(&step.stmt)?;
                 }
                 check_block_imports(body, "em `for`")?;
             }
@@ -1696,9 +1716,9 @@ fn check_no_nested_imports(statements: &[Stmt]) -> Result<(), LoadError> {
     Ok(())
 }
 
-fn check_block_imports(body: &[Stmt], context: &str) -> Result<(), LoadError> {
-    for stmt in body {
-        match stmt {
+fn check_block_imports(body: &[StmtNode], context: &str) -> Result<(), LoadError> {
+    for node in body {
+        match &node.stmt {
             Stmt::Import(path) => {
                 return Err(LoadError::Plain(format!(
                     "import {context} nao suportado (`{path}`): use `import` apenas no nivel superior do arquivo"
@@ -1913,7 +1933,7 @@ mod tests {
         let top: Set<String> = ["x".to_string(), "f".to_string()].into_iter().collect();
         let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
         // `fn f(x)` vira `fn M#f(M#x)`? Nao: param `x` e sombra (simples).
-        match &renamed[1] {
+        match &renamed[1].stmt {
             Stmt::FnDef { name, params, .. } => {
                 assert_eq!(name, "__rhp_mod0__f");
                 assert_eq!(
@@ -1924,7 +1944,7 @@ mod tests {
             other => panic!("esperado FnDef, obteve {other:?}"),
         }
         // `echo x` no topo vira `echo M#x`.
-        match &renamed[2] {
+        match &renamed[2].stmt {
             Stmt::Echo { expr } => match expr {
                 rhp_parser::Expr::Var(name) => assert_eq!(name, "__rhp_mod0__x"),
                 other => panic!("esperado Var, obteve {other:?}"),
@@ -2044,7 +2064,7 @@ mod tests {
             .statements;
         let top: Set<String> = ["x".to_string(), "f".to_string()].into_iter().collect();
         let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
-        match &renamed[1] {
+        match &renamed[1].stmt {
             Stmt::Echo { expr } => match expr {
                 rhp_parser::Expr::Call { args, .. } => {
                     assert!(matches!(&args[0],
@@ -2083,8 +2103,8 @@ mod tests {
                 .statements;
         let top: Set<String> = ["t".to_string()].into_iter().collect();
         let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
-        match &renamed[1] {
-            Stmt::ForC { init, .. } => match init.as_deref() {
+        match &renamed[1].stmt {
+            Stmt::ForC { init, .. } => match init.as_deref().map(|n| &n.stmt) {
                 Some(Stmt::Let { name, .. }) => assert_eq!(name, "i"),
                 other => panic!("esperado Let no init, obteve {other:?}"),
             },
@@ -2100,7 +2120,7 @@ mod tests {
             .statements;
         let top: Set<String> = ["x".to_string()].into_iter().collect();
         let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
-        match &renamed[1] {
+        match &renamed[1].stmt {
             Stmt::Destructure { target, init, .. } => {
                 assert!(matches!(
                     init,
@@ -2265,7 +2285,7 @@ mod tests {
         .statements;
         let top: Set<String> = ["x".to_string()].into_iter().collect();
         let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
-        match &renamed[1] {
+        match &renamed[1].stmt {
             Stmt::Switch {
                 discriminant,
                 cases,
@@ -2276,7 +2296,7 @@ mod tests {
                 ));
                 assert_eq!(cases.len(), 2);
                 for case in cases {
-                    assert!(matches!(&case.body[0],
+                    assert!(matches!(&case.body[0].stmt,
                         Stmt::Let { name, .. } if name == "v"));
                 }
             }
@@ -2308,7 +2328,7 @@ mod tests {
             .statements;
         let top: Set<String> = ["x".to_string(), "f".to_string()].into_iter().collect();
         let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
-        match &renamed[1] {
+        match &renamed[1].stmt {
             Stmt::Let {
                 init: Some(expr), ..
             } => match expr {
@@ -2320,7 +2340,7 @@ mod tests {
                             .collect::<Vec<_>>(),
                         ["x".to_string()]
                     );
-                    assert!(matches!(&data.body[0],
+                    assert!(matches!(&data.body[0].stmt,
                         Stmt::Return { expr: Some(rhp_parser::Expr::Var(name)) }
                         if name == "x"));
                 }
