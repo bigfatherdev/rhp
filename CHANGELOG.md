@@ -6,9 +6,8 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Removed
 
-- `RHP_GOVERNANCE.md` (duplicata byte-idêntica de `GOVERNANCE.md`);
-  `RHP_PROMPT_INICIAL_v2.md` restaurado (revert de `5ef8b9a`).
-  Registro: `changes/2026-11-16-docs-restaurar-prompt-limpar-duplicata.md`.
+- `RHP_GOVERNANCE.md` (duplicata byte-idêntica de `GOVERNANCE.md`).
+  Registro: `changes/2026-11-16-docs-remover-governanca-duplicada.md`.
 
 ### Fixed
 

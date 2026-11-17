@@ -1,31 +1,29 @@
-# [Docs] — Restaura prompt inicial, remove governança duplicada
+# [Docs] — Remove governança duplicada
 
-- ID: 2026-11-16-docs-restaurar-prompt-limpar-duplicata
+- ID: 2026-11-16-docs-remover-governanca-duplicada
 - Data: 2026-11-16
 - Versão: unreleased
-- Tipo: Docs (revert + Removed)
+- Tipo: Docs (Removed)
 - Compatibilidade: Compatível (só arquivos `.md` de governança; nenhum
   código, spec normativa ou comportamento alterado)
 
 ## Resumo
 
-Reverte o commit `5ef8b9a` (restaura `RHP_PROMPT_INICIAL_v2.md`) e
-exclui `RHP_GOVERNANCE.md`, que era byte-idêntico a `GOVERNANCE.md`
-sem relevância própria. Inventário completo (123 `.md`): demais
-arquivos (specs, `docs/`, `reports/`, RFCs, ADRs, `changes/`) têm
-função e foram mantidos.
+Exclui `RHP_GOVERNANCE.md`, byte-idêntico a `GOVERNANCE.md` e sem
+relevância própria. Inventário completo (123 `.md`): demais arquivos
+(specs, `docs/`, `reports/`, RFCs, ADRs, `changes/`) têm função e foram
+mantidos. (`RHP_PROMPT_INICIAL_v2.md` permanece excluído, conforme
+decisão do responsável — sem restore.)
 
 ## Motivação
 
-Pedido do responsável: desfazer a deleção do prompt inicial e limpar
-markdowns sem relevância no desenvolvimento do RHP.
+Pedido do responsável: limpar markdowns sem relevância no
+desenvolvimento do RHP.
 
 ## O que mudou
 
-- `git revert -n 5ef8b9a`: `RHP_PROMPT_INICIAL_v2.md` restaurado
-  (7.556 bytes, conteúdo original intacto).
 - `RHP_GOVERNANCE.md` excluído (`git rm`); `AGENTS.md:9` perde a nota
-  "(copiado de `RHP_GOVERNANCE.md")" — autoridade passa a ser só
+  "(copiado de `RHP_GOVERNANCE.md`)" — autoridade passa a ser só
   `GOVERNANCE.md`, sem mudar a ordem de autoridade (§1).
 
 ## Detalhes técnicos
@@ -51,10 +49,8 @@ Sem impacto (só documentação).
 
 ## Limitações e riscos conhecidos
 
-Nenhum: revert preserva histórico (sem reescrita do `main`); a
-duplicata excluída é recuperável pelo Git se preciso.
+Nenhum: a duplicata excluída é recuperável pelo Git se preciso.
 
 ## Referências
 
-- Commit revertido: `5ef8b9a` ("Delete RHP_PROMPT_INICIAL_v2.md");
 - `GOVERNANCE.md` §1 (ordem de autoridade).
