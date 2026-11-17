@@ -56,8 +56,9 @@ Stmt       := LetStmt | ConstStmt | DestructureStmt | AssignStmt | EchoStmt
            | IfStmt | WhileStmt | ForStmt | ForCStmt | SwitchStmt | TryStmt
            | ThrowStmt | BreakStmt | ContinueStmt | FnDef | StaticStmt | ReturnStmt
            | Block | ImportStmt | ImportNames | Export | ReExport | ExprStmt
-LetStmt    := "let" Ident ("=" Expr)? ";"
-ConstStmt  := "const" Ident "=" Expr ";"
+LetStmt    := "let" Ident (":" Tipo)? ("=" Expr)? ";"
+ConstStmt  := "const" Ident (":" Tipo)? "=" Expr ";"
+Tipo       := "int" | "float" | "string" | "bool" | "array" | "mapa" | "null" | "funcao"
 DestructureStmt := ("let" | "const") ("[" Ident ("," Ident)* "]"
            | "{" (Ident | Ident ":" Ident) ("," (Ident | Ident ":" Ident))* "}") "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
@@ -77,8 +78,8 @@ TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
 ThrowStmt  := "throw" Expr ";"
 BreakStmt  := "break" Int? ";"     // N >= 1, padrao 1 (sai de N breakables)
 ContinueStmt := "continue" Int? ";" // N >= 1, padrao 1 (conta laco e `switch`)
-FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" Block
-Param      := Ident ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
+FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" (":" Tipo)? Block
+Param      := Ident (":" Tipo)? ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
 ReturnStmt := "return" Expr? ";"
 ImportStmt := "import" String ";"
 StaticStmt := "static" Ident "=" Expr ";"   // so dentro de funcao
@@ -88,6 +89,15 @@ ExprStmt   := Expr ";"
 
 - `let x = e;` declara no escopo atual (`let x;` inicializa com `null`).
   Redeclarar no mesmo escopo e erro em runtime.
+- Anotacoes de tipo (RFC 0016, Etapa 5): `let x: int = 1;`,
+  `const N: string = "a";`, `fn f(a: int, b = 1): int { }` (e closures).
+  Tipos = `int | float | string | bool | array | mapa | null | funcao`
+  (nomes de `type()`). Checagem em runtime no vinculo (declaracao,
+  argumento apos defaults, retorno): mismatch = erro `tipos
+  incompatíveis: esperava T, encontrou V` (capturavel por `try`).
+  `let x: int;` falha (nulo implicito nao satisfaz `int`). Sem anotacao,
+  zero checagem (nenhuma instrucao nova). `static`/destructuring sem
+  anotacao (nao-objetivo).
 - `static n = e;` dentro de funcao (RFC 0010): estado por definicao,
   avaliado a cada chamada mas atribuido so na primeira; visivel no corpo
   inteiro (lookup: escopos, statics, globais); fora de funcao = erro.

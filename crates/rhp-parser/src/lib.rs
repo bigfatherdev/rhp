@@ -116,6 +116,8 @@ pub enum Stmt {
     },
     Let {
         name: String,
+        /// Anotacao de tipo (`x: int`; RFC 0016). Checada em runtime.
+        ann: Option<TypeTag>,
         init: Option<Expr>,
     },
     /// `let [a, b] = expr;` / `let {x} = expr;` / `let {k: v} = expr;`
@@ -129,6 +131,8 @@ pub enum Stmt {
     /// `const NOME = expr;` — como `let`, mas imutavel (atribuicao posterior e erro de compilacao).
     Const {
         name: String,
+        /// Anotacao de tipo (`N: string`; RFC 0016). Checada em runtime.
+        ann: Option<TypeTag>,
         init: Expr,
     },
     /// `static nome = expr;` dentro de funcao (estado por definicao, RFC 0010).
@@ -200,6 +204,8 @@ pub enum Stmt {
         params: Vec<Param>,
         /// `...rest` (no maximo um, por ultimo; RFC 0006).
         variadic: Option<String>,
+        /// Anotacao de retorno (`: int`; RFC 0016). Checada em runtime.
+        return_ann: Option<TypeTag>,
         body: Vec<StmtNode>,
     },
     Return {
@@ -246,6 +252,57 @@ pub struct ImportName {
 pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
+    /// Anotacao de tipo (`a: int`; RFC 0016, Etapa 5). Checada em runtime.
+    pub ann: Option<TypeTag>,
+}
+
+/// Tag de tipo para anotacoes (`: int`; RFC 0016, Etapa 5).
+///
+/// Nomes iguais aos de `type()` (`mapa`, nao `map`). `Copy` de proposito:
+/// tags circulam por valor em AST, bytecode e VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeTag {
+    Int,
+    Float,
+    String,
+    Bool,
+    Array,
+    Map,
+    Null,
+    Func,
+}
+
+impl TypeTag {
+    /// Nome no fonte -> tag (`None` = tipo desconhecido).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "int" => Some(Self::Int),
+            "float" => Some(Self::Float),
+            "string" => Some(Self::String),
+            "bool" => Some(Self::Bool),
+            "array" => Some(Self::Array),
+            "mapa" => Some(Self::Map),
+            "null" => Some(Self::Null),
+            "funcao" => Some(Self::Func),
+            _ => None,
+        }
+    }
+
+    /// Nome canonico (mensagens de erro, `fmt`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Int => "int",
+            Self::Float => "float",
+            Self::String => "string",
+            Self::Bool => "bool",
+            Self::Array => "array",
+            Self::Map => "mapa",
+            Self::Null => "null",
+            Self::Func => "funcao",
+        }
+    }
 }
 
 /// Ramo de `switch`: `cond: None` e o `default` (unico, posicao livre).
@@ -357,6 +414,8 @@ pub struct ClosureData {
     pub params: Vec<Param>,
     /// `...rest` (no maximo um, por ultimo; RFC 0006).
     pub variadic: Option<String>,
+    /// Anotacao de retorno (`: int`; RFC 0016). Checada em runtime.
+    pub return_ann: Option<TypeTag>,
     pub body: Vec<StmtNode>,
 }
 
@@ -724,6 +783,7 @@ fn parse_const(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         });
     }
     let name = expect_ident(cursor)?;
+    let ann = parse_type_ann(cursor)?;
     expect_token(
         cursor,
         &TokenKind::Assign,
@@ -731,7 +791,7 @@ fn parse_const(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     )?;
     let init = parse_expr(cursor)?;
     expect_semicolon(cursor)?;
-    Ok(Stmt::Const { name, init })
+    Ok(Stmt::Const { name, ann, init })
 }
 
 /// `static nome = expr;` (RFC 0010): estado por definicao de funcao.
@@ -767,6 +827,7 @@ fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         });
     }
     let name = expect_ident(cursor)?;
+    let ann = parse_type_ann(cursor)?;
     let init = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Assign)) {
         cursor.next();
         Some(parse_expr(cursor)?)
@@ -774,10 +835,40 @@ fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         None
     };
     expect_semicolon(cursor)?;
-    Ok(Stmt::Let { name, init })
+    Ok(Stmt::Let { name, ann, init })
 }
 
-/// Padrao de destructuring apos `let`/`const` (cursor no `[` ou `{`).
+/// Anotacao de tipo apos `:` (`x: int`; RFC 0016). `None` = ausente.
+fn parse_type_ann(cursor: &mut Cursor<'_>) -> Result<Option<TypeTag>, ParseError> {
+    if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) {
+        return Ok(None);
+    }
+    cursor.next();
+    let tok = cursor.next().ok_or_else(|| {
+        let (line, col) = cursor.end_pos();
+        ParseError::new("esperado tipo apos `:` (int, string, ...)", line, col)
+    })?;
+    match &tok.kind {
+        TokenKind::Ident(name) => TypeTag::parse(name).map_or_else(
+            || {
+                Err(ParseError::new(
+                    format!("tipo desconhecido `{name}` (use int, float, string, bool, array, mapa, null, funcao)"),
+                    tok.line,
+                    tok.col,
+                ))
+            },
+            |tag| Ok(Some(tag)),
+        ),
+        // `null` e palavra-chave (nao `Ident`); tipo valido.
+        TokenKind::Null => Ok(Some(TypeTag::Null)),
+        other => Err(ParseError::new(
+            format!("esperado tipo apos `:`, encontrado {}", describe(other)),
+            tok.line,
+            tok.col,
+        )),
+    }
+}
+
 fn parse_destructure_target(cursor: &mut Cursor<'_>) -> Result<DestructureTarget, ParseError> {
     match cursor.next().map(|t| t.kind.clone()) {
         Some(TokenKind::LBracket) => {
@@ -1272,12 +1363,14 @@ fn parse_fn_body(
     params: Vec<Param>,
     variadic: Option<String>,
 ) -> Result<Expr, ParseError> {
+    let return_ann = parse_type_ann(cursor)?;
     if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::FatArrow)) {
         cursor.next();
         let value = parse_expr(cursor)?;
         return Ok(Expr::Closure(Box::new(ClosureData {
             params,
             variadic,
+            return_ann,
             body: vec![StmtNode::from(Stmt::Return { expr: Some(value) })],
         })));
     }
@@ -1285,6 +1378,7 @@ fn parse_fn_body(
     Ok(Expr::Closure(Box::new(ClosureData {
         params,
         variadic,
+        return_ann,
         body,
     })))
 }
@@ -1293,11 +1387,13 @@ fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
     let name = expect_ident(cursor)?;
     let (params, variadic) = parse_params_list(cursor, "apos nome da funcao")?;
+    let return_ann = parse_type_ann(cursor)?;
     let body = parse_block(cursor)?;
     Ok(Stmt::FnDef {
         name,
         params,
         variadic,
+        return_ann,
         body,
     })
 }
@@ -1340,6 +1436,7 @@ fn parse_params_list(
                 break;
             }
             let name = expect_ident(cursor)?;
+            let ann = parse_type_ann(cursor)?;
             let default = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Assign)) {
                 cursor.next();
                 seen_optional = true;
@@ -1356,7 +1453,7 @@ fn parse_params_list(
                 }
                 None
             };
-            params.push(Param { name, default });
+            params.push(Param { name, ann, default });
             if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
                 cursor.next();
                 // `, ...rest` ou `, )`: continua o laco (o `...`/`)` decide).
@@ -2283,6 +2380,7 @@ mod tests {
             vec![
                 Stmt::Let {
                     name: "x".to_string(),
+                    ann: None,
                     init: Some(Expr::Int(1)),
                 },
                 Stmt::Assign {
@@ -2307,6 +2405,7 @@ mod tests {
             program.statements,
             vec![Stmt::Let {
                 name: "x".to_string(),
+                ann: None,
                 init: None
             }]
         );
@@ -2433,14 +2532,17 @@ mod tests {
                 params: vec![
                     Param {
                         name: "a".to_string(),
+                        ann: None,
                         default: None,
                     },
                     Param {
                         name: "b".to_string(),
+                        ann: None,
                         default: Some(Expr::Int(2)),
                     },
                     Param {
                         name: "c".to_string(),
+                        ann: None,
                         default: Some(Expr::Binary {
                             op: BinOp::Add,
                             left: Box::new(Expr::Int(1)),
@@ -2449,6 +2551,7 @@ mod tests {
                     },
                 ],
                 variadic: Some("rest".to_string()),
+                return_ann: None,
                 body: vec![StmtNode::from(Stmt::Return {
                     expr: Some(Expr::Var("a".to_string())),
                 })],
@@ -2525,6 +2628,7 @@ mod tests {
                 name: "f".to_string(),
                 params: vec![],
                 variadic: None,
+                return_ann: None,
                 body: vec![
                     StmtNode::from(Stmt::Static {
                         name: "n".to_string(),

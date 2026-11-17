@@ -70,20 +70,22 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             let _ = writeln!(out, "echo {};", fmt_expr(expr, 0));
         }
-        Stmt::Let { name, init } => {
+        Stmt::Let { name, ann, init } => {
             indent(level, out);
+            let ann = ann.map(|t| format!(": {}", t.name())).unwrap_or_default();
             match init {
                 Some(expr) => {
-                    let _ = writeln!(out, "let {name} = {};", fmt_expr(expr, 0));
+                    let _ = writeln!(out, "let {name}{ann} = {};", fmt_expr(expr, 0));
                 }
                 None => {
-                    let _ = writeln!(out, "let {name};");
+                    let _ = writeln!(out, "let {name}{ann};");
                 }
             }
         }
-        Stmt::Const { name, init } => {
+        Stmt::Const { name, ann, init } => {
             indent(level, out);
-            let _ = writeln!(out, "const {name} = {};", fmt_expr(init, 0));
+            let ann = ann.map(|t| format!(": {}", t.name())).unwrap_or_default();
+            let _ = writeln!(out, "const {name}{ann} = {};", fmt_expr(init, 0));
         }
         Stmt::Static { name, init } => {
             indent(level, out);
@@ -250,12 +252,16 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             name,
             params,
             variadic,
+            return_ann,
             body,
         } => {
             indent(level, out);
+            let ret = return_ann
+                .map(|t| format!(": {}", t.name()))
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
-                "fn {name}({}) {{",
+                "fn {name}({}){ret} {{",
                 fmt_params(params, variadic.as_deref())
             );
             fmt_block(body, level + 1, out);
@@ -331,9 +337,12 @@ fn fmt_block(stmts: &[StmtNode], level: usize, out: &mut String) {
 fn fmt_params(params: &[Param], variadic: Option<&str>) -> String {
     let mut parts: Vec<String> = params
         .iter()
-        .map(|p| match &p.default {
-            Some(d) => format!("{} = {}", p.name, fmt_expr(d, 0)),
-            None => p.name.clone(),
+        .map(|p| {
+            let ann = p.ann.map(|t| format!(": {}", t.name())).unwrap_or_default();
+            match &p.default {
+                Some(d) => format!("{}{ann} = {}", p.name, fmt_expr(d, 0)),
+                None => format!("{}{ann}", p.name),
+            }
         })
         .collect();
     if let Some(rest) = variadic {
@@ -513,8 +522,12 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             // nivel absoluto — aceito nesta etapa, ver RFC 0003 §7).
             let mut body = String::new();
             fmt_block(&data.body, 1, &mut body);
+            let ret = data
+                .return_ann
+                .map(|t| format!(": {}", t.name()))
+                .unwrap_or_default();
             format!(
-                "fn ({}) {{\n{body}}}",
+                "fn ({}){ret} {{\n{body}}}",
                 fmt_params(&data.params, data.variadic.as_deref())
             )
         }
@@ -816,6 +829,25 @@ mod tests {
         assert_eq!(fmt("echo {\"a b\": 1};"), "echo {\"a b\": 1};\n");
         assert_eq!(fmt("echo {x: 1};"), "echo {x: 1};\n");
         check_idempotent("echo {\"a b\": 1, x: 2};\n");
+    }
+
+    #[test]
+    fn preserves_type_annotations() {
+        // Etapa 5 (RFC 0016): anotacoes reemitidas no canonico.
+        assert_eq!(fmt("let x:int=1;"), "let x: int = 1;\n");
+        assert_eq!(
+            fmt("const N : string = \"a\";"),
+            "const N: string = \"a\";\n"
+        );
+        assert_eq!(
+            fmt("fn soma(a:int,b=1):int{return a+b;}"),
+            "fn soma(a: int, b = 1): int {\n  return a + b;\n}\n"
+        );
+        assert_eq!(
+            fmt("let d=fn(v:int):int=>v*2;"),
+            "let d = fn (v: int): int {\n  return v * 2;\n};\n"
+        );
+        check_idempotent("let x: int = 1;\nfn f(a: string): bool {\n  return true;\n}\n");
     }
 
     #[test]

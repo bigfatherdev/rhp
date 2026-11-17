@@ -5,7 +5,7 @@
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
 use rhp_bytecode::{builtin_arity, Builtin, Chunk, FuncDef, FuncValue, Op, Value, MAX_VALUE_DEPTH};
-use rhp_parser::Program;
+use rhp_parser::{Program, TypeTag};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
@@ -626,6 +626,10 @@ impl Vm {
                 if self.frames.len() == 1 {
                     return Err(VmError::new("`return` fora de funcao"));
                 }
+                // Anotacao de retorno (`: tipo`; RFC 0016).
+                if let Some(tag) = self.frames[idx].func.as_ref().and_then(|d| d.return_type) {
+                    check_type(&value, tag)?;
+                }
                 self.frames.pop();
                 let caller = self.frames.len() - 1;
                 // Retomada de HOF (RFC 0005): o valor e o retorno do callback;
@@ -730,6 +734,14 @@ impl Vm {
                 let value = self.pop(idx, "repropagacao")?;
                 let original = VmError::new(Self::uncaught_message(&value));
                 return self.unwind(value, original);
+            }
+            Op::CheckType(tag) => {
+                let value = self.frames[idx]
+                    .stack
+                    .last()
+                    .ok_or_else(|| VmError::new("pilha vazia em checagem de tipo".to_string()))?;
+                check_type(value, tag)?;
+                self.frames[idx].ip += 1;
             }
             Op::IterList => {
                 let value = self.pop(idx, "iteracao")?;
@@ -1087,6 +1099,15 @@ impl Vm {
         let mut scope = func.env.clone();
         for (name, value) in bindings {
             scope.insert(name, value);
+        }
+        // Anotacoes de parametros (`a: int`; RFC 0016): checa os valores
+        // vinculados (defaults ja preenchidos pelo chamador).
+        for (i, name) in func.def.params.iter().enumerate() {
+            if let Some(tag) = func.def.param_types.get(i).copied().flatten() {
+                if let Some(value) = scope.get(name) {
+                    check_type(value, tag)?;
+                }
+            }
         }
         self.frames.push(Frame {
             chunk: func.def.body.clone(),
@@ -1517,6 +1538,31 @@ fn type_name(value: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Map(_) => "mapa",
         Value::Func(_) => "funcao",
+    }
+}
+
+/// Checagem de anotacao de tipo (`: tipo`; RFC 0016, Etapa 5). So valida,
+/// nunca converte. Mensagem com prefixo `tipos incompativeis` (faixa E3001).
+fn check_type(value: &Value, tag: TypeTag) -> Result<(), VmError> {
+    let ok = matches!(
+        (value, tag),
+        (Value::Int(_), TypeTag::Int)
+            | (Value::Float(_), TypeTag::Float)
+            | (Value::Str(_), TypeTag::String)
+            | (Value::Bool(_), TypeTag::Bool)
+            | (Value::Array(_), TypeTag::Array)
+            | (Value::Map(_), TypeTag::Map)
+            | (Value::Null, TypeTag::Null)
+            | (Value::Func(_), TypeTag::Func)
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err(VmError::new(format!(
+            "tipos incompativeis: esperava {}, encontrou {}",
+            tag.name(),
+            type_name(value)
+        )))
     }
 }
 
@@ -2843,6 +2889,16 @@ mod tests {
             44 => Op::Throw,
             45 => Op::Rethrow,
             46 => Op::Return,
+            47 => Op::CheckType(match rng.next(8) {
+                0 => TypeTag::Int,
+                1 => TypeTag::Float,
+                2 => TypeTag::String,
+                3 => TypeTag::Bool,
+                4 => TypeTag::Array,
+                5 => TypeTag::Map,
+                6 => TypeTag::Null,
+                _ => TypeTag::Func,
+            }),
             _ => Op::EnterScope,
         }
     }
@@ -3012,6 +3068,43 @@ mod tests {
         line(&mut vm, &mut out, "echo x_indefinida;").expect_err("linha com erro falha");
         line(&mut vm, &mut out, "echo x;").expect("sessao sobrevive ao erro");
         assert_eq!(String::from_utf8(out).expect("utf8"), "40\n");
+    }
+
+    #[test]
+    fn checks_type_annotations() {
+        // Etapa 5 (RFC 0016): 8 tipos aceitam; mismatch = erro capturavel.
+        assert_eq!(
+            run_src("let a: int = 1; let b: float = 2.5; let c: string = \"x\"; let d: bool = true; let e: array = [1]; let f: mapa = {k: 1}; let g: null = null; let h: funcao = fn () { }; echo a + b;").expect("ok"),
+            "3.5\n"
+        );
+        let err = run_err("let x: int = \"a\";");
+        assert!(err.contains("tipos incompativeis"), "obteve: {err}");
+        assert!(err.contains("esperava int"), "obteve: {err}");
+        assert!(err.contains("string"), "obteve: {err}");
+        // Nulo implicito tambem checa.
+        assert!(run_err("let x: int;").contains("esperava int"));
+        // Parametros (incluipos apos default) e retorno.
+        assert_eq!(
+            run_src("fn soma(a: int, b: int = 10): int { return a + b; } echo soma(1);")
+                .expect("ok"),
+            "11\n"
+        );
+        assert!(run_err("fn f(a: int) { return a; } echo f(\"x\");").contains("esperava int"));
+        assert!(run_err("fn f(): int { return \"x\"; } echo f();").contains("esperava int"));
+        // Closure anotada; try/catch preserva a mensagem.
+        assert_eq!(
+            run_src("let d = fn (v: int): int => v * 2; echo d(21);").expect("ok"),
+            "42\n"
+        );
+        assert_eq!(
+            run_src(
+                "try { let x: int = 1.5; } catch e { echo e[\"tipo\"]; echo e[\"mensagem\"]; }"
+            )
+            .expect("ok"),
+            "runtime\ntipos incompativeis: esperava int, encontrou float\n"
+        );
+        // Sem anotacao: nada muda (nenhum CheckType emitido).
+        assert_eq!(run_src("let x = \"a\"; echo x;").expect("ok"), "a\n");
     }
 
     #[test]

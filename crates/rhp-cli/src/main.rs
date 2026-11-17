@@ -1202,6 +1202,7 @@ fn mangled_name(dep_idx: usize, original: &str, mangled: &[HashMap<String, Strin
 fn alias_let(visible: &str, origin: &str) -> StmtNode {
     StmtNode::from(Stmt::Let {
         name: visible.to_string(),
+        ann: None,
         init: Some(rhp_parser::Expr::Var(origin.to_string())),
     })
 }
@@ -1279,20 +1280,22 @@ impl Renamer<'_> {
             Stmt::Echo { expr } => Stmt::Echo {
                 expr: self.expr(expr),
             },
-            Stmt::Let { name, init } => {
+            Stmt::Let { name, ann, init } => {
                 // `init` antes do vinculo (como o compilador avalia).
                 let renamed_init = init.as_ref().map(|e| self.expr(e));
                 let renamed = self.declare(name);
                 Stmt::Let {
                     name: renamed,
+                    ann: *ann,
                     init: renamed_init,
                 }
             }
-            Stmt::Const { name, init } => {
+            Stmt::Const { name, ann, init } => {
                 let renamed_init = self.expr(init);
                 let renamed = self.declare(name);
                 Stmt::Const {
                     name: renamed,
+                    ann: *ann,
                     init: renamed_init,
                 }
             }
@@ -1436,6 +1439,7 @@ impl Renamer<'_> {
                 name,
                 params,
                 variadic,
+                return_ann,
                 body,
             } => {
                 let renamed = self.declare(name);
@@ -1445,6 +1449,7 @@ impl Renamer<'_> {
                     .iter()
                     .map(|p| rhp_parser::Param {
                         name: p.name.clone(),
+                        ann: p.ann,
                         default: p.default.as_ref().map(|e| self.expr(e)),
                     })
                     .collect::<Vec<_>>();
@@ -1461,6 +1466,7 @@ impl Renamer<'_> {
                     name: renamed,
                     params,
                     variadic: variadic.clone(),
+                    return_ann: *return_ann,
                     body,
                 }
             }
@@ -1594,6 +1600,7 @@ impl Renamer<'_> {
                     .iter()
                     .map(|p| rhp_parser::Param {
                         name: p.name.clone(),
+                        ann: p.ann,
                         default: p.default.as_ref().map(|e| self.expr(e)),
                     })
                     .collect::<Vec<_>>();
@@ -1609,6 +1616,7 @@ impl Renamer<'_> {
                 Expr::Closure(Box::new(rhp_parser::ClosureData {
                     params,
                     variadic: data.variadic.clone(),
+                    return_ann: data.return_ann,
                     body,
                 }))
             }

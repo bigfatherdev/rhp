@@ -6,7 +6,7 @@
 
 use rhp_parser::{
     AssignTarget, BinOp, CallArg, DestructureTarget, Expr, MatchArm, Program, Stmt, StmtNode,
-    SwitchCase, UnaryOp,
+    SwitchCase, TypeTag, UnaryOp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -83,6 +83,11 @@ pub struct FuncDef {
     pub defaults: Vec<Option<Value>>,
     /// `...rest` (no maximo um, por ultimo; RFC 0006).
     pub variadic: Option<String>,
+    /// Tipos dos parametros, alinhado a `params` (`None` = sem anotacao;
+    /// RFC 0016). Checados no `activate` da VM (apos defaults).
+    pub param_types: Vec<Option<TypeTag>>,
+    /// Tipo de retorno (`: tipo`; RFC 0016). Checado no `Return` da VM.
+    pub return_type: Option<TypeTag>,
     pub body: Rc<Chunk>,
 }
 
@@ -420,6 +425,9 @@ pub enum Op {
     Rethrow,
     /// Chama o builtin `id` (`n` = aridade fixa do builtin).
     CallBuiltin(BuiltinId),
+    /// Checa o topo da pilha contra a tag (anotacao `: tipo`, RFC 0016;
+    /// sem desempilhar; erro `tipos incompativeis: esperava ...`).
+    CheckType(TypeTag),
 }
 
 /// Identificador numerico estavel de builtin (para o bytecode).
@@ -748,6 +756,11 @@ fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(
                 (height - 1, Some(vec![ip + 1]))
             }
             Op::Neg | Op::Not | Op::BitNot => {
+                check_depth(height, 1, op, context)?;
+                (height, Some(vec![ip + 1]))
+            }
+            // `CheckType` so espia o topo (anotacao `: tipo`, RFC 0016).
+            Op::CheckType(_) => {
                 check_depth(height, 1, op, context)?;
                 (height, Some(vec![ip + 1]))
             }
@@ -1243,11 +1256,13 @@ impl Compiler {
         name: &str,
         params: &[rhp_parser::Param],
         variadic: Option<&str>,
+        return_ann: Option<TypeTag>,
         body: &[StmtNode],
     ) -> Result<u32, CompileError> {
         let mut seen = std::collections::HashSet::new();
         let mut names = Vec::with_capacity(params.len());
         let mut defaults = Vec::with_capacity(params.len());
+        let mut param_types = Vec::with_capacity(params.len());
         for param in params {
             if !seen.insert(param.name.clone()) {
                 return Err(CompileError::new(format!(
@@ -1257,6 +1272,7 @@ impl Compiler {
             }
             names.push(param.name.clone());
             defaults.push(param.default.as_ref().map(eval_const_expr).transpose()?);
+            param_types.push(param.ann);
         }
         if let Some(rest) = variadic {
             if !seen.insert(rest.to_string()) {
@@ -1279,6 +1295,8 @@ impl Compiler {
             params: names,
             defaults,
             variadic: variadic.map(str::to_string),
+            param_types,
+            return_type: return_ann,
             body: Rc::new(body_chunk),
         }));
         Ok((self.chunk.funcs.len() - 1) as u32)
@@ -1884,7 +1902,7 @@ impl Compiler {
                 self.compile_expr(expr)?;
                 self.emit(Op::Print);
             }
-            Stmt::Let { name, init } => {
+            Stmt::Let { name, ann, init } => {
                 match init {
                     Some(expr) => self.compile_expr(expr)?,
                     None => {
@@ -1892,11 +1910,17 @@ impl Compiler {
                         self.emit(Op::Constant(idx));
                     }
                 }
+                if let Some(tag) = ann {
+                    self.emit(Op::CheckType(*tag));
+                }
                 let name_idx = self.intern_name(name)?;
                 self.emit(Op::DeclareName(name_idx));
             }
-            Stmt::Const { name, init } => {
+            Stmt::Const { name, ann, init } => {
                 self.compile_expr(init)?;
+                if let Some(tag) = ann {
+                    self.emit(Op::CheckType(*tag));
+                }
                 let name_idx = self.intern_name(name)?;
                 self.emit(Op::DeclareName(name_idx));
                 self.declare_const(name);
@@ -2042,9 +2066,11 @@ impl Compiler {
                 name,
                 params,
                 variadic,
+                return_ann,
                 body,
             } => {
-                let func_idx = self.compile_func_body(name, params, variadic.as_deref(), body)?;
+                let func_idx =
+                    self.compile_func_body(name, params, variadic.as_deref(), *return_ann, body)?;
                 self.intern_name(name)?;
                 self.emit(Op::DefineFunc(func_idx));
             }
@@ -2287,6 +2313,7 @@ impl Compiler {
                     "{closure}",
                     &data.params,
                     data.variadic.as_deref(),
+                    data.return_ann,
                     &data.body,
                 )?;
                 self.emit(Op::MakeFunc(func_idx));
@@ -2998,6 +3025,8 @@ mod tests {
             params: vec![],
             defaults: vec![],
             variadic: None,
+            param_types: vec![],
+            return_type: None,
             body: Rc::new(Chunk::new()),
         });
         assert_eq!(

@@ -14,6 +14,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- Anotações de tipo com checagem em runtime (RFC 0016, Etapa 5):
+  `let x: int`, `fn f(a: int): int`, 8 tipos, erro `tipos incompativeis`
+  (E3001). Opt-in, sem coercao. Registro:
+  `changes/2026-11-16-feat-tipos-anotacoes.md`.
 - Teto de heap opt-in (RFC 0015, Etapa 3): `VmLimits.max_heap_bytes` +
   `rhp run --max-heap-bytes N`, estimador do modelo com enforcement O(1)
   amortizado, erro `heap excedeu o limite` (E3012). Padrão ilimitado.
