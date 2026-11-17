@@ -2592,8 +2592,9 @@ mod tests {
         }
     }
 
-    /// Gera expressao de `+`/`*` sobre 0..=9 com valor de referencia.
-    /// Faixa sem overflow possivel: so soma/multiplicacao de digitos.
+    /// Gera expressao de `+`/`-`/`*` sobre 0..=9 com valor de referencia.
+    /// Faixa sem overflow possivel: profundidade 4 limita o modulo a
+    /// ~1.8e15 (<< 2^63), seguro para a referencia em i64 em debug.
     fn gen_arith(rng: &mut Lcg, depth: u32) -> (String, i64) {
         if depth == 0 || rng.next(3) == 0 {
             let v = rng.next(10) as i64;
@@ -2601,17 +2602,42 @@ mod tests {
         }
         let (l_src, l_val) = gen_arith(rng, depth - 1);
         let (r_src, r_val) = gen_arith(rng, depth - 1);
-        if rng.next(2) == 0 {
-            (format!("({l_src} + {r_src})"), l_val + r_val)
-        } else {
-            (format!("({l_src} * {r_src})"), l_val * r_val)
+        match rng.next(3) {
+            0 => (format!("({l_src} + {r_src})"), l_val + r_val),
+            1 => (format!("({l_src} - {r_src})"), l_val - r_val),
+            _ => (format!("({l_src} * {r_src})"), l_val * r_val),
         }
+    }
+
+    /// Gera comparacao `<`/`==` sobre aritmetica rasa, com referencia.
+    fn gen_cmp(rng: &mut Lcg) -> (String, bool) {
+        let (l_src, l_val) = gen_arith(rng, 2);
+        let (r_src, r_val) = gen_arith(rng, 2);
+        if rng.next(2) == 0 {
+            (format!("({l_src} < {r_src})"), l_val < r_val)
+        } else {
+            (format!("({l_src} == {r_src})"), l_val == r_val)
+        }
+    }
+
+    /// Gera concatenacao de fragmentos ASCII com comprimento de referencia.
+    fn gen_concat(rng: &mut Lcg) -> (String, usize) {
+        const FRAGS: [&str; 4] = ["a", "bc", "def", ""];
+        let n = 1 + rng.next(4) as usize;
+        let mut src = String::from("\"\"");
+        let mut total = 0;
+        for _ in 0..n {
+            let f = FRAGS[rng.next(4) as usize];
+            total += f.len();
+            src = format!("({src} + \"{f}\")");
+        }
+        (src, total)
     }
 
     #[test]
     fn property_arithmetic_matches_reference() {
         let mut rng = Lcg(0x1234_5678_9ABC_DEF0);
-        for _ in 0..200 {
+        for _ in 0..1000 {
             let (src, expected) = gen_arith(&mut rng, 4);
             let got = run_src(&format!("echo {src};")).expect("programa gerado deve rodar");
             assert_eq!(got, format!("{expected}\n"), "fonte: {src}");
@@ -2767,6 +2793,26 @@ mod tests {
             .run_to_string(&chunk)
             .expect("return com teto folgado passa");
         assert_eq!(out, "1\n");
+    }
+
+    #[test]
+    fn property_comparison_matches_reference() {
+        let mut rng = Lcg(0x0BAD_F00D_CAFE_1234);
+        for _ in 0..500 {
+            let (src, expected) = gen_cmp(&mut rng);
+            let got = run_src(&format!("echo {src};")).expect("programa gerado deve rodar");
+            assert_eq!(got, format!("{expected}\n"), "fonte: {src}");
+        }
+    }
+
+    #[test]
+    fn property_string_concat_length() {
+        let mut rng = Lcg(0x5EED_1234_ABCD_5678);
+        for _ in 0..300 {
+            let (src, expected) = gen_concat(&mut rng);
+            let got = run_src(&format!("echo len({src});")).expect("programa gerado deve rodar");
+            assert_eq!(got, format!("{expected}\n"), "fonte: {src}");
+        }
     }
 
     #[test]

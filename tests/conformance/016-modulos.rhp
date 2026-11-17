@@ -1,0 +1,3 @@
+import {dobro, base} from "016-lib.rhp";
+echo dobro(21);
+echo base;

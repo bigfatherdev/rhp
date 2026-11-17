@@ -1,0 +1,13 @@
+for x in [3, 1, 2] {
+  echo x;
+}
+for k in {b: 1, a: 2} {
+  echo k;
+}
+for let i = 0; i < 3; i = i + 1 {
+  echo i * 10;
+}
+for ;; {
+  echo "uma";
+  break;
+}

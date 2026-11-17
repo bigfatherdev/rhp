@@ -1,0 +1,9 @@
+switch 2 {
+  case 1 { echo "um"; }
+  case 2 { echo "dois"; }
+  default { echo "outro"; }
+}
+switch 9 {
+  case 1 { echo "um"; break; }
+  default { echo "outro"; }
+}
