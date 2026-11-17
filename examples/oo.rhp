@@ -1,0 +1,23 @@
+// Classes (RFC 0017): metodos, `this`, `new`, campos.
+class Contador {
+  fn novo() {
+    this["n"] = 0;
+  }
+  fn inc() {
+    this["n"] = this["n"] + 1;
+    return this["n"];
+  }
+  fn get() {
+    return this["n"];
+  }
+}
+
+let c = new Contador();
+echo c.inc();
+echo c.inc();
+echo c.get();
+
+// Metodo destacado: chama sem write-back (nao persiste).
+let f = c.inc;
+echo f();
+echo c.get();

@@ -1,0 +1,15 @@
+// Tarefas assincronas (RFC 0019): cada `async_spawn` roda em thread
+// propria (isolada); `async_join` bloqueia e devolve o retorno.
+fn lenta() {
+  sleep(1);
+  return "lenta";
+}
+
+fn rapida() {
+  return 42;
+}
+
+let a = async_spawn("lenta");
+let b = async_spawn("rapida");
+echo async_join(b);
+echo async_join(a);

@@ -56,8 +56,9 @@ Stmt       := LetStmt | ConstStmt | DestructureStmt | AssignStmt | EchoStmt
            | IfStmt | WhileStmt | ForStmt | ForCStmt | SwitchStmt | TryStmt
            | ThrowStmt | BreakStmt | ContinueStmt | FnDef | StaticStmt | ReturnStmt
            | Block | ImportStmt | ImportNames | Export | ReExport | ExprStmt
-LetStmt    := "let" Ident ("=" Expr)? ";"
-ConstStmt  := "const" Ident "=" Expr ";"
+LetStmt    := "let" Ident (":" Tipo)? ("=" Expr)? ";"
+ConstStmt  := "const" Ident (":" Tipo)? "=" Expr ";"
+Tipo       := "int" | "float" | "string" | "bool" | "array" | "mapa" | "null" | "funcao"
 DestructureStmt := ("let" | "const") ("[" Ident ("," Ident)* "]"
            | "{" (Ident | Ident ":" Ident) ("," (Ident | Ident ":" Ident))* "}") "=" Expr ";"
 AssignStmt := Target "=" Expr ";"
@@ -77,8 +78,10 @@ TryStmt    := "try" Block ("catch" Ident? Block)? ("finally" Block)?
 ThrowStmt  := "throw" Expr ";"
 BreakStmt  := "break" Int? ";"     // N >= 1, padrao 1 (sai de N breakables)
 ContinueStmt := "continue" Int? ";" // N >= 1, padrao 1 (conta laco e `switch`)
-FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" Block
-Param      := Ident ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
+FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" (":" Tipo)? Block
+ClassDef   := "class" Ident "{" Metodo* "}"
+Metodo     := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" (":" Tipo)? Block
+Param      := Ident (":" Tipo)? ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
 ReturnStmt := "return" Expr? ";"
 ImportStmt := "import" String ";"
 StaticStmt := "static" Ident "=" Expr ";"   // so dentro de funcao
@@ -88,6 +91,24 @@ ExprStmt   := Expr ";"
 
 - `let x = e;` declara no escopo atual (`let x;` inicializa com `null`).
   Redeclarar no mesmo escopo e erro em runtime.
+- Anotacoes de tipo (RFC 0016, Etapa 5): `let x: int = 1;`,
+  `const N: string = "a";`, `fn f(a: int, b = 1): int { }` (e closures).
+  Tipos = `int | float | string | bool | array | mapa | null | funcao`
+  (nomes de `type()`). Checagem em runtime no vinculo (declaracao,
+  argumento apos defaults, retorno): mismatch = erro `tipos
+  incompatíveis: esperava T, encontrou V` (capturavel por `try`).
+  `let x: int;` falha (nulo implicito nao satisfaz `int`). Sem anotacao,
+  zero checagem (nenhuma instrucao nova). `static`/destructuring sem
+  anotacao (nao-objetivo).
+- Classes (RFC 0017, Etapa 5): `class Nome { fn m(params) { } ... }`,
+  `new Nome(args)`, `obj.metodo(args)`, `obj.campo`, `obj.campo = v`,
+  `this` (vinculado no metodo). Construtor = metodo `novo` (obrigatorio;
+  retorno ignorado). Instancias sao POR VALOR (copia, como mapas/arrays;
+  sem aliasing): mutacoes via `obj.metodo()` sobre variavel nomeada
+  persistem (write-back do `this` final; coerente com `a[i] = v`, que
+  tambem exige variavel); metodo destacado (`let f = obj.m; f()`) nao
+  persiste; `type()` = `"classe"`/`"instancia"`; `echo` mostra campos.
+  Sem heranca, sem `private`, sem estaticos de classe (nao-objetivos).
 - `static n = e;` dentro de funcao (RFC 0010): estado por definicao,
   avaliado a cada chamada mas atribuido so na primeira; visivel no corpo
   inteiro (lookup: escopos, statics, globais); fora de funcao = erro.
@@ -104,9 +125,10 @@ ExprStmt   := Expr ";"
 - `if`/`while` exigem condicao `Bool` (sem truthiness implicita). `while`
   reavalia a condicao a cada iteracao. `for x in e { ... }` avalia `e` uma
   vez: array itera os elementos em ordem; mapa itera as chaves `Str` em
-  ordem (mesma ordem de `keys`); outro tipo = erro de runtime ("`for`
-  exige array ou mapa"). `x` e declarada a cada iteracao no escopo do
-  corpo (atribuir a `x` nao afeta a iteracao; para strings, use
+  ordem (mesma ordem de `keys`); gerador consome sob demanda (forma lazy,
+  RFC 0018); outro tipo = erro de runtime ("`for` exige array, mapa ou
+  gerador"). `x` e declarada a cada iteracao no escopo do corpo (atribuir
+  a `x` nao afeta a iteracao; para strings, use
   `for c in split(s, "")`). `break` (dentro de `while`, `for` ou `switch`,
   mesmo aninhados em `if`/blocos) sai do laco/`switch` mais interno e fecha
   tambem o escopo do corpo — `let`s internos nao vazam para fora; fora de
@@ -116,6 +138,17 @@ ExprStmt   := Expr ";"
   elemento. `in` e contextual (identificador comum fora do `for`), mas
   `for` e palavra reservada. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
+- Geradores (RFC 0018, Etapa 5): `fn g() { yield 1; yield 2; }` — chamar
+  NAO executa (devolve gerador lazy); `next(g)` retoma ate o proximo
+  `yield` (valor) ou fim (`Null`, marca esgotado); `exhausted(g)` testa o
+  fim sem executar. `next` apos o fim = erro; `yield` fora de funcao =
+  erro de compilacao; `return` dentro de gerador descarta o valor.
+  Padrao manual: `while !exhausted(g) { let v = next(g); if exhausted(g)
+  { break; } ... }` (o `next` final entrega `Null` descartavel).
+  `for x in gen` consome (com `break`/`continue`); gerador esgotado em
+  novo `for` = zero iteracoes. `this` em metodos-geradores e vinculado
+  na criacao (sem write-back). `type()` = `"gerador"`; `==` por
+  identidade.
 - `switch e { case c { ... } default { ... } }` (RFC 0004): avalia `e` uma
   vez; cada `case` compara com `==` do RHP em ordem ate o primeiro match
   (preguicoso); sem `break`, o controle cai no proximo ramo (fallthrough);
@@ -304,18 +337,29 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `usort(arr, cmp)` | (RFC 0005) Copia ordenada por `cmp(a, b): Int` (`< 0`: `a` antes; `> 0`: depois; `0`: empate, estavel — insertion sort). Retorno nao-`Int` = erro. Vazio/unitario nao chama. Nao muta o original. |
 | `exit(codigo)` | Encerra o programa com codigo 0-255 (fora disso ou nao-`Int` = erro). Desenrola chamadas; em `rhp test`, conta como falha do arquivo. |
 | `now()` | Segundos desde 1970-01-01T00:00:00Z (`Int`; relogio do sistema). |
-| `sleep(s)` | Bloqueia `s` segundos (`Int`/`Float`; fracao = sub-segundo). Negativo, nao-finito ou > 3600 = erro. Devolve `null`. VM single-thread: tudo para junto. |
+| `sleep(s)` | Bloqueia `s` segundos (`Int`/`Float`; fracao = sub-segundo). Negativo, nao-finito ou > 3600 = erro. Devolve `null`. Tarefas `async` rodam em paralelo (cada uma na sua thread). |
 | `date_str(ts)` | Epoch `Int` => `"AAAA-MM-DDTHH:MM:SSZ"` (UTC, sempre; sem timezones). |
 | `json_parse(texto)` | Texto JSON => valor (`null`/`Bool`/`Int` se inteiro em `i64` senao `Float`/`Str`/`Array`/`Mapa`). Gramatica estrita; erro com posicao (byte). Objetos: primeira chave vence (regra dos literais). Teto de 128 niveis. |
 | `json_stringify(valor)` | Valor => texto JSON canonico (chaves ordenadas, sem espacos; `2.0` para floats inteiros). `NaN`/infinito e `Func` = erro. Teto de 128 niveis. |
 | `http_get(url)` | (Fase 6) GET `http://host[:porta]/caminho` com timeouts de 5s (conexao/leitura; DNS usa o resolvedor do sistema, sem timeout proprio), teto de corpo de 1 MiB, so 2xx e corpo UTF-8; resto = erro. Somente esquema `http://`. Sem redirects (use `http_fetch`). |
 | `http_fetch(url, opts)` | (Fase A5) GET com `opts` (tudo opcional): `seguir` (bool, padrao sim), `max_redirecionamentos` (0-10, padrao 5), `timeout` (segundos 0-60, padrao 5), `headers` (mapa `Str`->`Str`), `metodo` (so `GET`). Devolve mapa `{status: Int, cabecalhos: Mapa (chaves minusculas), corpo: Str}` — status final mesmo fora de 2xx. Redirects 301/302/303/307/308 com `Location` (absoluta, raiz ou relativa); `https://` verificado (raizes embutidas + `RHP_CA_BUNDLE` com PEM extra); upgrade `http->https` seguido, downgrade recusado. Erro em transporte, timeout, teto 1 MiB, limite de redirects, opcao invalida. |
-| `db_open(caminho)` | (Fase B) Abre/cria SQLite; devolve handle `Int`. Caminhos relativos resolvem no diretorio atual; roda com as permissoes do usuario. `db_open("pg:host=.. port=.. user=.. dbname=..")` conecta no PostgreSQL (auth `trust`; padroes host 127.0.0.1/porta 5432/user `postgres`/dbname = user). |
+| `db_open(caminho)` | (Fase B) Abre/cria SQLite; devolve handle `Int`. Caminhos relativos resolvem no diretorio atual; roda com as permissoes do usuario. `db_open("pg:host=.. port=.. user=.. dbname=..")` conecta no PostgreSQL (auth `trust`; padroes host 127.0.0.1/porta 5432/user `postgres`/dbname = user). `db_open("mysql:host=.. [port=..] [user=..] [password=..] [dbname=..]")` conecta no MySQL via protocolo 4.1 + `mysql_native_password` (padroes host 127.0.0.1/porta 3306; sem `password` = auth vazia). |
 | `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); placeholders `?` (SQLite) ou `$1` (PG), `params` array (`[]` sem params); devolve linhas afetadas (`Int`). Linhas de SELECT sao descartadas (use `db_query`). |
-| `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna => valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB = erro no SQLite; tipos PG mapeados por OID, resto vira `Str`). |
+| `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna => valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB = erro no SQLite; tipos PG mapeados por OID, resto vira `Str`; tipos numericos MySQL => `Int`/`Float` quando parseaveis, resto (incluindo data/hora) => `Str`). |
 | `db_close(h)` | Fecha o handle (reuso = erro); devolve `null`. Fim do programa fecha o resto. |
 | `http_serve(porta, handler, opts)` | (Fase C/D) Servidor HTTP: `porta` 0–65535 (0 = livre do SO), `handler` = nome de `fn(req)` global, `opts` com `max_conexoes` (padrão 64), `max_requisicoes` (padrão 0 = para sempre) e `limite_taxa` (req/s por IP, padrão 0 = sem limite; excedeu = 429). Por request: `req` = mapa `{metodo, caminho, query, cabecalhos (minúsculas), cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Erro no handler = 500 sem vazar; `exit(codigo)` termina o servidor. Handlers sem estado (sem compartilhar nada entre requests). |
 | `template(texto, valores)` | (Fase C) Interpola `{{chave}}` com escape HTML obrigatório (`&<>"'`); chave ausente/`{{` sem fechar/tipo inválido = erro; sem laços/condicionais. |
+| `tcp_connect(host, porta)` | (Etapa 5, RFC 0020) `Str`+`Int` => handle `Int` (DNS do sistema, timeout de 5s; erro claro). |
+| `tcp_send(h, dados)` | (Etapa 5) Escreve `Str`; devolve bytes escritos (`Int`). Handle invalido = erro. |
+| `tcp_recv(h, max)` | (Etapa 5) Le ate `max` bytes e devolve `Str` (UTF-8; nao-UTF8 = erro); `Null` em EOF limpo. Handle invalido = erro. |
+| `tcp_close(h)` | (Etapa 5) Fecha (idempotente? Nao: reuso = erro). Devolve `null`. |
+| `redis_open(host, porta)` | (Etapa 5, RFC 0020) Conecta (sem AUTH; servidor com senha = erro `-NOAUTH`). Devolve handle `Int`. |
+| `redis_exec(h, [cmd, args...])` | (Etapa 5) Executa comando RESP: simples/bulk => `Str`, inteiro => `Int`, nulo => `null`, array => `Array` (recursivo, teto 128). Erro RESP (`-...`) = erro RHP. Comando vazio/arg nao-string = erro. |
+| `redis_close(h)` | (Etapa 5) Fecha. Devolve `null`; reuso = erro. |
+| `next(gen)` | (RFC 0018, Etapa 5) Retoma o gerador ate o proximo `yield` (devolve o valor); no fim, marca esgotado e devolve `Null`. Gerador esgotado = erro (teste com `exhausted` antes). Nao-gerador = erro. |
+| `exhausted(gen)` | (RFC 0018, Etapa 5) `Bool`: `true` se o gerador terminou (ou nunca executou? Nao: so apos o fim; antes de qualquer `next` = `false`). Nao-gerador = erro. |
+| `async_spawn("f")` | (RFC 0019, Etapa 5) Roda `f` (só `fn` de nivel superior, sem captura, nao-gerador) em thread propria e devolve handle `Int` imediatamente. Isolada: sem globais compartilhados (o worker recompila o programa). |
+| `async_join(h)` | (RFC 0019, Etapa 5) Bloqueia ate a tarefa terminar; devolve o retorno (desserializado de JSON: null/bool/int/float/string/array/mapa; resto = erro). Handle one-shot (reuso = erro). Erro da tarefa = erro no `join` (`tarefa ... falhou: ...`). |
 
 Exemplo:
 

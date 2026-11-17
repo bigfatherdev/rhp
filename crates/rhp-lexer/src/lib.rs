@@ -34,10 +34,15 @@ pub enum TokenKind {
     Catch,
     Finally,
     Throw,
+    Yield,
     Export,
     Fn,
     Return,
     Static,
+    /// `class` (RFC 0017, Etapa 5).
+    Class,
+    /// `new` (RFC 0017, Etapa 5).
+    New,
     Import,
     True,
     False,
@@ -75,14 +80,19 @@ pub enum TokenKind {
     Semicolon,
     Comma,
     Colon,
-    /// `...` (resto de parametros, RFC 0006). `.` isolado e erro lexico.
+    /// `...` (resto de parametros, RFC 0006); `.` e `Dot` (membro).
     Ellipsis,
+    /// `.` (acesso a membro, RFC 0017). `..` continua erro lexico.
+    Dot,
     LParen,
     RParen,
     LBrace,
     RBrace,
     LBracket,
     RBracket,
+    /// Comentario de linha `//` (texto sem `//` nem quebra; Etapa 4).
+    /// Trivia: o parser o ignora na gramatica, mas o coleta para o `fmt`.
+    Comment(String),
 }
 
 /// Um token com posicao de inicio (linha/coluna, base 1).
@@ -165,8 +175,8 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 col += 1;
             }
             '.' => {
-                // `...` (RFC 0006); `.`/`..` sao erro claro (RHP nao tem
-                // ponto flutuante lider nem acesso por ponto).
+                // `...` (RFC 0006) e `.` (membro, RFC 0017); `..` e erro
+                // claro. Ponto flutuante (`3.5`) e tratado no numero.
                 let start_col = col;
                 let mut dots = 0;
                 while chars.peek().copied().is_some_and(|(_, c)| c == '.') && dots < 3 {
@@ -176,9 +186,11 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 col += dots;
                 if dots == 3 {
                     tokens.push(Token::new(TokenKind::Ellipsis, line, start_col));
+                } else if dots == 1 {
+                    tokens.push(Token::new(TokenKind::Dot, line, start_col));
                 } else {
                     return Err(LexError::new(
-                        "esperado `...` (resto de parametros)".to_string(),
+                        "esperado `...` (resto de parametros) ou `.` (membro)".to_string(),
                         line,
                         start_col,
                     ));
@@ -232,8 +244,12 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             '/' => {
                 chars.next();
                 col += 1;
-                // Comentario de linha `//`: ignora ate o fim da linha.
+                // Comentario de linha `//`: emite como trivia (Etapa 4)
+                // em vez de descartar; o parser o coleta para o `fmt`.
                 if chars.peek().copied().is_some_and(|(_, c)| c == '/') {
+                    let comment_line = line;
+                    let start_col = col - 1;
+                    let mut text = String::new();
                     for (_, c) in chars.by_ref() {
                         col += 1;
                         if c == '\n' {
@@ -241,7 +257,15 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                             col = 1;
                             break;
                         }
+                        text.push(c);
                     }
+                    // Remove a segunda `/` inicial do texto.
+                    let text = text.strip_prefix('/').unwrap_or(&text).to_string();
+                    tokens.push(Token::new(
+                        TokenKind::Comment(text),
+                        comment_line,
+                        start_col,
+                    ));
                 } else {
                     tokens.push(Token::new(TokenKind::Slash, line, col - 1));
                 }
@@ -612,10 +636,13 @@ fn lex_ident_or_keyword(
         "catch" => TokenKind::Catch,
         "finally" => TokenKind::Finally,
         "throw" => TokenKind::Throw,
+        "yield" => TokenKind::Yield,
         "export" => TokenKind::Export,
         "fn" => TokenKind::Fn,
         "return" => TokenKind::Return,
         "static" => TokenKind::Static,
+        "class" => TokenKind::Class,
+        "new" => TokenKind::New,
         "import" => TokenKind::Import,
         "true" => TokenKind::True,
         "false" => TokenKind::False,
@@ -850,14 +877,23 @@ mod tests {
 
     #[test]
     fn ignores_line_comments() {
+        // Etapa 4: comentarios viram trivia `Comment` (o parser os filtra
+        // da gramatica e o `fmt` os preserva).
         assert_eq!(
             kinds("// comentario\necho 1; // fim"),
             vec![
+                TokenKind::Comment(" comentario".to_string()),
                 TokenKind::Echo,
                 TokenKind::IntLiteral(1),
                 TokenKind::Semicolon,
+                TokenKind::Comment(" fim".to_string()),
             ]
         );
+        // Linha e coluna do comentario: onde `//` comeca.
+        let tokens = lex("// ola\necho 1;").expect("lex deve passar");
+        assert!(matches!(&tokens[0].kind, TokenKind::Comment(t) if t == " ola"));
+        assert_eq!((tokens[0].line, tokens[0].col), (1, 1));
+        assert_eq!((tokens[1].line, tokens[1].col), (2, 1));
     }
 
     #[test]

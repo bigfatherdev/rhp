@@ -4,8 +4,12 @@
 //! globais compartilhadas. O bytecode e tratado como entrada potencialmente
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
-use rhp_bytecode::{builtin_arity, Builtin, Chunk, FuncDef, FuncValue, Op, Value, MAX_VALUE_DEPTH};
-use rhp_parser::Program;
+use rhp_bytecode::{
+    builtin_arity, Builtin, Chunk, ClassDef, Frame, FuncDef, FuncValue, GenHandle, GenState,
+    Handler, Op, PendingHof, Value, MAX_VALUE_DEPTH,
+};
+use rhp_parser::{Program, TypeTag};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
@@ -18,8 +22,11 @@ pub use builtins::MAX_HTTP_BODY;
 
 mod http_server;
 mod json;
+mod mysql;
 mod pg;
+mod redis;
 mod sqlite;
+mod tcp;
 mod time;
 mod tls;
 
@@ -43,12 +50,17 @@ pub struct VmLimits {
 }
 
 /// Erro de runtime da VM.
+///
+/// `message` e estavel (vira valor em `try`/`catch`); `trace` e so
+/// diagnostico da CLI (pilha de chamadas, da mais interna para a mais
+/// externa; Etapa 4, DevX).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmError {
     pub message: String,
     /// Codigo de `exit(codigo)` quando o erro e um pedido de saida;
     /// `None` para erros comuns. Leitura publica; construcao interna.
     exit_code: Option<i32>,
+    trace: Vec<String>,
 }
 
 impl VmError {
@@ -56,6 +68,7 @@ impl VmError {
         Self {
             message: message.into(),
             exit_code: None,
+            trace: Vec::new(),
         }
     }
 
@@ -65,6 +78,7 @@ impl VmError {
         Self {
             message: format!("exit({code})"),
             exit_code: Some(code),
+            trace: Vec::new(),
         }
     }
 
@@ -72,6 +86,19 @@ impl VmError {
     #[must_use]
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// Pilha de chamadas no momento do erro (nomes de funcao, da mais
+    /// interna para a mais externa; vazia no nivel superior).
+    #[must_use]
+    pub fn trace(&self) -> &[String] {
+        &self.trace
+    }
+
+    /// Anexa a pilha de chamadas (uso interno do `run`).
+    fn with_trace(mut self, trace: Vec<String>) -> Self {
+        self.trace = trace;
+        self
     }
 }
 
@@ -83,67 +110,11 @@ impl fmt::Display for VmError {
 
 impl std::error::Error for VmError {}
 
-/// Frame de execucao: uma ativacao de chunk (principal ou funcao).
-#[derive(Debug)]
-struct Frame {
-    code: Vec<Op>,
-    constants: Vec<Value>,
-    names: Vec<String>,
-    funcs: Vec<Rc<FuncDef>>,
-    ip: usize,
-    stack: Vec<Value>,
-    /// Pilha de escopos locais; `scopes[0]` e o escopo da ativacao
-    /// (parametros no caso de funcao).
-    scopes: Vec<HashMap<String, Value>>,
-    /// Pilha de handlers de `try` (RFC 0001); o mais interno por ultimo.
-    handlers: Vec<Handler>,
-    /// HOF com callback em voo (RFC 0005): progresso da iteracao enquanto
-    /// as ativacoes do callback executam e retornam. `None` no comum.
-    pending: Option<PendingHof>,
-    /// Definicao da funcao desta ativacao (`None` no programa principal).
-    /// Usada pelo estado `static` (RFC 0010: por definicao).
-    func: Option<Rc<FuncDef>>,
-}
+/// Argumentos separados de chamada mista: posicionais + nomeados
+/// (RFC 0009; reusado por `new` e chamada de metodo, RFC 0017).
+type MixedArgs = (Vec<Value>, Vec<(String, Value)>);
 
-/// Estado de `map`/`filter`/`usort` entre chamadas do callback (RFC 0005).
-/// O frame chamador guarda o progresso; cada retorno do callback avanca
-/// (`advance_hof`) ate finalizar com o resultado empilhado.
-#[derive(Debug, Clone)]
-enum PendingHof {
-    /// `map`: aplica `func` a cada item, acumulando resultados.
-    Map {
-        func: FuncValue,
-        items: Vec<Value>,
-        /// Indice do item cuja chamada esta em voo.
-        next: usize,
-        acc: Vec<Value>,
-    },
-    /// `filter`: como `map`, mas so acumula quando o retorno e `Bool(true)`.
-    Filter {
-        func: FuncValue,
-        items: Vec<Value>,
-        next: usize,
-        acc: Vec<Value>,
-    },
-    /// `usort`: insertion sort estavel dirigido por comparacoes.
-    Sort {
-        func: FuncValue,
-        sorted: Vec<Value>,
-        /// Proximo par a comparar: `(sorted[j], sorted[j-1])`, `j = max(1, ..)`.
-        i: usize,
-        j: usize,
-    },
-}
-
-/// Handler de `try`: para onde saltar e com que escopos/pilha.
-#[derive(Debug, Clone, Copy)]
-struct Handler {
-    /// Instrucao do `catch` ou do bloco `finally`+`Rethrow`.
-    target: usize,
-    /// `scopes.len()` ao registrar (restaura no unwinding).
-    scope_len: usize,
-}
-
+/// Passo de execucao: continua no mesmo frame ou termina (`Halt`).
 enum Step {
     Continue,
     Done,
@@ -156,6 +127,9 @@ pub struct Vm {
     globals: HashMap<String, Value>,
     limits: VmLimits,
     steps: u64,
+    /// Traco de execucao (`rhp run --trace`, Etapa 4): imprime `ip` + op
+    /// em stderr a cada passo. So diagnostico; nao afeta a semantica.
+    trace: bool,
     argv: Vec<String>,
     /// Programa-fonte (AST) para recompilacao por thread (`http_serve`;
     /// so dados owned, `Send+Sync`).
@@ -173,6 +147,64 @@ pub struct Vm {
     /// Bytes estimados empilhados desde a ultima varredura da heap
     /// (teto amortizado O(1), RFC 0015; zerado em `set_limits`).
     heap_since_check: u64,
+    /// Sockets TCP crus (`tcp_*`; RFC 0020).
+    tcp: tcp::TcpHandles,
+    /// Conexoes Redis (`redis_*`; RFC 0020).
+    redis: redis::RedisHandles,
+    /// Tarefas assincronas em voo (`async_spawn`/`async_join`, RFC 0019).
+    tasks: TaskHandles,
+}
+
+/// Tarefas assincronas por handle (RFC 0019): cada uma roda em thread
+/// propria com programa recompilado; resultado via JSON (fronteira).
+#[derive(Debug, Default)]
+struct TaskHandles {
+    running: HashMap<i64, TaskThread>,
+    next: i64,
+}
+
+/// Tarefa em voo: thread + nome da funcao (para diagnostico).
+#[derive(Debug)]
+struct TaskThread {
+    name: String,
+    handle: std::thread::JoinHandle<TaskResult>,
+}
+
+/// Resultado que cruza a fronteira da thread (JSON serializado; `String`
+/// e `Send`, ao contrario de `Value`).
+type TaskResult = Result<String, String>;
+
+/// Corpo da thread de tarefa (RFC 0019): recompila o programa (owned,
+/// padrao `http_serve`), executa a funcao de nivel superior e serializa
+/// o retorno em JSON. Isolada: sem globais compartilhados; erros viram
+/// `Err(mensagem)` para o `join` re-lancar.
+fn run_task(program: Arc<Program>, argv: Vec<String>, name: String) -> TaskResult {
+    let chunk = rhp_bytecode::compile(&program).map_err(|e| format!("compilacao: {e}"))?;
+    let def = chunk
+        .funcs
+        .iter()
+        .find(|f| f.name == name)
+        .cloned()
+        .ok_or_else(|| format!("funcao `{name}` inexistente"))?;
+    if def.is_generator {
+        return Err(format!("`async_spawn` nao suporta gerador (`{name}`)"));
+    }
+    let func = FuncValue {
+        def: def.clone(),
+        env: HashMap::new(),
+    };
+    let mut vm = Vm::new();
+    vm.set_argv(argv);
+    // Frame raiz com `Halt`: sem ele, o `return` da tarefa pareceria
+    // "fora de funcao"; com ele, o `drive` termina e devolve o valor.
+    let mut root = rhp_bytecode::Chunk::new();
+    root.code.push(rhp_bytecode::Op::Halt);
+    vm.reset(&root);
+    vm.push_call_frame(func, Vec::new())
+        .map_err(|e| e.message.clone())?;
+    let mut sink = std::io::sink();
+    let value = vm.drive(&mut sink).map_err(|e| e.message.clone())?;
+    crate::json::stringify_json(&value).map_err(|e| e.message.clone())
 }
 
 /// Conexoes de banco da VM (B2: SQLite; B3: +PostgreSQL).
@@ -187,6 +219,7 @@ struct DbHandles {
 enum DbConn {
     Sqlite(sqlite::Connection),
     Postgres(pg::Connection),
+    Mysql(mysql::Connection),
 }
 
 /// Semente do xorshift64* de `rand` (RFC 0012): relogio (ns) misturado com
@@ -211,13 +244,22 @@ impl Vm {
             globals: HashMap::new(),
             limits: VmLimits::default(),
             steps: 0,
+            trace: false,
             argv: Vec::new(),
             program: None,
             db: DbHandles::default(),
             statics: Vec::new(),
             rng: seed_rng(),
             heap_since_check: 0,
+            tasks: TaskHandles::default(),
+            tcp: tcp::TcpHandles::default(),
+            redis: redis::RedisHandles::default(),
         }
+    }
+
+    /// Liga/desliga o traco de execucao (`rhp run --trace`).
+    pub fn set_trace(&mut self, trace: bool) {
+        self.trace = trace;
     }
 
     /// Define os argumentos de linha de comando visiveis via `argv()`.
@@ -251,15 +293,52 @@ impl Vm {
             .validate()
             .map_err(|e| VmError::new(format!("bytecode invalido: {e}")))?;
         self.reset(chunk);
+        self.drive(output).map(|_| ())
+    }
 
+    /// Executa ate `Halt` (ou erro), devolvendo o valor no topo da pilha
+    /// em `Done` (`Null` se vazia). Nucleo compartilhado de `run`,
+    /// `run_value` e `run_continue` (com trace anexado no erro).
+    fn drive(&mut self, output: &mut dyn Write) -> Result<Value, VmError> {
         while !self.frames.is_empty() {
             let idx = self.frames.len() - 1;
-            match self.step(idx, output)? {
-                Step::Continue => {}
-                Step::Done => return Ok(()),
+            match self.step(idx, output) {
+                Ok(Step::Continue) => {}
+                Ok(Step::Done) => {
+                    let value = self.frames[idx].stack.pop().unwrap_or(Value::Null);
+                    return Ok(value);
+                }
+                Err(error) => return Err(error.with_trace(self.call_stack())),
             }
         }
         Err(VmError::new("execucao terminou sem `Halt`"))
+    }
+
+    /// Executa um chunk sobre o estado atual, sem reiniciar (REPL, Etapa 4):
+    /// globais, statics, argv e limites sobrevivem entre linhas; frames e
+    /// passos reiniciam. Erro descarta os frames, preservando o estado.
+    pub fn run_continue(&mut self, chunk: &Chunk, output: &mut dyn Write) -> Result<(), VmError> {
+        chunk
+            .validate()
+            .map_err(|e| VmError::new(format!("bytecode invalido: {e}")))?;
+        self.unwind_all();
+        self.steps = 0;
+        self.push_root(chunk);
+        let result = self.drive(output).map(|_| ());
+        if result.is_err() {
+            self.unwind_all();
+        }
+        result
+    }
+
+    /// Pilha de chamadas ativas (nomes de funcao, da mais interna para a
+    /// mais externa). Frames sem funcao (nivel superior) nao aparecem.
+    fn call_stack(&self) -> Vec<String> {
+        self.frames
+            .iter()
+            .rev()
+            .filter_map(|frame| frame.func.as_ref().map(|def| def.name.clone()))
+            .collect()
     }
 
     /// Executa o chunk e devolve o valor no topo da pilha (`Null` se vazia).
@@ -269,38 +348,42 @@ impl Vm {
             .validate()
             .map_err(|e| VmError::new(format!("bytecode invalido: {e}")))?;
         self.reset(chunk);
-
-        while !self.frames.is_empty() {
-            let idx = self.frames.len() - 1;
-            match self.step(idx, output)? {
-                Step::Continue => {}
-                Step::Done => {
-                    let value = self.frames[idx].stack.pop().unwrap_or(Value::Null);
-                    return Ok(value);
-                }
-            }
-        }
-        Err(VmError::new("execucao terminou sem `Halt`"))
+        self.drive(output)
     }
 
     /// Reinicia frames/globais/passos com um chunk validado.
+    /// Tarefas em voo sao descartadas (threads seguem detached;
+    /// `join` pendente vira `handle invalido`).
     fn reset(&mut self, chunk: &Chunk) {
         self.frames.clear();
         self.globals.clear();
         self.statics.clear();
         self.steps = 0;
+        self.tasks = TaskHandles::default();
+        self.push_root(chunk);
+    }
+
+    /// Empilha o frame raiz de um chunk validado (sem tocar em globais,
+    /// statics, argv ou limites).
+    fn push_root(&mut self, chunk: &Chunk) {
         self.frames.push(Frame {
-            code: chunk.code.clone(),
-            constants: chunk.constants.clone(),
-            names: chunk.names.clone(),
-            funcs: chunk.funcs.iter().map(|f| Rc::new(f.clone())).collect(),
+            chunk: Rc::new(chunk.clone()),
             ip: 0,
             stack: Vec::new(),
             scopes: vec![HashMap::new()],
             handlers: Vec::new(),
             pending: None,
+            pending_gen: None,
+            pending_new: None,
+            pending_method: None,
             func: None,
         });
+    }
+
+    /// Desenrola frames ate a base, descartando pilhas/escopos/handlers.
+    /// Globais e statics sobrevivem (estado do REPL entre linhas).
+    fn unwind_all(&mut self) {
+        self.frames.clear();
     }
 
     /// Executa e retorna a saida como `String` (conveniencia para testes).
@@ -342,19 +425,25 @@ impl Vm {
                 )));
             }
         }
-        let op = {
+        let (ip, op) = {
             let frame = self
                 .frames
                 .get(idx)
                 .ok_or_else(|| VmError::new("frame de execucao inexistente"))?;
-            *frame
+            let op = *frame
+                .chunk
                 .code
                 .get(frame.ip)
-                .ok_or_else(|| VmError::new("ponteiro de instrucao fora do codigo"))?
+                .ok_or_else(|| VmError::new("ponteiro de instrucao fora do codigo"))?;
+            (frame.ip, op)
         };
+        if self.trace {
+            eprintln!("[trace] f{idx}:{ip} {op:?}");
+        }
         match op {
             Op::Constant(const_idx) => {
                 let value = self.frames[idx]
+                    .chunk
                     .constants
                     .get(const_idx as usize)
                     .cloned()
@@ -461,6 +550,24 @@ impl Vm {
                     }
                 }
             }
+            Op::JumpIfTrue(target) => {
+                let value = self.pop(idx, "condicao")?;
+                match value {
+                    Value::Bool(cond) => {
+                        if cond {
+                            self.frames[idx].ip = target as usize;
+                        } else {
+                            self.frames[idx].ip += 1;
+                        }
+                    }
+                    other => {
+                        return Err(VmError::new(format!(
+                            "condicao deve ser bool, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                }
+            }
             Op::Jump(target) => {
                 self.frames[idx].ip = target as usize;
             }
@@ -519,6 +626,7 @@ impl Vm {
             }
             Op::DefineFunc(func_idx) => {
                 let func = self.frames[idx]
+                    .chunk
                     .funcs
                     .get(func_idx as usize)
                     .cloned()
@@ -532,6 +640,7 @@ impl Vm {
             }
             Op::MakeFunc(func_idx) => {
                 let def = self.frames[idx]
+                    .chunk
                     .funcs
                     .get(func_idx as usize)
                     .cloned()
@@ -548,17 +657,123 @@ impl Vm {
             Op::CallMixed(desc_idx) => {
                 self.call_mixed(idx, desc_idx)?;
             }
+            Op::BuildClass(name_idx, count) => {
+                // Desempilha `count` pares [nome(Str), metodo(Func)] e
+                // empilha a classe (tabela de metodos compartilhada).
+                let name = self.name_of(idx, name_idx)?;
+                let mut methods = HashMap::new();
+                for _ in 0..count {
+                    let func = self.pop(idx, "metodo de classe")?;
+                    let method_name = self.pop(idx, "nome de metodo")?;
+                    let (method_name, func) = match (method_name, func) {
+                        (Value::Str(method_name), Value::Func(func)) => (method_name, func),
+                        (method_name, func) => {
+                            return Err(VmError::new(format!(
+                                "bytecode invalido: metodo de classe espera (Str, Func), encontrou ({} {})",
+                                type_name(&method_name),
+                                type_name(&func),
+                            )));
+                        }
+                    };
+                    if methods.insert(method_name.clone(), func).is_some() {
+                        return Err(VmError::new(format!(
+                            "metodo duplicado `{method_name}` (invalido fora do compilador)"
+                        )));
+                    }
+                }
+                self.push_checked(idx, Value::Class(Rc::new(ClassDef { name, methods })))?;
+                self.frames[idx].ip += 1;
+            }
+            Op::NewMixed(desc_idx) => {
+                self.new_mixed(idx, desc_idx)?;
+            }
+            Op::CallMethod(var_idx, field_idx, desc_idx) => {
+                self.call_method(idx, var_idx, field_idx, desc_idx)?;
+            }
+            Op::Yield => {
+                let value = self.pop(idx, "`yield`")?;
+                // Entrega ao retomador e salva o frame para continuar depois.
+                // `pending_gen` foi armado pelo `gen_resume` no resume.
+                let gen = self.frames[idx].pending_gen.take().ok_or_else(|| {
+                    VmError::new("`yield` fora de retomada de gerador (interno)".to_string())
+                })?;
+                let mut frame = self.frames.pop().expect("frame do gerador");
+                // Avanca PARA ALEM do `yield`: o resume continua na proxima.
+                frame.ip += 1;
+                gen.0.borrow_mut().frame = Some(frame);
+                let caller = self.frames.len() - 1;
+                self.push_checked(caller, value)?;
+                self.frames[caller].ip += 1;
+            }
             Op::Return => {
                 let value = self.pop(idx, "`return`")?;
                 if self.frames.len() == 1 {
                     return Err(VmError::new("`return` fora de funcao"));
                 }
+                // Gerador terminando (RFC 0018): marca `done`, descarta o
+                // retorno e entrega `Null` (use `yield` para valores).
+                // Tem precedencia: nada mais se aplica a este frame.
+                if let Some(gen) = self.frames[idx].pending_gen.take() {
+                    gen.0.borrow_mut().done = true;
+                    gen.0.borrow_mut().frame = None;
+                    self.frames.pop();
+                    let caller = self.frames.len() - 1;
+                    self.push_checked(caller, Value::Null)?;
+                    self.frames[caller].ip += 1;
+                    return Ok(Step::Continue);
+                }
+                // Anotacao de retorno (`: tipo`; RFC 0016).
+                if let Some(tag) = self.frames[idx].func.as_ref().and_then(|d| d.return_type) {
+                    check_type_or_err(&value, tag)?;
+                }
+                // `new` (RFC 0017): o `this` final sai desta ativacao
+                // (construtor); o retorno e descartado. A flag morre com
+                // o frame no unwind — nunca fica obsoleta.
+                let closing_new = self.frames[idx].pending_new.take();
+                let closing_method = self.frames[idx].pending_method.take();
+                let final_this = if closing_new.is_some() || closing_method.is_some() {
+                    self.frames[idx].scopes[0].get("this").cloned()
+                } else {
+                    None
+                };
                 self.frames.pop();
                 let caller = self.frames.len() - 1;
                 // Retomada de HOF (RFC 0005): o valor e o retorno do callback;
                 // sem HOF pendente, entrega normal ao chamador.
                 if let Some(pending) = self.frames[caller].pending.take() {
                     self.advance_hof(caller, pending, value)?;
+                } else if let Some(class_name) = closing_new {
+                    // `new` (RFC 0017): descarta o retorno do construtor e
+                    // entrega o `this` final (deve ser instancia da classe).
+                    let ok = matches!(&final_this, Some(Value::Instance { class, .. }) if class.name == class_name);
+                    if ok {
+                        self.push_checked(caller, final_this.expect("this verificado"))?;
+                    } else {
+                        return Err(VmError::new(format!(
+                            "construtor `novo` de `{class_name}` deve preservar `this` como instancia"
+                        )));
+                    }
+                } else if let Some(var_name) = closing_method {
+                    // Metodo sobre variavel (RFC 0017): o retorno e o valor
+                    // da chamada; o `this` final volta para a variavel
+                    // (mutacoes via `obj.metodo()` persistem; coerente com
+                    // `a[i] = v`, que tambem exige variavel nomeada).
+                    match final_this {
+                        Some(Value::Instance { .. }) => {
+                            if !self.assign(caller, &var_name, final_this.expect("this verificado"))
+                            {
+                                return Err(VmError::new(format!(
+                                    "variavel nao definida: {var_name}"
+                                )));
+                            }
+                            self.push_checked(caller, value)?;
+                        }
+                        _ => {
+                            return Err(VmError::new(
+                                "metodo deve preservar `this` como instancia".to_string(),
+                            ));
+                        }
+                    }
                 } else {
                     self.push_checked(caller, value)?;
                 }
@@ -658,6 +873,14 @@ impl Vm {
                 let original = VmError::new(Self::uncaught_message(&value));
                 return self.unwind(value, original);
             }
+            Op::CheckType(tag) => {
+                let value = self.frames[idx]
+                    .stack
+                    .last()
+                    .ok_or_else(|| VmError::new("pilha vazia em checagem de tipo".to_string()))?;
+                check_type_or_err(value, tag)?;
+                self.frames[idx].ip += 1;
+            }
             Op::IterList => {
                 let value = self.pop(idx, "iteracao")?;
                 let list = match value {
@@ -669,7 +892,7 @@ impl Vm {
                     }
                     other => {
                         return Err(VmError::new(format!(
-                            "`for` exige array ou mapa, encontrado {}",
+                            "`for` exige array, mapa ou gerador, encontrado {}",
                             type_name(&other)
                         )));
                     }
@@ -696,6 +919,14 @@ impl Vm {
                 // (nunca passam pelo `call_builtin` sincrono).
                 if matches!(builtin, Builtin::Map | Builtin::Filter | Builtin::Usort) {
                     self.hof_begin(idx, builtin, args)?;
+                } else if matches!(builtin, Builtin::Next) {
+                    // `next(gen)` (RFC 0018): retoma o gerador (precisa dos
+                    // frames; nunca passa pelo `call_builtin` sincrono).
+                    self.gen_resume(args)?;
+                } else if matches!(builtin, Builtin::AsyncSpawn | Builtin::AsyncJoin) {
+                    // Tarefas (RFC 0019): precisam da VM (programa + tabela).
+                    self.async_begin(idx, builtin, args)?;
+                    self.frames[idx].ip += 1;
                 } else {
                     let result = call_builtin(
                         builtin,
@@ -704,6 +935,8 @@ impl Vm {
                         &mut self.db,
                         &mut self.rng,
                         self.program.clone(),
+                        &mut self.tcp,
+                        &mut self.redis,
                     )?;
                     self.push_checked(idx, result)?;
                     self.frames[idx].ip += 1;
@@ -810,6 +1043,7 @@ impl Vm {
 
     fn name_of(&self, idx: usize, name_idx: u32) -> Result<String, VmError> {
         self.frames[idx]
+            .chunk
             .names
             .get(name_idx as usize)
             .cloned()
@@ -1002,6 +1236,27 @@ impl Vm {
     /// Empilha a ativacao com vinculos ja resolvidos (ordem irrelevante:
     /// vao direto para o escopo unico). Checa profundidade e preserva a
     /// guarda de `ExitScope` (base com 1 escopo). Nao avanca o `ip`.
+    /// Monta o frame de ativacao (sem empilhar, sem checar profundidade).
+    fn make_frame(func: &FuncValue, scope: HashMap<String, Value>) -> Frame {
+        Frame {
+            chunk: func.def.body.clone(),
+            ip: 0,
+            stack: Vec::new(),
+            scopes: vec![scope],
+            handlers: Vec::new(),
+            pending_new: None,
+            pending_method: None,
+            pending_gen: None,
+            pending: None,
+            func: Some(func.def.clone()),
+        }
+    }
+
+    /// Empilha a ativacao com vinculos ja resolvidos (ordem irrelevante:
+    /// vao direto para o escopo unico). Checa profundidade e preserva a
+    /// guarda de `ExitScope` (base com 1 escopo). Nao avanca o `ip`.
+    /// Funcao geradora NAO executa: empilha `Value::Generator` lazy
+    /// (RFC 0018) no chamador.
     fn activate(&mut self, func: FuncValue, bindings: Vec<(String, Value)>) -> Result<(), VmError> {
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(VmError::new(
@@ -1014,24 +1269,27 @@ impl Vm {
         for (name, value) in bindings {
             scope.insert(name, value);
         }
-        self.frames.push(Frame {
-            code: func.def.body.code.clone(),
-            constants: func.def.body.constants.clone(),
-            names: func.def.body.names.clone(),
-            funcs: func
-                .def
-                .body
-                .funcs
-                .iter()
-                .map(|f| Rc::new(f.clone()))
-                .collect(),
-            ip: 0,
-            stack: Vec::new(),
-            scopes: vec![scope],
-            handlers: Vec::new(),
-            pending: None,
-            func: Some(func.def.clone()),
-        });
+        // Anotacoes de parametros (`a: int`; RFC 0016): checa os valores
+        // vinculados (defaults ja preenchidos pelo chamador).
+        for (i, name) in func.def.params.iter().enumerate() {
+            if let Some(tag) = func.def.param_types.get(i).copied().flatten() {
+                if let Some(value) = scope.get(name) {
+                    check_type_or_err(value, tag)?;
+                }
+            }
+        }
+        if func.def.is_generator {
+            let frame = Self::make_frame(&func, scope);
+            let gen = Value::Generator(GenHandle(Rc::new(RefCell::new(GenState {
+                func,
+                frame: Some(frame),
+                done: false,
+            }))));
+            let top = self.frames.len() - 1;
+            self.push_checked(top, gen)?;
+            return Ok(());
+        }
+        self.frames.push(Self::make_frame(&func, scope));
         Ok(())
     }
 
@@ -1109,10 +1367,11 @@ impl Vm {
         self.activate(func, bindings)
     }
 
-    /// Executa `Op::CallMixed` (RFC 0009): le o descritor, desempilha callee
-    /// + valores em ordem do fonte, expande spreads e liga por nome/posicao.
-    fn call_mixed(&mut self, idx: usize, desc_idx: u32) -> Result<(), VmError> {
-        let desc = match self.frames[idx].constants.get(desc_idx as usize) {
+    /// Desempilha os valores de uma chamada com descritor e os separa em
+    /// posicionais/nomeados (expandindo spreads). Compartilhado por
+    /// `CallMixed`, `NewMixed` e `CallMethod` (RFCs 0009 e 0017).
+    fn mixed_args(&mut self, idx: usize, desc_idx: u32, what: &str) -> Result<MixedArgs, VmError> {
+        let desc = match self.frames[idx].chunk.constants.get(desc_idx as usize) {
             Some(Value::Array(items)) => items.clone(),
             _ => {
                 return Err(VmError::new(format!(
@@ -1121,8 +1380,8 @@ impl Vm {
             }
         };
         let n = desc.len();
-        if self.frames[idx].stack.len() < n + 1 {
-            return Err(VmError::new("pilha insuficiente para chamada"));
+        if self.frames[idx].stack.len() < n {
+            return Err(VmError::new(format!("pilha insuficiente para {what}")));
         }
         let mut values = Vec::with_capacity(n);
         for _ in 0..n {
@@ -1131,19 +1390,6 @@ impl Vm {
             }
         }
         values.reverse();
-        let callee = self.frames[idx]
-            .stack
-            .pop()
-            .ok_or_else(|| VmError::new("pilha insuficiente para chamada"))?;
-        let func = match callee {
-            Value::Func(func) => func,
-            other => {
-                return Err(VmError::new(format!(
-                    "tentativa de chamar {} como funcao",
-                    type_name(&other)
-                )));
-            }
-        };
         let mut pos = Vec::new();
         let mut named = Vec::new();
         for (marker, value) in desc.iter().zip(values) {
@@ -1167,9 +1413,309 @@ impl Vm {
                 }
             }
         }
+        Ok((pos, named))
+    }
+
+    /// Executa `Op::CallMixed` (RFC 0009): le o descritor, desempilha callee
+    /// + valores em ordem do fonte, expande spreads e liga por nome/posicao.
+    fn call_mixed(&mut self, idx: usize, desc_idx: u32) -> Result<(), VmError> {
+        let (pos, named) = self.mixed_args(idx, desc_idx, "chamada")?;
+        let callee = self.frames[idx]
+            .stack
+            .pop()
+            .ok_or_else(|| VmError::new("pilha insuficiente para chamada"))?;
+        let func = match callee {
+            Value::Func(func) => func,
+            other => {
+                return Err(VmError::new(format!(
+                    "tentativa de chamar {} como funcao",
+                    type_name(&other)
+                )));
+            }
+        };
         self.push_call_frame_mixed(func, pos, named)?;
         self.frames[idx].ip += 1;
         Ok(())
+    }
+
+    /// Executa `Op::NewMixed` (RFC 0017): como `call_mixed`, mas o callee
+    /// deve ser `Value::Class` e o alvo e sempre o construtor `novo`.
+    /// Ativa com `this` = instancia vazia e arma `pending_new` no frame
+    /// do construtor (o `Return` entrega o `this` final).
+    fn new_mixed(&mut self, idx: usize, desc_idx: u32) -> Result<(), VmError> {
+        let (pos, named) = self.mixed_args(idx, desc_idx, "`new`")?;
+        let callee = self.frames[idx]
+            .stack
+            .pop()
+            .ok_or_else(|| VmError::new("pilha insuficiente para `new`"))?;
+        let class = match callee {
+            Value::Class(class) => class,
+            other => {
+                return Err(VmError::new(format!(
+                    "`new` exige classe, encontrou {}",
+                    type_name(&other)
+                )));
+            }
+        };
+        let novo = class.methods.get("novo").cloned().ok_or_else(|| {
+            VmError::new(format!(
+                "classe `{}` sem construtor `novo` (defina `fn novo(...)`)",
+                class.name
+            ))
+        })?;
+        if novo.def.is_generator {
+            return Err(VmError::new(format!(
+                "construtor `novo` de `{}` nao pode ser gerador",
+                class.name
+            )));
+        }
+        let instance = Value::Instance {
+            class: class.clone(),
+            fields: HashMap::new(),
+        };
+        let mut func = novo;
+        // `this` disponivel no corpo do construtor (e em closures dele).
+        func.env.insert("this".to_string(), instance);
+        self.push_call_frame_mixed(func, pos, named)?;
+        self.frames[idx].ip += 1;
+        if let Some(frame) = self.frames.last_mut() {
+            frame.pending_new = Some(class.name.clone());
+        }
+        Ok(())
+    }
+
+    /// Executa `Op::CallMethod` (RFC 0017): `variavel.metodo(args)`.
+    /// Como `Index` + chamada, mas com write-back: apos o retorno, o
+    /// `this` final e gravado de volta na variavel (mutacoes de metodo
+    /// sobre variaveis nomeadas persistem; coerente com `a[i] = v`, que
+    /// tambem exige variavel). Sobre expressoes temporarias, use
+    /// `obj.metodo()` via `Index` (sem write-back).
+    fn call_method(
+        &mut self,
+        idx: usize,
+        var_idx: u32,
+        field_idx: u32,
+        desc_idx: u32,
+    ) -> Result<(), VmError> {
+        let var_name = self.name_of(idx, var_idx)?;
+        let field = match self.frames[idx].chunk.constants.get(field_idx as usize) {
+            Some(Value::Str(field)) => field.clone(),
+            _ => {
+                return Err(VmError::new(format!(
+                    "bytecode invalido: campo de metodo {field_idx} invalido"
+                )));
+            }
+        };
+        let (pos, named) = self.mixed_args(idx, desc_idx, "chamada de metodo")?;
+        let base = self
+            .lookup(idx, &var_name)
+            .ok_or_else(|| VmError::new(format!("variavel nao definida: {var_name}")))?;
+        match base {
+            Value::Instance { class, fields } => {
+                // Campos primeiro (como no `Index`): funcao em campo
+                // chama sem `this` e sem write-back.
+                if let Some(value) = fields.get(&field) {
+                    let func = match value.clone() {
+                        Value::Func(func) => func,
+                        other => {
+                            return Err(VmError::new(format!(
+                                "tentativa de chamar {} como funcao",
+                                type_name(&other)
+                            )));
+                        }
+                    };
+                    self.push_call_frame_mixed(func, pos, named)?;
+                    self.frames[idx].ip += 1;
+                    return Ok(());
+                }
+                let func = class.methods.get(&field).cloned().ok_or_else(|| {
+                    VmError::new(format!(
+                        "membro inexistente na instancia de `{}`: `{field}` (sem campo nem metodo)",
+                        class.name,
+                    ))
+                })?;
+                let mut func = func;
+                func.env.insert(
+                    "this".to_string(),
+                    Value::Instance {
+                        class: class.clone(),
+                        fields,
+                    },
+                );
+                // Metodo gerador: lazy, sem write-back (nunca executa aqui).
+                let is_gen = func.def.is_generator;
+                self.push_call_frame_mixed(func, pos, named)?;
+                self.frames[idx].ip += 1;
+                if !is_gen {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.pending_method = Some(var_name);
+                    }
+                }
+                Ok(())
+            }
+            other => {
+                // Nao-instancia: equivale a `Index` + chamada comum (sem
+                // write-back; ex.: mapa com campo funcao).
+                let member = index_value(&other, &Value::Str(field))?;
+                let func = match member {
+                    Value::Func(func) => func,
+                    other => {
+                        return Err(VmError::new(format!(
+                            "tentativa de chamar {} como funcao",
+                            type_name(&other)
+                        )));
+                    }
+                };
+                self.push_call_frame_mixed(func, pos, named)?;
+                self.frames[idx].ip += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Retoma um gerador (`next`; RFC 0018, Etapa 5): empilha o frame
+    /// suspenso e arma `pending_gen` nele. O chamador NAO avanca: quem
+    /// avancar e o `Yield` (valor) ou o `Return` (fim) do gerador.
+    /// Gerador esgotado = erro (teste com `exhausted` antes de `next`).
+    fn gen_resume(&mut self, args: Vec<Value>) -> Result<(), VmError> {
+        let gen = match args.as_slice() {
+            [Value::Generator(gen)] => gen.clone(),
+            [other] => {
+                return Err(VmError::new(format!(
+                    "`next` exige gerador, encontrou {}",
+                    type_name(other)
+                )));
+            }
+            _ => return Err(VmError::new("`next` exige 1 argumento".to_string())),
+        };
+        let frame = {
+            let mut state = gen.0.borrow_mut();
+            if state.done {
+                return Err(VmError::new(
+                    "gerador esgotado (teste com `exhausted` antes de `next`)".to_string(),
+                ));
+            }
+            match state.frame.take() {
+                Some(mut frame) => {
+                    frame.pending_gen = Some(gen.clone());
+                    frame
+                }
+                None => {
+                    // Sem frame e sem `done`: retomada reentrante (o frame
+                    // esta na pilha) ou frame destruido por unwind de erro.
+                    // Nos dois casos nao ha como continuar: marca esgotado.
+                    state.done = true;
+                    return Err(VmError::new(
+                        "gerador interrompido (retomada reentrante ou erro anterior; crie outro)"
+                            .to_string(),
+                    ));
+                }
+            }
+        };
+        self.frames.push(frame);
+        Ok(())
+    }
+
+    /// Inicia (`async_spawn("f")`) ou aguarda (`async_join(h)`) tarefa
+    /// (RFC 0019, Etapa 5): thread propria com programa recompilado
+    /// (padrao `http_serve`: `Arc<Program>` e owned+`Send`); resultado
+    /// cruza a fronteira como JSON (fronteira `String`, `Send`).
+    fn async_begin(
+        &mut self,
+        idx: usize,
+        builtin: Builtin,
+        args: Vec<Value>,
+    ) -> Result<(), VmError> {
+        match builtin {
+            Builtin::AsyncSpawn => {
+                let name = match args.as_slice() {
+                    [Value::Str(name)] => name.clone(),
+                    [other] => {
+                        return Err(VmError::new(format!(
+                            "`async_spawn` exige funcao (nome em string), encontrou {}",
+                            type_name(other)
+                        )));
+                    }
+                    _ => return Err(VmError::new("`async_spawn` exige 1 argumento".to_string())),
+                };
+                // Valida ja: `fn` de nivel superior existente, nao-geradora,
+                // sem captura (o worker recompila e revalida pelo nome).
+                let func = match self.lookup(idx, &name) {
+                    Some(Value::Func(func)) => func,
+                    Some(other) => {
+                        return Err(VmError::new(format!(
+                            "`async_spawn` exige funcao, `{name}` e {}",
+                            type_name(&other)
+                        )));
+                    }
+                    None => {
+                        return Err(VmError::new(format!(
+                            "`async_spawn`: funcao `{name}` inexistente (so `fn` de nivel superior)"
+                        )));
+                    }
+                };
+                if func.def.is_generator {
+                    return Err(VmError::new(format!(
+                        "`async_spawn` nao suporta gerador (`{name}`; use `next`/`for`)"
+                    )));
+                }
+                if !func.env.is_empty() {
+                    return Err(VmError::new(format!(
+                        "`async_spawn` exige funcao sem captura (`{name}` captura ambiente)"
+                    )));
+                }
+                let program = self.program.clone().ok_or_else(|| {
+                    VmError::new("`async_spawn` sem programa-fonte (interno)".to_string())
+                })?;
+                let argv = self.argv.clone();
+                let thread_name = name.clone();
+                let handle = std::thread::spawn(move || run_task(program, argv, thread_name));
+                let id = self.tasks.next;
+                self.tasks.next += 1;
+                self.tasks.running.insert(id, TaskThread { name, handle });
+                self.push_checked(idx, Value::Int(id))?;
+                Ok(())
+            }
+            Builtin::AsyncJoin => {
+                let id = match args.as_slice() {
+                    [Value::Int(id)] => *id,
+                    [other] => {
+                        return Err(VmError::new(format!(
+                            "`async_join` exige handle (int), encontrou {}",
+                            type_name(other)
+                        )));
+                    }
+                    _ => return Err(VmError::new("`async_join` exige 1 argumento".to_string())),
+                };
+                let task = self.tasks.running.remove(&id).ok_or_else(|| {
+                    VmError::new(format!(
+                        "`async_join`: handle {id} invalido ou ja consumido"
+                    ))
+                })?;
+                let result = task.handle.join().map_err(|_| {
+                    VmError::new(format!(
+                        "`async_join`: tarefa `{}` abortou (panic)",
+                        task.name
+                    ))
+                })?;
+                match result {
+                    Ok(json) => {
+                        let value = crate::json::parse_json(&json).map_err(|e| {
+                            VmError::new(format!("`async_join`: retorno invalido: {e}"))
+                        })?;
+                        self.push_checked(idx, value)?;
+                        Ok(())
+                    }
+                    Err(message) => Err(VmError::new(format!(
+                        "tarefa `{}` falhou: {message}",
+                        task.name
+                    ))),
+                }
+            }
+            _ => Err(VmError::new(
+                "interno: builtin async desconhecido".to_string(),
+            )),
+        }
     }
 
     /// Inicia `map`/`filter`/`usort` (RFC 0005): valida `(colecao, funcao)`,
@@ -1191,6 +1737,11 @@ impl Vm {
                 )));
             }
         };
+        if func.def.is_generator {
+            return Err(VmError::new(format!(
+                "callback de `{name}` nao pode ser gerador (use `for x in gen` ou `next`)"
+            )));
+        }
         if items.is_empty() {
             self.push_checked(idx, Value::Array(Vec::new()))?;
             self.frames[idx].ip += 1;
@@ -1426,6 +1977,28 @@ fn heap_size_of(value: &Value, depth: usize) -> u64 {
         }
         Value::Map(entries) => heap_size_of_entries(entries, depth),
         Value::Func(f) => heap_size_of_entries(&f.env, depth),
+        Value::Class(def) => def.name.len() as u64,
+        Value::Instance { class, fields } => {
+            (class.name.len() as u64).saturating_add(heap_size_of_entries(fields, depth))
+        }
+        Value::Generator(gen) => {
+            // `try_borrow`: se o frame suspenso (transitivamente) contem
+            // este mesmo gerador, o borrow aninhado falharia (`panic`) —
+            // nesse caso conta 0 (estimativa; fail-safe documentado).
+            let Ok(state) = gen.0.try_borrow() else {
+                return 0;
+            };
+            let mut total = heap_size_of_entries(&state.func.env, depth);
+            if let Some(frame) = &state.frame {
+                for value in &frame.stack {
+                    total = total.saturating_add(heap_size_of(value, depth + 1));
+                }
+                for scope in &frame.scopes {
+                    total = total.saturating_add(heap_size_of_entries(scope, depth + 1));
+                }
+            }
+            total
+        }
         _ => 0,
     }
 }
@@ -1452,6 +2025,39 @@ fn type_name(value: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Map(_) => "mapa",
         Value::Func(_) => "funcao",
+        Value::Class(_) => "classe",
+        Value::Instance { .. } => "instancia",
+        Value::Generator(_) => "gerador",
+    }
+}
+
+/// Checagem de anotacao de tipo (`: tipo`; RFC 0016, Etapa 5). So valida,
+/// nunca converte. Mensagem com prefixo `tipos incompativeis` (faixa E3001).
+fn check_type(value: &Value, tag: TypeTag) -> bool {
+    match (value, tag) {
+        (Value::Int(_), TypeTag::Int)
+        | (Value::Float(_), TypeTag::Float)
+        | (Value::Str(_), TypeTag::String)
+        | (Value::Bool(_), TypeTag::Bool)
+        | (Value::Array(_), TypeTag::Array)
+        | (Value::Map(_), TypeTag::Map)
+        | (Value::Null, TypeTag::Null)
+        | (Value::Func(_), TypeTag::Func) => true,
+        // Classes/instancias/geradores nao tem tag (distintos de
+        // mapa/funcao): nunca casam.
+        _ => false,
+    }
+}
+
+fn check_type_or_err(value: &Value, tag: TypeTag) -> Result<(), VmError> {
+    if check_type(value, tag) {
+        Ok(())
+    } else {
+        Err(VmError::new(format!(
+            "tipos incompativeis: esperava {}, encontrou {}",
+            tag.name(),
+            type_name(value)
+        )))
     }
 }
 
@@ -1721,6 +2327,35 @@ fn index_value(base: &Value, index: &Value) -> Result<Value, VmError> {
             .get(key)
             .cloned()
             .ok_or_else(|| VmError::new(format!("chave inexistente no mapa: {key}"))),
+        (Value::Instance { class, fields }, Value::Str(key)) => {
+            // Campos primeiro; depois metodos (vinculados a `this`).
+            // Sem aliasing: a instancia e por valor (copia), como mapas.
+            if let Some(value) = fields.get(key) {
+                Ok(value.clone())
+            } else if let Some(func) = class.methods.get(key) {
+                // Metodo vinculado: env capturado na definicao + `this`.
+                let mut env = func.env.clone();
+                env.insert(
+                    "this".to_string(),
+                    Value::Instance {
+                        class: class.clone(),
+                        fields: fields.clone(),
+                    },
+                );
+                Ok(Value::Func(FuncValue {
+                    def: func.def.clone(),
+                    env,
+                }))
+            } else {
+                Err(VmError::new(format!(
+                    "membro inexistente na instancia de `{}`: `{key}` (sem campo nem metodo)",
+                    class.name,
+                )))
+            }
+        }
+        (Value::Class(_), _) => Err(VmError::new(
+            "indexacao de classe nao suportada (instancie com `new`)".to_string(),
+        )),
         _ => Err(VmError::new(format!(
             "indexacao nao suportada para {}[{}]",
             type_name(base),
@@ -1747,6 +2382,21 @@ fn store_index_value(container: &Value, index: &Value, value: Value) -> Result<V
             let mut updated = entries.clone();
             updated.insert(key.clone(), value);
             Ok(Value::Map(updated))
+        }
+        (Value::Instance { class, fields }, Value::Str(key)) => {
+            // Campos sao mutaveis (`this["n"] = ...`); metodos nao sao
+            // sobrescreviveis por atribuicao (erro claro).
+            if class.methods.contains_key(key) {
+                return Err(VmError::new(format!(
+                    "metodo `{key}` nao pode ser sobrescrito por atribuicao"
+                )));
+            }
+            let mut updated = fields.clone();
+            updated.insert(key.clone(), value);
+            Ok(Value::Instance {
+                class: class.clone(),
+                fields: updated,
+            })
         }
         _ => Err(VmError::new(format!(
             "atribuicao indexada nao suportada para {}[{}]",
@@ -2730,7 +3380,7 @@ mod tests {
     /// proposito). `n_consts`/`n_names` = tamanho do pool; saltos miram
     /// `0..code_len+2` (podem cair fora).
     fn fuzz_op(rng: &mut Lcg, n_consts: u32, n_names: u32, code_len: u32) -> Op {
-        match rng.next(48) {
+        match rng.next(53) {
             0 => Op::Constant(rng.next(n_consts as u64 + 2) as u32),
             1 => Op::LoadName(rng.next(n_names as u64 + 2) as u32),
             2 => Op::StoreName(rng.next(n_names as u64 + 2) as u32),
@@ -2778,6 +3428,25 @@ mod tests {
             44 => Op::Throw,
             45 => Op::Rethrow,
             46 => Op::Return,
+            47 => Op::CheckType(match rng.next(8) {
+                0 => TypeTag::Int,
+                1 => TypeTag::Float,
+                2 => TypeTag::String,
+                3 => TypeTag::Bool,
+                4 => TypeTag::Array,
+                5 => TypeTag::Map,
+                6 => TypeTag::Null,
+                _ => TypeTag::Func,
+            }),
+            48 => Op::BuildClass(rng.next(n_names as u64 + 2) as u32, rng.next(3) as u32),
+            49 => Op::NewMixed(rng.next(n_consts as u64 + 2) as u32),
+            50 => Op::CallMethod(
+                rng.next(n_names as u64 + 2) as u32,
+                rng.next(n_consts as u64 + 2) as u32,
+                rng.next(n_consts as u64 + 2) as u32,
+            ),
+            51 => Op::JumpIfTrue(rng.next(code_len as u64 + 2) as u32),
+            52 => Op::Yield,
             _ => Op::EnterScope,
         }
     }
@@ -2914,6 +3583,79 @@ mod tests {
     }
 
     #[test]
+    fn error_carries_call_stack() {
+        // Etapa 4: pilha da mais interna para a mais externa; vazia no
+        // nivel superior; `message` intacta (vira valor em `try`/`catch`).
+        let chunk = compile_src("fn f() { g(); } fn g() { x_indefinida; } f();");
+        let err = Vm::new().run_to_string(&chunk).expect_err("deve falhar");
+        assert_eq!(err.trace(), &["g".to_string(), "f".to_string()]);
+        assert!(err.message.contains("nao definida"));
+        let top = compile_src("x_indefinida;");
+        let err = Vm::new().run_to_string(&top).expect_err("deve falhar");
+        assert!(err.trace().is_empty());
+        // Capturado por `try`: mensagem preservada, sem trace no valor.
+        let out = run_src("fn f() { x_indefinida; } try { f(); } catch e { echo e[\"tipo\"]; }")
+            .expect("catch passa");
+        assert_eq!(out, "runtime\n");
+    }
+
+    #[test]
+    fn run_continue_preserves_state_across_lines() {
+        // Etapa 4 (REPL): globais/funcoes sobrevivem; erro nao corrompe.
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let line = |vm: &mut Vm, out: &mut Vec<u8>, src: &str| {
+            let chunk = compile_src(src);
+            vm.run_continue(&chunk, out).map(|_| ())
+        };
+        line(&mut vm, &mut out, "let x = 40;").expect("linha 1 passa");
+        line(&mut vm, &mut out, "fn soma(a) { return a + 2; }").expect("linha 2 passa");
+        line(&mut vm, &mut out, "echo soma(x);").expect("linha 3 passa");
+        assert_eq!(String::from_utf8(out.clone()).expect("utf8"), "42\n");
+        out.clear();
+        line(&mut vm, &mut out, "echo x_indefinida;").expect_err("linha com erro falha");
+        line(&mut vm, &mut out, "echo x;").expect("sessao sobrevive ao erro");
+        assert_eq!(String::from_utf8(out).expect("utf8"), "40\n");
+    }
+
+    #[test]
+    fn checks_type_annotations() {
+        // Etapa 5 (RFC 0016): 8 tipos aceitam; mismatch = erro capturavel.
+        assert_eq!(
+            run_src("let a: int = 1; let b: float = 2.5; let c: string = \"x\"; let d: bool = true; let e: array = [1]; let f: mapa = {k: 1}; let g: null = null; let h: funcao = fn () { }; echo a + b;").expect("ok"),
+            "3.5\n"
+        );
+        let err = run_err("let x: int = \"a\";");
+        assert!(err.contains("tipos incompativeis"), "obteve: {err}");
+        assert!(err.contains("esperava int"), "obteve: {err}");
+        assert!(err.contains("string"), "obteve: {err}");
+        // Nulo implicito tambem checa.
+        assert!(run_err("let x: int;").contains("esperava int"));
+        // Parametros (incluipos apos default) e retorno.
+        assert_eq!(
+            run_src("fn soma(a: int, b: int = 10): int { return a + b; } echo soma(1);")
+                .expect("ok"),
+            "11\n"
+        );
+        assert!(run_err("fn f(a: int) { return a; } echo f(\"x\");").contains("esperava int"));
+        assert!(run_err("fn f(): int { return \"x\"; } echo f();").contains("esperava int"));
+        // Closure anotada; try/catch preserva a mensagem.
+        assert_eq!(
+            run_src("let d = fn (v: int): int => v * 2; echo d(21);").expect("ok"),
+            "42\n"
+        );
+        assert_eq!(
+            run_src(
+                "try { let x: int = 1.5; } catch e { echo e[\"tipo\"]; echo e[\"mensagem\"]; }"
+            )
+            .expect("ok"),
+            "runtime\ntipos incompativeis: esperava int, encontrou float\n"
+        );
+        // Sem anotacao: nada muda (nenhum CheckType emitido).
+        assert_eq!(run_src("let x = \"a\"; echo x;").expect("ok"), "a\n");
+    }
+
+    #[test]
     fn respects_heap_byte_limit() {
         // ~10 strings de 100 bytes retidas: ~1 KB vivo > teto de 512.
         let src = "let a = []; let i = 0; while i < 10 { a = push(a, \"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\"); i = i + 1; } echo len(a);";
@@ -2945,6 +3687,163 @@ mod tests {
         });
         let out = vm_t.run_to_string(&chunk_t).expect("transiente passa");
         assert_eq!(out, "50\n");
+    }
+
+    #[test]
+    fn classes_methods_and_this() {
+        // Etapa 5 (RFC 0017): ciclo completo; mutacao via `c.m()` persiste
+        // (write-back); metodo destacado nao persiste (documentado).
+        let cls = "class Contador { fn novo() { this[\"n\"] = 0; } fn inc() { this[\"n\"] = this[\"n\"] + 1; return this[\"n\"]; } fn get() { return this[\"n\"]; } } ";
+        assert_eq!(
+            run_src(&format!(
+                "{cls} let c = new Contador(); echo c.inc(); echo c.inc(); echo c.get();"
+            ))
+            .expect("ok"),
+            "1\n2\n2\n"
+        );
+        assert_eq!(
+            run_src(&format!(
+                "{cls} let c = new Contador(); let f = c.inc; echo f(); echo c.get();"
+            ))
+            .expect("ok"),
+            "1\n0\n"
+        );
+        // Erros: sem `novo`, metodo ausente, `new` em nao-classe, aridade.
+        assert!(run_err("class A { } let a = new A();").contains("sem construtor"));
+        assert!(
+            run_err(&format!("{cls} let c = new Contador(); echo c.ausente;"))
+                .contains("membro inexistente")
+        );
+        assert!(run_err("let x = 1; let y = new x();").contains("`new` exige classe"));
+        assert!(run_err(&format!("{cls} let c = new Contador(1);")).contains("espera"));
+        // `this` fora de metodo = variavel indefinida; construtor que
+        // descarta `this` = erro.
+        assert!(run_err("echo this;").contains("nao definida"));
+        assert!(
+            run_err("class B { fn novo() { this = 5; } } let b = new B();")
+                .contains("preservar `this`")
+        );
+        // Metodo com named/spread + retorno anotado + `try`.
+        assert_eq!(
+            run_src("class S { fn novo(s) { this[\"s\"] = s; } fn rep(n) { return this[\"s\"]; } } let s = new S(s: \"ab\"); echo s.rep(...[1]);").expect("ok"),
+            "ab\n"
+        );
+        assert_eq!(
+            run_src("class T { fn novo(): int { return 1; } } let t = new T(); echo type(t);")
+                .expect("ok"),
+            "instancia\n"
+        );
+    }
+
+    #[test]
+    fn generators_yield_resume_and_finish() {
+        // Etapa 5 (RFC 0018): chamada nao executa (lazy); `next` retoma;
+        // `exhausted` marca o fim; valor de `return` e descartado.
+        let src = "fn g() { echo \"ini\"; yield 1; echo \"mei\"; yield 2; echo \"fim\"; return 99; } let x = g(); echo \"criado\"; echo next(x); echo exhausted(x); echo next(x); echo exhausted(x); echo next(x);";
+        assert_eq!(
+            run_src(src).expect("ok"),
+            "criado\nini\n1\nfalse\nmei\n2\nfalse\nfim\nnull\n"
+        );
+        assert!(run_err(
+            "fn g() { yield 1; } let x = g(); echo next(x); echo next(x); echo next(x);"
+        )
+        .contains("esgotado"));
+        // `yield` sem valor entrega `Null`; `yield null` nao confunde o fim.
+        assert_eq!(run_src("fn g() { yield; yield null; } let x = g(); echo next(x) == null; echo next(x) == null; echo exhausted(x);").expect("ok"), "true\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn generators_for_in_and_control_flow() {
+        // `for x in gen`: break/continue, parada antecipada, vazio, reuso.
+        assert_eq!(
+            run_src("fn g() { yield 1; yield 2; yield 3; } for x in g() { if x == 2 { continue; } if x == 3 { break; } echo x; } echo \"ok\";").expect("ok"),
+            "1\nok\n"
+        );
+        assert_eq!(
+            run_src("fn v() { if false { yield 1; } } for x in v() { echo x; } echo \"fim\";")
+                .expect("ok"),
+            "fim\n"
+        );
+        assert_eq!(
+            run_src("fn nats() { let i = 0; while true { yield i; i = i + 1; } } for x in nats() { if x > 2 { break; } echo x; }").expect("ok"),
+            "0\n1\n2\n"
+        );
+        // Gerador esgotado em novo `for`: zero iteracoes (sem erro).
+        assert_eq!(
+            run_src("fn g() { yield 1; } let x = g(); echo next(x); for y in x { echo y; } echo \"fim\";").expect("ok"),
+            "1\nfim\n"
+        );
+    }
+
+    #[test]
+    fn generators_reject_misuse() {
+        // `new` em nao-classe, `yield` fora de funcao, `next`/`exhausted`
+        // em nao-gerador, construtor/metodo gerador, callback gerador.
+        assert!(run_err("fn f() { return 1; } echo next(f);").contains("exige gerador"));
+        assert!(run_err("echo exhausted(1);").contains("exige gerador"));
+        {
+            let prog = parse_source("yield 1;").expect("parse deve passar");
+            assert!(rhp_bytecode::compile(&prog)
+                .expect_err("yield fora de funcao deve falhar")
+                .message
+                .contains("fora de funcao"));
+        }
+        assert!(
+            run_err("class C { fn novo() { yield 1; } } let c = new C();")
+                .contains("nao pode ser gerador")
+        );
+        assert!(run_err("fn g() { yield 1; } echo map([1], g);").contains("nao pode ser gerador"));
+        // Erro dentro do gerador: `try` externo captura; resume abortado.
+        assert_eq!(
+            run_src("fn g() { yield 1; x_indefinida; } let x = g(); try { echo next(x); echo next(x); } catch e { echo e[\"tipo\"]; } try { echo next(x); } catch e { echo \"morto\"; }").expect("ok"),
+            "1\nruntime\nmorto\n"
+        );
+    }
+
+    #[test]
+    fn tasks_run_in_parallel_and_join() {
+        // Etapa 5 (RFC 0019): spawn/join com threads; 2x sleep(200ms)
+        // termina bem abaixo do serial (margem folgada anti-flake).
+        // `run_src` nao define programa; aqui vai o pipeline completo.
+        use std::sync::Arc;
+        use std::time::Instant;
+        fn run_with_program(src: &str) -> Result<String, VmError> {
+            let program = Arc::new(parse_source(src).expect("parse deve passar"));
+            let chunk = rhp_bytecode::compile(&program).expect("compile deve passar");
+            let mut vm = Vm::new();
+            vm.set_program(program);
+            vm.run_to_string(&chunk)
+        }
+        fn run_err_with_program(src: &str) -> String {
+            run_with_program(src).expect_err("deve falhar").message
+        }
+        let src = "fn dorme() { sleep(0.2); return \"ok\"; } fn agora() { return 7; } let a = async_spawn(\"dorme\"); let b = async_spawn(\"agora\"); echo async_join(b); echo async_join(a);";
+        let start = Instant::now();
+        assert_eq!(run_with_program(src).expect("ok"), "7\nok\n");
+        assert!(
+            start.elapsed().as_millis() < 350,
+            "paralelo esperado (< 350ms para 200ms de sono)"
+        );
+        // Erro da tarefa vira erro do join; handle one-shot.
+        assert!(run_err_with_program(
+            "fn ruim() { x_indefinida; } let h = async_spawn(\"ruim\"); echo async_join(h);"
+        )
+        .contains("tarefa"));
+        assert!(run_err_with_program("echo async_join(999);").contains("invalido"));
+        assert!(run_err_with_program("fn f() { return 1; } let h = async_spawn(\"f\"); echo async_join(h); echo async_join(h);").contains("invalido"));
+        // Validacao no spawn: inexistente, nao-funcao, gerador, captura.
+        assert!(run_err_with_program("echo async_spawn(\"naoexiste\");").contains("inexistente"));
+        assert!(run_err_with_program("let x = 1; echo async_spawn(x);").contains("exige funcao"));
+        assert!(
+            run_err_with_program("fn g() { yield 1; } echo async_spawn(\"g\");")
+                .contains("gerador")
+        );
+        assert!(run_err_with_program("fn outer() { let y = 1; fn f() { return y; } return f; } let g = outer(); echo async_spawn(\"g\");").contains("captura"));
+        // Isolamento: global do pai nao existe no worker.
+        assert!(run_err_with_program(
+            "let x = 1; fn f() { return x; } let h = async_spawn(\"f\"); echo async_join(h);"
+        )
+        .contains("nao definida"));
     }
 
     #[test]
@@ -3351,9 +4250,9 @@ mod tests {
         assert!(err.contains("nao definida"), "obteve: {err}");
         // Nao iteravel e erro com tipo.
         let err = run_err("for x in 42 { echo x; }");
-        assert!(err.contains("array ou mapa"), "obteve: {err}");
+        assert!(err.contains("array, mapa ou gerador"), "obteve: {err}");
         let err = run_err("for x in \"ab\" { echo x; }");
-        assert!(err.contains("array ou mapa"), "obteve: {err}");
+        assert!(err.contains("array, mapa ou gerador"), "obteve: {err}");
     }
 
     #[test]

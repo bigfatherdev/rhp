@@ -5,9 +5,10 @@
 //! baseada em pilha e valida o chunk (recursivamente) antes de executar.
 
 use rhp_parser::{
-    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, MatchArm, Program, Stmt, SwitchCase,
-    UnaryOp,
+    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, MatchArm, Program, Stmt, StmtNode,
+    SwitchCase, TypeTag, UnaryOp,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
@@ -25,6 +26,118 @@ pub enum Value {
     /// Funcao de primeira classe (RFC 0003): definicao compilada +
     /// ambiente capturado por valor no momento da criacao (`MakeFunc`).
     Func(FuncValue),
+    /// Classe (tabela de metodos; RFC 0017, Etapa 5). Valor de `class Nome`.
+    Class(Rc<ClassDef>),
+    /// Instancia de classe (`new`): classe + campos mutaveis.
+    Instance {
+        class: Rc<ClassDef>,
+        fields: HashMap<String, Value>,
+    },
+    /// Gerador lazy (`fn` com `yield`; RFC 0018, Etapa 5). Igualdade por
+    /// identidade (mesmo objeto + mesmo `done`).
+    Generator(GenHandle),
+}
+
+/// Frame de execucao: uma ativacao de chunk (principal ou funcao).
+///
+/// Mora aqui (e nao na VM) para que `GenState` possa suspender e retomar
+/// frames por valor, sem registros nem vazamentos (RFC 0018). O chunk e
+/// compartilhado por `Rc`; somente leitura durante a execucao.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub chunk: Rc<Chunk>,
+    pub ip: usize,
+    pub stack: Vec<Value>,
+    /// Pilha de escopos locais; `scopes[0]` e o escopo da ativacao
+    /// (parametros no caso de funcao).
+    pub scopes: Vec<HashMap<String, Value>>,
+    /// Pilha de handlers de `try` (RFC 0001); o mais interno por ultimo.
+    pub handlers: Vec<Handler>,
+    /// `new` em voo (RFC 0017): nome da classe enquanto o construtor
+    /// `novo` executa; vive no frame DO CONSTRUTOR.
+    pub pending_new: Option<String>,
+    /// Metodo em voo (`var.metodo()`; RFC 0017): nome da variavel para
+    /// write-back do `this` final. Vive no frame DO METODO.
+    pub pending_method: Option<String>,
+    /// Gerador em voo (RFC 0018): de quem e este resume; o `Yield`/`Return`
+    /// do frame salva/marca o gerador e devolve o valor ao chamador.
+    /// Vive no frame DO GERADOR (morre com ele no unwind, sem stale).
+    pub pending_gen: Option<GenHandle>,
+    /// HOF com callback em voo (RFC 0005): progresso da iteracao enquanto
+    /// as ativacoes do callback executam e retornam. `None` no comum.
+    pub pending: Option<PendingHof>,
+    /// Definicao da funcao desta ativacao (`None` no programa principal).
+    pub func: Option<Rc<FuncDef>>,
+}
+
+/// Estado de um gerador (RFC 0018, Etapa 5): funcao, frame suspenso
+/// (`None` = ainda nao iniciado) e flag de fim. O frame e movido para
+/// dentro/fora a cada `next`/`yield` (dono unico, sem aliasing).
+#[derive(Debug, Clone)]
+pub struct GenState {
+    pub func: FuncValue,
+    pub frame: Option<Frame>,
+    pub done: bool,
+}
+
+/// Identidade de gerador (handle compartilhado; ver RFC 0018).
+/// `PartialEq` por identidade (`Rc::ptr_eq` + `done`): estrutural
+/// recursaria para sempre em ciclos (frame que captura o gerador).
+#[derive(Debug, Clone)]
+pub struct GenHandle(pub Rc<RefCell<GenState>>);
+
+impl PartialEq for GenHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) && self.0.borrow().done == other.0.borrow().done
+    }
+}
+
+/// Estado de `map`/`filter`/`usort` entre chamadas do callback (RFC 0005).
+/// O frame chamador guarda o progresso; cada retorno do callback avanca
+/// (`advance_hof`) ate finalizar com o resultado empilhado.
+#[derive(Debug, Clone)]
+pub enum PendingHof {
+    /// `map`: aplica `func` a cada item, acumulando resultados.
+    Map {
+        func: FuncValue,
+        items: Vec<Value>,
+        /// Indice do item cuja chamada esta em voo.
+        next: usize,
+        acc: Vec<Value>,
+    },
+    /// `filter`: como `map`, mas so acumula quando o retorno e `Bool(true)`.
+    Filter {
+        func: FuncValue,
+        items: Vec<Value>,
+        next: usize,
+        acc: Vec<Value>,
+    },
+    /// `usort`: insertion sort estavel dirigido por comparacoes.
+    Sort {
+        func: FuncValue,
+        sorted: Vec<Value>,
+        /// Proximo par a comparar: `(sorted[j], sorted[j-1])`, `j = max(1, ..)`.
+        i: usize,
+        j: usize,
+    },
+}
+
+/// Handler de `try`: para onde saltar e com que escopos/pilha.
+#[derive(Debug, Clone, Copy)]
+pub struct Handler {
+    /// Instrucao do `catch` ou do bloco `finally`+`Rethrow`.
+    pub target: usize,
+    /// `scopes.len()` ao registrar (restaura no unwinding).
+    pub scope_len: usize,
+}
+
+/// Definicao de classe compilada (RFC 0017, Etapa 5): nome + tabela de
+/// metodos (cada um um `FuncValue` com ambiente capturado na definicao;
+/// `this` e vinculado na chamada).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassDef {
+    pub name: String,
+    pub methods: HashMap<String, FuncValue>,
 }
 
 /// Valor funcional de primeira classe: definicao + ambiente capturado.
@@ -66,12 +179,34 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
+            Self::Class(def) => write!(f, "<classe {}>", def.name),
+            Self::Instance { fields, .. } => {
+                let mut keys: Vec<&String> = fields.keys().collect();
+                keys.sort();
+                write!(f, "{{")?;
+                for (i, key) in keys.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    if let Some(value) = fields.get(*key) {
+                        write!(f, "{key}: {value}")?;
+                    }
+                }
+                write!(f, "}}")
+            }
             Self::Func(func) => write!(f, "<fn {}>", func.def.name),
+            Self::Generator(gen) => {
+                let state = gen.0.borrow();
+                write!(f, "<gerador {}>", state.func.def.name)
+            }
         }
     }
 }
 
 /// Definicao de funcao compilada.
+///
+/// `body` e `Rc` (o mesmo chunk e referenciado pelo `Frame` da ativacao;
+/// sem clonagem profunda por chamada; Etapa 3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDef {
     pub name: String,
@@ -80,7 +215,15 @@ pub struct FuncDef {
     pub defaults: Vec<Option<Value>>,
     /// `...rest` (no maximo um, por ultimo; RFC 0006).
     pub variadic: Option<String>,
-    pub body: Chunk,
+    /// Tipos dos parametros, alinhado a `params` (`None` = sem anotacao;
+    /// RFC 0016). Checados no `activate` da VM (apos defaults).
+    pub param_types: Vec<Option<TypeTag>>,
+    /// Tipo de retorno (`: tipo`; RFC 0016). Checado no `Return` da VM.
+    pub return_type: Option<TypeTag>,
+    /// `true` se o corpo contem `yield` (funcao geradora; RFC 0018).
+    /// Chamar NAO executa: devolve `Value::Generator` lazy.
+    pub is_generator: bool,
+    pub body: Rc<Chunk>,
 }
 
 /// Builtin da biblioteca-padrao nucleo (Fases 3 e 6).
@@ -180,6 +323,28 @@ pub enum Builtin {
     RandRange,
     /// `fs_list(dir)` — nomes de entradas ordenados (`[]` se vazio; RFC 0012).
     FsList,
+    /// `next(gen)` — proximo valor do gerador (erro se esgotado; RFC 0018).
+    Next,
+    /// `exhausted(gen)` — `Bool`: gerador terminou (RFC 0018).
+    Exhausted,
+    /// `async_spawn("f")` — `Int` (handle); roda `f` em thread (RFC 0019).
+    AsyncSpawn,
+    /// `async_join(h)` — bloqueia e devolve o retorno (RFC 0019).
+    AsyncJoin,
+    /// `tcp_connect(host, porta)` — `Int` (handle; RFC 0020).
+    TcpConnect,
+    /// `tcp_send(h, dados)` — bytes escritos (`Int`; RFC 0020).
+    TcpSend,
+    /// `tcp_recv(h, max)` — ate `max` bytes (`Str`; `Null` em EOF; RFC 0020).
+    TcpRecv,
+    /// `tcp_close(h)` — fecha (`Null`; RFC 0020).
+    TcpClose,
+    /// `redis_open(host, porta)` — `Int` (handle; sem AUTH na v1; RFC 0020).
+    RedisOpen,
+    /// `redis_exec(h, [cmd, args...])` — valor RESP (RFC 0020).
+    RedisExec,
+    /// `redis_close(h)` — fecha (`Null`; RFC 0020).
+    RedisClose,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -250,6 +415,17 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "sha256" => Some(Builtin::Sha256),
         "hmac_sha256" => Some(Builtin::HmacSha256),
         "hmac_verify" => Some(Builtin::HmacVerify),
+        "next" => Some(Builtin::Next),
+        "exhausted" => Some(Builtin::Exhausted),
+        "async_spawn" => Some(Builtin::AsyncSpawn),
+        "async_join" => Some(Builtin::AsyncJoin),
+        "tcp_connect" => Some(Builtin::TcpConnect),
+        "tcp_send" => Some(Builtin::TcpSend),
+        "tcp_recv" => Some(Builtin::TcpRecv),
+        "tcp_close" => Some(Builtin::TcpClose),
+        "redis_open" => Some(Builtin::RedisOpen),
+        "redis_exec" => Some(Builtin::RedisExec),
+        "redis_close" => Some(Builtin::RedisClose),
         _ => None,
     }
 }
@@ -289,6 +465,12 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::DbClose
         | Builtin::FsList
         | Builtin::HashPassword
+        | Builtin::Next
+        | Builtin::Exhausted
+        | Builtin::AsyncSpawn
+        | Builtin::AsyncJoin
+        | Builtin::TcpClose
+        | Builtin::RedisClose
         | Builtin::Sha256 => 1,
         Builtin::Push
         | Builtin::Contains
@@ -312,7 +494,12 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::VerifyPassword
         | Builtin::RegexMatch
         | Builtin::RegexSplit
-        | Builtin::HmacSha256 => 2,
+        | Builtin::HmacSha256
+        | Builtin::TcpConnect
+        | Builtin::TcpSend
+        | Builtin::TcpRecv
+        | Builtin::RedisOpen
+        | Builtin::RedisExec => 2,
         Builtin::DbExec
         | Builtin::DbQuery
         | Builtin::HttpServe
@@ -361,6 +548,8 @@ pub enum Op {
     Ge,
     /// Desempilha `Bool`; se falso, salta para `ip = alvo`.
     JumpIfFalse(u32),
+    /// Desempilha `Bool`; se verdadeiro, salta para `ip = alvo` (RFC 0018).
+    JumpIfTrue(u32),
     /// Salta para `ip = alvo`.
     Jump(u32),
     /// Empilha o valor atual de `names[idx]` (erro se indefinido).
@@ -417,6 +606,23 @@ pub enum Op {
     Rethrow,
     /// Chama o builtin `id` (`n` = aridade fixa do builtin).
     CallBuiltin(BuiltinId),
+    /// Checa o topo da pilha contra a tag (anotacao `: tipo`, RFC 0016;
+    /// sem desempilhar; erro `tipos incompativeis: esperava ...`).
+    CheckType(TypeTag),
+    /// Constroi classe (`BuildClass(nome_idx, n)`): desempilha `n` pares
+    /// `[nome(Str), metodo(Func)]` e empilha `Value::Class` (RFC 0017).
+    BuildClass(u32, u32),
+    /// Instancia (`NewMixed(desc_idx)`, como `CallMixed`): desempilha os
+    /// valores + a classe, ativa `novo` com `this` e entrega a
+    /// instancia (retorno do construtor ignorado; RFC 0017).
+    NewMixed(u32),
+    /// Chamada de metodo sobre variavel (`CallMethod(var, campo, desc)`;
+    /// RFC 0017): como `Index` + chamada, mas com write-back do `this`
+    /// final na variavel (mutacoes via `obj.metodo()` persistem).
+    CallMethod(u32, u32, u32),
+    /// Suspender gerador (`Yield`; RFC 0018): desempilha o valor e o
+    /// entrega ao retomador, guardando o frame para continuar depois.
+    Yield,
 }
 
 /// Identificador numerico estavel de builtin (para o bytecode).
@@ -491,6 +697,17 @@ impl BuiltinId {
             61 => Ok(Builtin::Sha256),
             62 => Ok(Builtin::HmacSha256),
             63 => Ok(Builtin::HmacVerify),
+            64 => Ok(Builtin::Next),
+            65 => Ok(Builtin::Exhausted),
+            66 => Ok(Builtin::AsyncSpawn),
+            67 => Ok(Builtin::AsyncJoin),
+            68 => Ok(Builtin::TcpConnect),
+            69 => Ok(Builtin::TcpSend),
+            70 => Ok(Builtin::TcpRecv),
+            71 => Ok(Builtin::TcpClose),
+            72 => Ok(Builtin::RedisOpen),
+            73 => Ok(Builtin::RedisExec),
+            74 => Ok(Builtin::RedisClose),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -563,17 +780,31 @@ impl From<Builtin> for BuiltinId {
             Builtin::Sha256 => 61,
             Builtin::HmacSha256 => 62,
             Builtin::HmacVerify => 63,
+            Builtin::Next => 64,
+            Builtin::Exhausted => 65,
+            Builtin::AsyncSpawn => 66,
+            Builtin::AsyncJoin => 67,
+            Builtin::TcpConnect => 68,
+            Builtin::TcpSend => 69,
+            Builtin::TcpRecv => 70,
+            Builtin::TcpClose => 71,
+            Builtin::RedisOpen => 72,
+            Builtin::RedisExec => 73,
+            Builtin::RedisClose => 74,
         };
         Self(id)
     }
 }
 
 /// Chunk de bytecode: constantes, nomes, funcoes e codigo.
+///
+/// `funcs` guarda `Rc` (compartilhado entre a tabela do chunk e os frames
+/// da VM sem clonar por chamada; Etapa 3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub constants: Vec<Value>,
     pub names: Vec<String>,
-    pub funcs: Vec<FuncDef>,
+    pub funcs: Vec<Rc<FuncDef>>,
     pub code: Vec<Op>,
 }
 
@@ -647,12 +878,18 @@ impl Chunk {
                         "chunk invalido em `{context}`: nome {idx} fora do pool"
                     )));
                 }
+                Op::BuildClass(name_idx, _) if (name_idx as usize) >= self.names.len() => {
+                    return Err(CompileError::new(format!(
+                        "chunk invalido em `{context}`: nome {name_idx} fora do pool"
+                    )));
+                }
                 Op::DefineFunc(idx) | Op::MakeFunc(idx) if (idx as usize) >= self.funcs.len() => {
                     return Err(CompileError::new(format!(
                         "chunk invalido em `{context}`: funcao {idx} inexistente"
                     )));
                 }
                 Op::JumpIfFalse(target)
+                | Op::JumpIfTrue(target)
                 | Op::Jump(target)
                 | Op::JumpIfNotNull(target)
                 | Op::TryBegin(target)
@@ -665,8 +902,24 @@ impl Chunk {
                 Op::CallBuiltin(id) => {
                     id.resolve()?;
                 }
-                Op::CallMixed(desc) => {
+                Op::CallMixed(desc) | Op::NewMixed(desc) => {
                     // Descritor existe; o tipo e checado em `call_mixed_slots`.
+                    call_mixed_slots(&self.constants, desc, context)?;
+                }
+                Op::CallMethod(var_idx, field_idx, desc) => {
+                    if (var_idx as usize) >= self.names.len() {
+                        return Err(CompileError::new(format!(
+                            "chunk invalido em `{context}`: nome {var_idx} fora do pool"
+                        )));
+                    }
+                    match self.constants.get(field_idx as usize) {
+                        Some(Value::Str(_)) => {}
+                        _ => {
+                            return Err(CompileError::new(format!(
+                                "chunk invalido em `{context}`: campo de metodo {field_idx} invalido"
+                            )));
+                        }
+                    }
                     call_mixed_slots(&self.constants, desc, context)?;
                 }
                 _ => {}
@@ -745,6 +998,11 @@ fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(
                 check_depth(height, 1, op, context)?;
                 (height, Some(vec![ip + 1]))
             }
+            // `CheckType` so espia o topo (anotacao `: tipo`, RFC 0016).
+            Op::CheckType(_) => {
+                check_depth(height, 1, op, context)?;
+                (height, Some(vec![ip + 1]))
+            }
             Op::IterList => {
                 check_depth(height, 1, op, context)?;
                 (height, Some(vec![ip + 1]))
@@ -778,7 +1036,7 @@ fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(
                 check_depth(height, 2, op, context)?;
                 (height - 2, Some(vec![ip + 1]))
             }
-            Op::JumpIfFalse(target) | Op::JumpIfNotNull(target) => {
+            Op::JumpIfFalse(target) | Op::JumpIfNotNull(target) | Op::JumpIfTrue(target) => {
                 check_depth(height, 1, op, context)?;
                 (height - 1, Some(vec![target as usize, ip + 1]))
             }
@@ -793,6 +1051,9 @@ fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(
             // `MakeFunc` captura o ambiente sem tocar na pilha de operandos.
             Op::MakeFunc(_) => (height + 1, Some(vec![ip + 1])),
             Op::Halt | Op::Return => (height, None),
+            // `Yield` desempilha e sai do frame (como `Return`); o
+            // validador estatico nao acompanha o salto dinamico.
+            Op::Yield => (height, None),
             Op::Call(arity) => {
                 let arity = arity as usize;
                 check_depth(height, arity as i64 + 1, op, context)?;
@@ -802,6 +1063,25 @@ fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(
                 let slots = call_mixed_slots(constants, desc, context)? as i64;
                 check_depth(height, slots + 1, op, context)?;
                 (height - slots, Some(vec![ip + 1]))
+            }
+            Op::NewMixed(desc) => {
+                // Como `CallMixed` (desempilha valores + classe, empilha
+                // a instancia): mesma aritmetica de pilha.
+                let slots = call_mixed_slots(constants, desc, context)? as i64;
+                check_depth(height, slots + 1, op, context)?;
+                (height - slots, Some(vec![ip + 1]))
+            }
+            Op::CallMethod(_, _, desc) => {
+                // Desempilha so os argumentos (a variavel e lida pelo nome);
+                // empilha o retorno.
+                let slots = call_mixed_slots(constants, desc, context)? as i64;
+                check_depth(height, slots, op, context)?;
+                (height - slots + 1, Some(vec![ip + 1]))
+            }
+            Op::BuildClass(_, count) => {
+                let pairs = count as i64;
+                check_depth(height, pairs * 2, op, context)?;
+                (height - pairs * 2 + 1, Some(vec![ip + 1]))
             }
             Op::CallBuiltin(id) => {
                 // `validate_shallow` ja rejeitou ids desconhecidos.
@@ -923,7 +1203,7 @@ struct Compiler {
 /// que o cruzam: fechar handler e rodar `finally` antes do desvio).
 struct PendingTry {
     /// Corpo do `finally` (clonado) para duplicar nas saidas.
-    finally_body: Option<Vec<Stmt>>,
+    finally_body: Option<Vec<StmtNode>>,
     /// `true` enquanto o corpo protegido compila (handler ativo no
     /// runtime); `false` nas regioes de `catch`/`finally` (handler ja
     /// consumido pelo unwinding ou pelo `TryEnd` do caminho normal).
@@ -1168,9 +1448,14 @@ impl Compiler {
             Value::Str(s) => Some(ConstKey::Str(s.clone())),
             Value::Bool(b) => Some(ConstKey::Bool(*b)),
             Value::Null => Some(ConstKey::Null),
-            // Compostos e funcoes: sem dedup (comparacao profunda cara,
-            // beneficio atipico).
-            Value::Array(_) | Value::Map(_) | Value::Func(_) => None,
+            // Compostos, funcoes, classes, instancias e geradores: sem
+            // dedup (comparacao profunda cara, beneficio atipico).
+            Value::Array(_)
+            | Value::Map(_)
+            | Value::Func(_)
+            | Value::Class(_)
+            | Value::Instance { .. }
+            | Value::Generator(_) => None,
         }
     }
 
@@ -1214,6 +1499,7 @@ impl Compiler {
         debug_assert!((target as usize) <= len as usize);
         match self.chunk.code[pos] {
             Op::JumpIfFalse(_) => self.chunk.code[pos] = Op::JumpIfFalse(target),
+            Op::JumpIfTrue(_) => self.chunk.code[pos] = Op::JumpIfTrue(target),
             Op::JumpIfNotNull(_) => self.chunk.code[pos] = Op::JumpIfNotNull(target),
             Op::Jump(_) => self.chunk.code[pos] = Op::Jump(target),
             Op::TryBegin(_) => self.chunk.code[pos] = Op::TryBegin(target),
@@ -1221,9 +1507,9 @@ impl Compiler {
         }
     }
 
-    fn compile_stmts(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
-        for stmt in stmts {
-            self.compile_stmt(stmt)?;
+    fn compile_stmts(&mut self, stmts: &[StmtNode]) -> Result<(), CompileError> {
+        for node in stmts {
+            self.compile_stmt(&node.stmt)?;
         }
         Ok(())
     }
@@ -1237,11 +1523,13 @@ impl Compiler {
         name: &str,
         params: &[rhp_parser::Param],
         variadic: Option<&str>,
-        body: &[Stmt],
+        return_ann: Option<TypeTag>,
+        body: &[StmtNode],
     ) -> Result<u32, CompileError> {
         let mut seen = std::collections::HashSet::new();
         let mut names = Vec::with_capacity(params.len());
         let mut defaults = Vec::with_capacity(params.len());
+        let mut param_types = Vec::with_capacity(params.len());
         for param in params {
             if !seen.insert(param.name.clone()) {
                 return Err(CompileError::new(format!(
@@ -1251,6 +1539,7 @@ impl Compiler {
             }
             names.push(param.name.clone());
             defaults.push(param.default.as_ref().map(eval_const_expr).transpose()?);
+            param_types.push(param.ann);
         }
         if let Some(rest) = variadic {
             if !seen.insert(rest.to_string()) {
@@ -1265,16 +1554,20 @@ impl Compiler {
         fn_compiler.emit(Op::Halt);
         let body_chunk = fn_compiler.chunk;
         body_chunk.validate()?;
+        let is_generator = body_chunk.code.iter().any(|op| matches!(op, Op::Yield));
         if self.chunk.funcs.len() >= u32::MAX as usize {
             return Err(CompileError::new("limite de funcoes excedido"));
         }
-        self.chunk.funcs.push(FuncDef {
+        self.chunk.funcs.push(Rc::new(FuncDef {
             name: name.to_string(),
             params: names,
             defaults,
             variadic: variadic.map(str::to_string),
-            body: body_chunk,
-        });
+            param_types,
+            return_type: return_ann,
+            is_generator,
+            body: Rc::new(body_chunk),
+        }));
         Ok((self.chunk.funcs.len() - 1) as u32)
     }
 
@@ -1301,12 +1594,94 @@ impl Compiler {
     /// indice, como um `while` com incremento. `VAR` e declarada a cada
     /// iteracao no escopo do corpo. `break` fecha corpo + laco; `continue`
     /// salta ao incremento.
-    fn compile_for(&mut self, var: &str, iter: &Expr, body: &[Stmt]) -> Result<(), CompileError> {
+    fn compile_for(
+        &mut self,
+        var: &str,
+        iter: &Expr,
+        body: &[StmtNode],
+    ) -> Result<(), CompileError> {
         self.emit_scope_open();
         let for_depth = self.scopes.len();
+        // Avalia o iteravel UMA vez e guarda em H_iter (RFC 0018: gerador
+        // ou colecao; o teste de tipo abaixo escolhe a forma do laco).
+        let iter_name = self.hidden_for_name("iter");
+        self.compile_expr(iter)?;
+        let iter_idx = self.intern_name(&iter_name)?;
+        self.emit(Op::DeclareName(iter_idx));
+        // if type(H_iter) == "gerador": forma lazy; senao, eager.
+        let iter_ref = self.intern_name(&iter_name)?;
+        self.emit(Op::LoadName(iter_ref));
+        self.emit(Op::CallBuiltin(BuiltinId::from(Builtin::Type)));
+        let gerador_idx = self.add_constant(Value::Str("gerador".to_string()))?;
+        self.emit(Op::Constant(gerador_idx));
+        self.emit(Op::Eq);
+        let eager_jump = self.emit(Op::JumpIfFalse(u32::MAX));
+        // ---- Forma lazy (gerador).
+        // while true { tmp = next; if exhausted { break }; x = tmp; BODY }
+        // O `exhausted` e testado ANTES (gerador ja esgotado = zero
+        // iteracoes) e DEPOIS de cada `next` (o gerador so termina
+        // *durante* um resume; o valor final e descartado). `tmp` usa
+        // `StoreName` (sem redeclare) para nao exigir segundo `close`
+        // (o rastreamento estatico de escopos e linear).
+        let tmp_name = self.hidden_for_name("prox");
+        let tmp_idx = self.intern_name(&tmp_name)?;
+        let tmp_null = self.add_constant(Value::Null)?;
+        self.emit(Op::Constant(tmp_null));
+        self.emit(Op::DeclareName(tmp_idx));
+        let iter_is_done = self.intern_name(&iter_name)?;
+        self.emit(Op::LoadName(iter_is_done));
+        self.emit(Op::CallBuiltin(BuiltinId::from(Builtin::Exhausted)));
+        let lazy_exit = self.emit(Op::JumpIfTrue(u32::MAX));
+        let lazy_start = self.chunk.code.len() as u32;
+        let iter_next = self.intern_name(&iter_name)?;
+        self.emit(Op::LoadName(iter_next));
+        self.emit(Op::CallBuiltin(BuiltinId::from(Builtin::Next)));
+        let tmp_store = self.intern_name(&tmp_name)?;
+        self.emit(Op::StoreName(tmp_store));
+        let iter_done = self.intern_name(&iter_name)?;
+        self.emit(Op::LoadName(iter_done));
+        self.emit(Op::CallBuiltin(BuiltinId::from(Builtin::Exhausted)));
+        let lazy_done_jump = self.emit(Op::JumpIfTrue(u32::MAX));
+        // Escopo do corpo (como na forma eager): o `DeclareName` de `x`
+        // cai dentro dele, nao no escopo do laco/global.
+        self.emit_scope_open();
+        let tmp_load = self.intern_name(&tmp_name)?;
+        self.emit(Op::LoadName(tmp_load));
+        let var_lazy = self.intern_name(var)?;
+        self.emit(Op::DeclareName(var_lazy));
+        let lazy_body_depth = self.scopes.len();
+        self.loops.push(LoopCtx {
+            is_loop: true,
+            break_depth: for_depth,
+            continue_depth: lazy_body_depth,
+            start: None,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
+        let saved_scopes_lazy = self.scopes.clone();
+        self.compile_stmts(body)?;
+        self.scopes = saved_scopes_lazy;
+        // Trampolim do `continue`: fecha o escopo do corpo e volta ao teste.
+        let lazy_continue = self.chunk.code.len() as u32;
+        self.emit_scope_close()?;
+        self.emit(Op::Jump(lazy_start));
+        let lazy_continues = std::mem::take(&mut self.loops.last_mut().expect("laco").continues);
+        for pos in &lazy_continues {
+            self.patch_jump(*pos, lazy_continue);
+        }
+        // Gerador esgotado no meio do resume: sai (o `tmp` descartado fica
+        // para a proxima forma; nada aberto para fechar aqui).
+        let lazy_done = self.chunk.code.len() as u32;
+        self.patch_jump(lazy_done_jump, lazy_done);
+        let lazy_done_exit = self.emit(Op::Jump(u32::MAX));
+        // ---- Forma eager (array/mapa): a de antes, sobre H_iter.
+        // (JumpIfTrue nao existe; o salto condicional acima ja desviou.)
+        let eager_label = self.chunk.code.len() as u32;
+        self.patch_jump(eager_jump, eager_label);
         let list_name = self.hidden_for_name("lista");
         let idx_name = self.hidden_for_name("indice");
-        self.compile_expr(iter)?;
+        let iter_eager = self.intern_name(&iter_name)?;
+        self.emit(Op::LoadName(iter_eager));
         self.emit(Op::IterList);
         let list_idx = self.intern_name(&list_name)?;
         self.emit(Op::DeclareName(list_idx));
@@ -1324,15 +1699,9 @@ impl Compiler {
         self.emit(Op::Lt);
         let exit_jump = self.emit(Op::JumpIfFalse(u32::MAX));
         self.emit_scope_open();
-        let body_depth = self.scopes.len();
-        self.loops.push(LoopCtx {
-            is_loop: true,
-            break_depth: for_depth,
-            continue_depth: body_depth,
-            start: None,
-            breaks: Vec::new(),
-            continues: Vec::new(),
-        });
+        // Sem `push` novo: o LoopCtx e o mesmo da forma lazy (um `for`,
+        // dois corpos; `break` das duas formas converge no mesmo fim e
+        // `continue` foi separado por forma acima).
         // VAR = H_list[H_idx].
         let list_elem = self.intern_name(&list_name)?;
         self.emit(Op::LoadName(list_elem));
@@ -1359,6 +1728,9 @@ impl Compiler {
         self.emit(Op::Jump(loop_start));
         let exit_target = self.chunk.code.len() as u32;
         self.patch_jump(exit_jump, exit_target);
+        // Saida da forma lazy (gerador esgotado) converge no mesmo fim.
+        self.patch_jump(lazy_exit, exit_target);
+        self.patch_jump(lazy_done_exit, exit_target);
         let Some(loop_ctx) = self.loops.pop() else {
             return Err(CompileError::new(
                 "desequilibrio interno de lacos".to_string(),
@@ -1378,7 +1750,7 @@ impl Compiler {
     /// `try`: caminho normal ou desvio abrupto). Codigo de corpo e neutro
     /// na pilha de operandos; `break`/`continue`/`return` dentro da copia
     /// nao disparam nova duplicacao (substituem o fluxo em curso).
-    fn emit_finally_copy(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
+    fn emit_finally_copy(&mut self, body: &[StmtNode]) -> Result<(), CompileError> {
         self.emit_scope_open();
         self.emitting_finally += 1;
         let saved = self.scopes.clone();
@@ -1401,7 +1773,7 @@ impl Compiler {
         // Do mais interno para fora. `TryEnd` marca o handler como
         // consumido NESTE caminho: copias de `finally` emitidas a seguir
         // (que podem conter novos desvios) nao o repetem.
-        let mut copies: Vec<Vec<Stmt>> = Vec::new();
+        let mut copies: Vec<Vec<StmtNode>> = Vec::new();
         let mut i = self.pending_trys.len();
         while i > 0 {
             i -= 1;
@@ -1441,10 +1813,10 @@ impl Compiler {
     /// `finally` via `emit_abrupt_exits` (braco respectivo).
     fn compile_try(
         &mut self,
-        body: &[Stmt],
+        body: &[StmtNode],
         catch_var: &Option<String>,
-        catch_body: &Option<Vec<Stmt>>,
-        finally_body: &Option<Vec<Stmt>>,
+        catch_body: &Option<Vec<StmtNode>>,
+        finally_body: &Option<Vec<StmtNode>>,
     ) -> Result<(), CompileError> {
         let handler_jump = self.emit(Op::TryBegin(u32::MAX));
         self.emit_scope_open();
@@ -1502,8 +1874,8 @@ impl Compiler {
     fn compile_if(
         &mut self,
         cond: &Expr,
-        then_branch: &[Stmt],
-        else_branch: &Option<Vec<Stmt>>,
+        then_branch: &[StmtNode],
+        else_branch: &Option<Vec<StmtNode>>,
     ) -> Result<(), CompileError> {
         self.compile_expr(cond)?;
         let else_jump = self.emit(Op::JumpIfFalse(u32::MAX));
@@ -1730,6 +2102,15 @@ impl Compiler {
                 self.compile_expr(other)?;
             }
         }
+        let desc_idx = self.emit_call_args(args)?;
+        self.emit(Op::CallMixed(desc_idx));
+        Ok(())
+    }
+
+    /// Emite os valores dos argumentos + descritor da chamada mista
+    /// (`0` = posicional, `1` = spread, `Str` = nomeado); devolve o indice
+    /// do descritor. Compartilhado por `CallMixed` e `NewMixed` (RFC 0017).
+    fn emit_call_args(&mut self, args: &[CallArg]) -> Result<u32, CompileError> {
         for arg in args {
             self.compile_expr(arg.value())?;
         }
@@ -1744,8 +2125,15 @@ impl Compiler {
                 CallArg::Named(name, _) => Value::Str(name.clone()),
             })
             .collect();
-        let desc_idx = self.add_constant(Value::Array(desc))?;
-        self.emit(Op::CallMixed(desc_idx));
+        self.add_constant(Value::Array(desc))
+    }
+
+    /// Compila `new Nome(args)` (RFC 0017): avalia a classe e os argumentos
+    /// e emite `NewMixed` (mesmo descritor da chamada mista).
+    fn compile_new(&mut self, class: &Expr, args: &[CallArg]) -> Result<(), CompileError> {
+        self.compile_expr(class)?;
+        let desc_idx = self.emit_call_args(args)?;
+        self.emit(Op::NewMixed(desc_idx));
         Ok(())
     }
 
@@ -1812,14 +2200,14 @@ impl Compiler {
     /// `cond` ausente = sempre verdadeiro.
     fn compile_for_c(
         &mut self,
-        init: &Option<Box<Stmt>>,
+        init: &Option<Box<StmtNode>>,
         cond: &Option<Expr>,
-        step: &Option<Box<Stmt>>,
-        body: &[Stmt],
+        step: &Option<Box<StmtNode>>,
+        body: &[StmtNode],
     ) -> Result<(), CompileError> {
         self.emit_scope_open();
         if let Some(init) = init {
-            self.compile_stmt(init)?;
+            self.compile_stmt(&init.stmt)?;
         }
         let loop_start = self.chunk.code.len() as u32;
         let exit_jump = match cond {
@@ -1845,7 +2233,7 @@ impl Compiler {
         let continue_target = self.chunk.code.len() as u32;
         self.emit_scope_close()?;
         if let Some(step) = step {
-            self.compile_stmt(step)?;
+            self.compile_stmt(&step.stmt)?;
         }
         self.emit(Op::Jump(loop_start));
         let exit_target = self.chunk.code.len() as u32;
@@ -1873,7 +2261,7 @@ impl Compiler {
                 self.compile_expr(expr)?;
                 self.emit(Op::Print);
             }
-            Stmt::Let { name, init } => {
+            Stmt::Let { name, ann, init } => {
                 match init {
                     Some(expr) => self.compile_expr(expr)?,
                     None => {
@@ -1881,11 +2269,17 @@ impl Compiler {
                         self.emit(Op::Constant(idx));
                     }
                 }
+                if let Some(tag) = ann {
+                    self.emit(Op::CheckType(*tag));
+                }
                 let name_idx = self.intern_name(name)?;
                 self.emit(Op::DeclareName(name_idx));
             }
-            Stmt::Const { name, init } => {
+            Stmt::Const { name, ann, init } => {
                 self.compile_expr(init)?;
+                if let Some(tag) = ann {
+                    self.emit(Op::CheckType(*tag));
+                }
                 let name_idx = self.intern_name(name)?;
                 self.emit(Op::DeclareName(name_idx));
                 self.declare_const(name);
@@ -2031,9 +2425,11 @@ impl Compiler {
                 name,
                 params,
                 variadic,
+                return_ann,
                 body,
             } => {
-                let func_idx = self.compile_func_body(name, params, variadic.as_deref(), body)?;
+                let func_idx =
+                    self.compile_func_body(name, params, variadic.as_deref(), *return_ann, body)?;
                 self.intern_name(name)?;
                 self.emit(Op::DefineFunc(func_idx));
             }
@@ -2052,6 +2448,21 @@ impl Compiler {
                 }
                 self.emit(Op::Return);
             }
+            Stmt::Yield { expr } => {
+                if !self.in_function {
+                    return Err(CompileError::new("`yield` fora de funcao"));
+                }
+                // `yield` cruza `try`s como `return` (handler + `finally`).
+                self.emit_abrupt_exits(None)?;
+                match expr {
+                    Some(expr) => self.compile_expr(expr)?,
+                    None => {
+                        let idx = self.add_constant(Value::Null)?;
+                        self.emit(Op::Constant(idx));
+                    }
+                }
+                self.emit(Op::Yield);
+            }
             Stmt::Throw { expr } => {
                 self.compile_expr(expr)?;
                 self.emit(Op::Throw);
@@ -2062,6 +2473,25 @@ impl Compiler {
                 catch_body,
                 finally_body,
             } => self.compile_try(body, catch_var, catch_body, finally_body)?,
+            Stmt::ClassDef { name, methods } => {
+                let name_idx = self.intern_name(name)?;
+                for method in methods {
+                    let func_idx = self.compile_func_body(
+                        &format!("{name}::{}", method.name),
+                        &method.params,
+                        method.variadic.as_deref(),
+                        method.return_ann,
+                        &method.body,
+                    )?;
+                    let method_name_idx = self.add_constant(Value::Str(method.name.clone()))?;
+                    self.emit(Op::Constant(method_name_idx));
+                    self.emit(Op::MakeFunc(func_idx));
+                }
+                let count = u32::try_from(methods.len())
+                    .map_err(|_| CompileError::new("classe com metodos demais".to_string()))?;
+                self.emit(Op::BuildClass(name_idx, count));
+                self.emit(Op::DeclareName(name_idx));
+            }
             Stmt::Block(stmts) => {
                 self.emit_scope_open();
                 self.compile_stmts(stmts)?;
@@ -2152,6 +2582,17 @@ impl Compiler {
                 self.compile_expr(base)?;
                 self.compile_expr(index)?;
                 self.emit(Op::Index);
+            }
+            Expr::Member { obj, field } => {
+                // `obj.campo` = `obj["campo"]`; em instancia resolve campo
+                // ou metodo vinculado (RFC 0017).
+                self.compile_expr(obj)?;
+                let field_idx = self.add_constant(Value::Str(field.clone()))?;
+                self.emit(Op::Constant(field_idx));
+                self.emit(Op::Index);
+            }
+            Expr::New { class, args } => {
+                self.compile_new(class, args)?;
             }
             Expr::Unary { op, expr } => {
                 self.compile_expr(expr)?;
@@ -2258,6 +2699,19 @@ impl Compiler {
                         name: name.clone(),
                         args: args.clone(),
                     })?;
+                } else if let Expr::Member { obj, field } = callee.as_ref() {
+                    if let Expr::Var(var) = obj.as_ref() {
+                        // `var.metodo(args)`: chamada de metodo com
+                        // write-back do `this` (RFC 0017; coerente com
+                        // `a[i] = v`, que tambem exige variavel nomeada).
+                        let var_idx = self.intern_name(var)?;
+                        let field_idx = self.add_constant(Value::Str(field.clone()))?;
+                        let desc_idx = self.emit_call_args(args)?;
+                        self.emit(Op::CallMethod(var_idx, field_idx, desc_idx));
+                    } else {
+                        // `expr.metodo(args)`: via `Index`, sem write-back.
+                        self.compile_call_mixed(callee, args)?;
+                    }
                 } else if args.iter().all(|a| matches!(a, CallArg::Pos(_))) {
                     self.compile_expr(callee)?;
                     for arg in args {
@@ -2276,6 +2730,7 @@ impl Compiler {
                     "{closure}",
                     &data.params,
                     data.variadic.as_deref(),
+                    data.return_ann,
                     &data.body,
                 )?;
                 self.emit(Op::MakeFunc(func_idx));
@@ -2291,8 +2746,8 @@ impl Compiler {
 /// Indica se a execucao nunca passa do fim desta lista de instrucoes
 /// (termina em `break`, `continue` ou `return`, considerando `if`/`{}`).
 /// Usado para nao emitir fechamento de escopo em codigo inalancavel.
-fn diverges(stmts: &[Stmt]) -> bool {
-    match stmts.last() {
+fn diverges(nodes: &[StmtNode]) -> bool {
+    match nodes.last().map(|node| &node.stmt) {
         Some(Stmt::Break)
         | Some(Stmt::BreakN(_))
         | Some(Stmt::Continue)
@@ -2336,9 +2791,10 @@ mod tests {
     #[test]
     fn compiles_echo_hello() {
         let program = Program {
-            statements: vec![Stmt::Echo {
+            statements: vec![StmtNode::from(Stmt::Echo {
                 expr: Expr::StringLiteral("Hello from RHP!".to_string()),
-            }],
+            })],
+            trailing_comments: vec![],
         };
         let chunk = compile(&program).expect("compile deve passar");
         assert_eq!(
@@ -2350,7 +2806,11 @@ mod tests {
 
     #[test]
     fn compiles_empty_program_to_halt_only() {
-        let chunk = compile(&Program { statements: vec![] }).expect("deve passar");
+        let chunk = compile(&Program {
+            statements: vec![],
+            trailing_comments: vec![],
+        })
+        .expect("deve passar");
         assert!(chunk.constants.is_empty());
         assert_eq!(chunk.code, vec![Op::Halt]);
     }
@@ -2892,6 +3352,17 @@ mod tests {
             Builtin::Sha256,
             Builtin::HmacSha256,
             Builtin::HmacVerify,
+            Builtin::Next,
+            Builtin::Exhausted,
+            Builtin::AsyncSpawn,
+            Builtin::AsyncJoin,
+            Builtin::TcpConnect,
+            Builtin::TcpSend,
+            Builtin::TcpRecv,
+            Builtin::TcpClose,
+            Builtin::RedisOpen,
+            Builtin::RedisExec,
+            Builtin::RedisClose,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);
@@ -2982,7 +3453,10 @@ mod tests {
             params: vec![],
             defaults: vec![],
             variadic: None,
-            body: Chunk::new(),
+            param_types: vec![],
+            return_type: None,
+            is_generator: false,
+            body: Rc::new(Chunk::new()),
         });
         assert_eq!(
             Value::Func(FuncValue {

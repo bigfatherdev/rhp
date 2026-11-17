@@ -19,6 +19,36 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- `fmt` preserva comentários e linhas em branco (Etapa 4, DevX):
+  trivia `//` no lexer, `StmtNode` com decoracao, reemissao idempotente.
+  Registro: `changes/2026-11-16-feat-fmt-comentarios.md`.
+- Stack traces em erros de runtime (Etapa 4): `VmError.trace` + `  em f`
+  na CLI (message intacta p/ `try`). Registro:
+  `changes/2026-11-16-feat-stack-traces.md`.
+- REPL com estado persistente (Etapa 4): `rhp repl` + `Vm::run_continue`.
+  Registro: `changes/2026-11-16-feat-repl.md`.
+- Trace de execucao + LSP minimo (Etapa 4): `rhp run --trace`,
+  `rhp lsp` (JSON-RPC stdio, diagnostics). Registro:
+  `changes/2026-11-16-feat-trace-lsp.md`.
+- Conectores TCP/Redis/MySQL (RFC 0020, Etapa 5): `tcp_*`, `redis_*`
+  (RESP2), `db_open("mysql:...")` reaproveitando `db_*`. Testes com
+  servidores in-process. Registro:
+  `changes/2026-11-16-feat-conectores-tcp-redis-mysql.md`.
+- Tarefas assíncronas (RFC 0019, Etapa 5): `async_spawn("f")` (thread
+  isolada, recompila o programa) + `async_join(h)` (bloqueia, devolve
+  o retorno desserializado). Registro:
+  `changes/2026-11-16-feat-async-spawn-join.md`.
+- Geradores lazy (RFC 0018, Etapa 5): `yield`, `next`/`exhausted`,
+  `for x in gen` (duas formas), `type()` = gerador, `==` por identidade.
+  Registro: `changes/2026-11-16-feat-geradores.md`.
+- Classes mínimas (RFC 0017, Etapa 5): `class`, `new` (construtor `novo`),
+  `obj.metodo()` com `this` e write-back, `type()` classe/instância.
+  Por valor, sem herança. Registro:
+  `changes/2026-11-16-feat-classes-minimas.md`.
+- Anotações de tipo com checagem em runtime (RFC 0016, Etapa 5):
+  `let x: int`, `fn f(a: int): int`, 8 tipos, erro `tipos incompativeis`
+  (E3001). Opt-in, sem coercao. Registro:
+  `changes/2026-11-16-feat-tipos-anotacoes.md`.
 - Teto de heap opt-in (RFC 0015, Etapa 3): `VmLimits.max_heap_bytes` +
   `rhp run --max-heap-bytes N`, estimador do modelo com enforcement O(1)
   amortizado, erro `heap excedeu o limite` (E3012). Padrão ilimitado.

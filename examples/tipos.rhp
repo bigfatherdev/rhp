@@ -1,0 +1,15 @@
+// Anotacoes de tipo (RFC 0016): checadas em runtime, sem coercao.
+fn soma(a: int, b: int = 10): int {
+  return a + b;
+}
+echo soma(1);
+echo soma(1, 2);
+
+let nome: string = "rhp";
+echo nome;
+
+const LIMITE: int = 100;
+echo LIMITE;
+
+let dobro = fn (v: int): int => v * 2;
+echo dobro(21);

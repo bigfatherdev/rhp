@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-
 fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
@@ -28,6 +27,18 @@ fn run_temp_source(name: &str, source: &str) -> std::process::Output {
     let file = dir.join(name);
     std::fs::write(&file, source).expect("nao foi possivel escrever programa temporario");
     run_file(&file)
+}
+
+fn run_temp_source_trace(name: &str, source: &str) -> std::process::Output {
+    let dir = std::env::temp_dir().join(format!("rhp-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    let file = dir.join(name);
+    std::fs::write(&file, source).expect("nao foi possivel escrever programa temporario");
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    Command::new(rhp_bin)
+        .args(["run", "--trace", &file.to_string_lossy()])
+        .output()
+        .expect("falha ao executar o binario rhp")
 }
 
 #[test]
@@ -1119,6 +1130,73 @@ fn rhp_run_reports_runtime_type_error() {
     assert!(
         stderr.contains("incompativeis"),
         "stderr deveria mencionar tipos incompativeis, obteve: {stderr}"
+    );
+}
+
+#[test]
+fn rhp_run_error_shows_call_stack() {
+    // Etapa 4: stack trace da mais interna para a mais externa; erro no
+    // nivel superior nao imprime pilha.
+    let output = run_temp_source(
+        "trace.rhp",
+        "fn f() {\n  g();\n}\nfn g() {\n  x_indefinida;\n}\nf();\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let pos_g = stderr.find("em g").expect("trace deveria ter `em g`");
+    let pos_f = stderr.find("em f").expect("trace deveria ter `em f`");
+    assert!(pos_g < pos_f, "ordem interna->externa, obteve: {stderr}");
+    let flat = run_temp_source("flat.rhp", "x_indefinida;\n");
+    assert!(!flat.status.success());
+    let flat_err = String::from_utf8_lossy(&flat.stderr);
+    assert!(
+        !flat_err.contains("  em "),
+        "nivel superior nao tem pilha, obteve: {flat_err}"
+    );
+}
+
+#[test]
+fn rhp_run_trace_prints_ops_to_stderr() {
+    // Etapa 4: `rhp run --trace` despeja `ip` + op em stderr; a saida do
+    // programa continua intacta em stdout.
+    let output = run_temp_source_trace("trace.rhp", "echo 1 + 2;\n");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"3\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[trace]"), "obteve: {stderr}");
+    assert!(stderr.contains("Constant"), "obteve: {stderr}");
+    assert!(stderr.contains("Halt"), "obteve: {stderr}");
+}
+
+#[test]
+fn rhp_repl_keeps_state_across_lines() {
+    // Etapa 4: `rhp repl` com stdin redirecionado; estado sobrevive,
+    // erro de uma linha nao mata a sessao.
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let mut child = Command::new(rhp_bin)
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("falha ao iniciar rhp repl");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin do repl")
+        .write_all(
+            b"let x = 40;\nfn soma(a) { return a + 2; }\necho soma(x);\necho x_ruim;\necho x;\n",
+        )
+        .expect("escrever no stdin do repl");
+    let output = child.wait_with_output().expect("aguardar repl");
+    assert!(output.status.success(), "repl nao deveria falhar");
+    assert_eq!(output.stdout, b"42\n40\n", "stdout={:?}", output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("x_ruim"),
+        "erro da linha ruim, obteve: {stderr}"
     );
 }
 

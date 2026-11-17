@@ -6,20 +6,45 @@
 //! `format(parse(format(p))) == format(p)`.
 
 use rhp_parser::{
-    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, Param, Program, Stmt, UnaryOp,
+    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, Param, Program, Stmt, StmtNode, UnaryOp,
 };
 use std::fmt::Write as _;
 
 /// Formata o programa no estilo canonico.
 ///
-/// A saida termina sempre com exatamente um `\n` (programa vazio => `""`).
+/// Comentarios e linhas em branco (Etapa 4): cada statement reemite seus
+/// `leading` (um por linha), `trailing` (fim da linha final) e ate uma
+/// linha em branco antes; comentarios apos o ultimo statement vao ao fim.
+/// Idempotente: `format(parse(format(p))) == format(p)`.
 #[must_use]
 pub fn format(program: &Program) -> String {
     let mut out = String::new();
-    for stmt in &program.statements {
-        fmt_stmt(stmt, 0, &mut out);
+    for (i, node) in program.statements.iter().enumerate() {
+        fmt_node(node, 0, i > 0, &mut out);
+    }
+    for text in &program.trailing_comments {
+        let _ = writeln!(out, "//{text}");
     }
     out
+}
+
+/// Statement com decoracao (comentarios + linha em branco).
+fn fmt_node(node: &StmtNode, level: usize, not_first: bool, out: &mut String) {
+    if not_first && node.blank_before {
+        out.push('\n');
+    }
+    for text in &node.leading {
+        indent(level, out);
+        let _ = writeln!(out, "//{text}");
+    }
+    fmt_stmt(&node.stmt, level, out);
+    if let Some(text) = node.trailing.as_ref() {
+        // Todo braco de `fmt_stmt` termina a linha com `\n`: reinsere o
+        // comentario de fim de linha antes dela.
+        debug_assert!(out.ends_with('\n'));
+        out.pop();
+        let _ = writeln!(out, " //{text}");
+    }
 }
 
 /// Formata fonte RHP (atalho lex+parse+format).
@@ -45,20 +70,22 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             let _ = writeln!(out, "echo {};", fmt_expr(expr, 0));
         }
-        Stmt::Let { name, init } => {
+        Stmt::Let { name, ann, init } => {
             indent(level, out);
+            let ann = ann.map(|t| format!(": {}", t.name())).unwrap_or_default();
             match init {
                 Some(expr) => {
-                    let _ = writeln!(out, "let {name} = {};", fmt_expr(expr, 0));
+                    let _ = writeln!(out, "let {name}{ann} = {};", fmt_expr(expr, 0));
                 }
                 None => {
-                    let _ = writeln!(out, "let {name};");
+                    let _ = writeln!(out, "let {name}{ann};");
                 }
             }
         }
-        Stmt::Const { name, init } => {
+        Stmt::Const { name, ann, init } => {
             indent(level, out);
-            let _ = writeln!(out, "const {name} = {};", fmt_expr(init, 0));
+            let ann = ann.map(|t| format!(": {}", t.name())).unwrap_or_default();
+            let _ = writeln!(out, "const {name}{ann} = {};", fmt_expr(init, 0));
         }
         Stmt::Static { name, init } => {
             indent(level, out);
@@ -181,6 +208,15 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             let _ = writeln!(out, "throw {};", fmt_expr(expr, 0));
         }
+        Stmt::Yield { expr } => {
+            indent(level, out);
+            match expr {
+                Some(expr) => {
+                    let _ = writeln!(out, "yield {};", fmt_expr(expr, 0));
+                }
+                None => out.push_str("yield;\n"),
+            }
+        }
         Stmt::For { var, iter, body } => {
             indent(level, out);
             let _ = writeln!(out, "for {var} in {} {{", fmt_expr(iter, 0));
@@ -225,15 +261,45 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             name,
             params,
             variadic,
+            return_ann,
             body,
         } => {
             indent(level, out);
+            let ret = return_ann
+                .map(|t| format!(": {}", t.name()))
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
-                "fn {name}({}) {{",
+                "fn {name}({}){ret} {{",
                 fmt_params(params, variadic.as_deref())
             );
             fmt_block(body, level + 1, out);
+            indent(level, out);
+            out.push_str("}\n");
+        }
+        Stmt::ClassDef { name, methods } => {
+            indent(level, out);
+            out.push_str(&format!("class {name} {{\n"));
+            for method in methods {
+                indent(level + 1, out);
+                let ret = method
+                    .return_ann
+                    .map(|t| format!(": {}", t.name()))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "fn {}({}){ret} {{",
+                    method.name,
+                    fmt_params(&method.params, method.variadic.as_deref())
+                );
+                // Corpo com indentacao absoluta (metodos nao aninham em
+                // expressoes, ao contrario de closures).
+                let mut body = String::new();
+                fmt_block(&method.body, level + 2, &mut body);
+                out.push_str(&body);
+                indent(level + 1, out);
+                out.push_str("}\n");
+            }
             indent(level, out);
             out.push_str("}\n");
         }
@@ -278,7 +344,7 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             // `def` e `fn`/`let`/`const`: formata sem indentacao extra e
             // troca a quebra final por `;`/bloco na mesma linha logica.
             let mut inner = String::new();
-            fmt_stmt(def, 0, &mut inner);
+            fmt_node(def, 0, false, &mut inner);
             let inner = inner.trim_end();
             let _ = writeln!(out, "{inner}");
         }
@@ -296,9 +362,9 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
     }
 }
 
-fn fmt_block(stmts: &[Stmt], level: usize, out: &mut String) {
-    for stmt in stmts {
-        fmt_stmt(stmt, level, out);
+fn fmt_block(stmts: &[StmtNode], level: usize, out: &mut String) {
+    for (i, node) in stmts.iter().enumerate() {
+        fmt_node(node, level, i > 0, out);
     }
 }
 
@@ -306,9 +372,12 @@ fn fmt_block(stmts: &[Stmt], level: usize, out: &mut String) {
 fn fmt_params(params: &[Param], variadic: Option<&str>) -> String {
     let mut parts: Vec<String> = params
         .iter()
-        .map(|p| match &p.default {
-            Some(d) => format!("{} = {}", p.name, fmt_expr(d, 0)),
-            None => p.name.clone(),
+        .map(|p| {
+            let ann = p.ann.map(|t| format!(": {}", t.name())).unwrap_or_default();
+            match &p.default {
+                Some(d) => format!("{}{ann} = {}", p.name, fmt_expr(d, 0)),
+                None => format!("{}{ann}", p.name),
+            }
         })
         .collect();
     if let Some(rest) = variadic {
@@ -328,15 +397,15 @@ fn fmt_stmt_one_line(stmt: &Stmt) -> String {
 
 /// Cabecalho `for init; cond; passo` (partes vazias ok; RFC 0008).
 fn fmt_for_c_head(
-    init: &Option<Box<Stmt>>,
+    init: &Option<Box<StmtNode>>,
     cond: &Option<Expr>,
-    step: &Option<Box<Stmt>>,
+    step: &Option<Box<StmtNode>>,
 ) -> String {
     let mut head = String::from("for");
     match init {
-        Some(stmt) => {
+        Some(node) => {
             head.push(' ');
-            head.push_str(&fmt_stmt_one_line(stmt));
+            head.push_str(&fmt_stmt_one_line(&node.stmt));
         }
         None => head.push_str(" ;"),
     }
@@ -348,9 +417,13 @@ fn fmt_for_c_head(
         }
         None => head.push_str(" ;"),
     }
-    if let Some(stmt) = step {
+    if let Some(node) = step {
         head.push(' ');
-        head.push_str(fmt_stmt_one_line(stmt).trim_end_matches(';').trim_end());
+        head.push_str(
+            fmt_stmt_one_line(&node.stmt)
+                .trim_end_matches(';')
+                .trim_end(),
+        );
     }
     head
 }
@@ -474,6 +547,13 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
             format!("{name}({})", inner.join(", "))
         }
+        Expr::Member { obj, field } => {
+            format!("{}.{field}", fmt_atom(obj))
+        }
+        Expr::New { class, args } => {
+            let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
+            format!("new {}({})", fmt_atom(class), inner.join(", "))
+        }
         Expr::CallValue { callee, args } => {
             let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
             format!("{}({})", fmt_atom(callee), inner.join(", "))
@@ -484,8 +564,12 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             // nivel absoluto — aceito nesta etapa, ver RFC 0003 §7).
             let mut body = String::new();
             fmt_block(&data.body, 1, &mut body);
+            let ret = data
+                .return_ann
+                .map(|t| format!(": {}", t.name()))
+                .unwrap_or_default();
             format!(
-                "fn ({}) {{\n{body}}}",
+                "fn ({}){ret} {{\n{body}}}",
                 fmt_params(&data.params, data.variadic.as_deref())
             )
         }
@@ -540,6 +624,8 @@ fn fmt_atom(expr: &Expr) -> String {
         | Expr::CallValue { .. }
         | Expr::Closure(_)
         | Expr::Index { .. }
+        | Expr::Member { .. }
+        | Expr::New { .. }
         | Expr::Array(_)
         | Expr::Map(_)
         | Expr::StringLiteral(_)
@@ -790,7 +876,88 @@ mod tests {
     }
 
     #[test]
+    fn preserves_type_annotations() {
+        // Etapa 5 (RFC 0016): anotacoes reemitidas no canonico.
+        assert_eq!(fmt("let x:int=1;"), "let x: int = 1;\n");
+        assert_eq!(
+            fmt("const N : string = \"a\";"),
+            "const N: string = \"a\";\n"
+        );
+        assert_eq!(
+            fmt("fn soma(a:int,b=1):int{return a+b;}"),
+            "fn soma(a: int, b = 1): int {\n  return a + b;\n}\n"
+        );
+        assert_eq!(
+            fmt("let d=fn(v:int):int=>v*2;"),
+            "let d = fn (v: int): int {\n  return v * 2;\n};\n"
+        );
+        check_idempotent("let x: int = 1;\nfn f(a: string): bool {\n  return true;\n}\n");
+    }
+
+    #[test]
+    fn preserves_classes_and_members() {
+        // Etapa 5 (RFC 0017): classe, `new`, `.campo`, `this`.
+        let src = "class Contador {\n  fn novo() {\n    this[\"n\"] = 0;\n  }\n  fn inc(): int {\n    return this[\"n\"];\n  }\n}\n";
+        assert_eq!(
+            fmt("class Contador{fn novo(){this[\"n\"]=0;}fn inc():int{return this[\"n\"];}}"),
+            src
+        );
+        check_idempotent(src);
+        assert_eq!(fmt("echo c.n;"), "echo c.n;\n");
+        assert_eq!(fmt("let c=new Contador();"), "let c = new Contador();\n");
+        check_idempotent("let c = new Contador();\necho c.inc(1, x: 2);\n");
+    }
+
+    #[test]
     fn reports_syntax_errors() {
         assert!(format_source("echo \"x\"").is_err());
+    }
+
+    #[test]
+    fn preserves_yield() {
+        // Etapa 5 (RFC 0018): `yield` com e sem valor, idempotente.
+        assert_eq!(
+            fmt("fn g(){yield 1;yield;}"),
+            "fn g() {\n  yield 1;\n  yield;\n}\n"
+        );
+        check_idempotent("fn g() {\n  yield 1;\n  yield;\n}\n");
+    }
+
+    #[test]
+    fn preserves_line_comments() {
+        // Etapa 4: comentarios de linha propria, trailing e de fim de
+        // arquivo sobrevivem ao fmt, na ordem relativa.
+        let src = "// cabecalho\nlet x = 1; // fim da linha\necho x;\n// eof\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "// cabecalho\nlet x = 1; // fim da linha\necho x;\n// eof\n"
+        );
+        check_idempotent(src);
+    }
+
+    #[test]
+    fn preserves_comments_in_blocks() {
+        let src = "if true {\n  // dentro\n  echo 1;\n} // fim\n";
+        let out = fmt(src);
+        assert_eq!(out, "if true {\n  // dentro\n  echo 1;\n} // fim\n");
+        check_idempotent(src);
+    }
+
+    #[test]
+    fn preserves_single_blank_line() {
+        let src = "echo 1;\n\n\necho 2;\n";
+        assert_eq!(fmt(src), "echo 1;\n\necho 2;\n");
+        check_idempotent(src);
+    }
+
+    #[test]
+    fn comments_do_not_change_semantics() {
+        // Mesmo AST com e sem comentarios (comparacao estrutural).
+        let with = rhp_parser::parse_source("// c\necho 1; // t\n").expect("parse deve passar");
+        let without = rhp_parser::parse_source("echo 1;\n").expect("parse deve passar");
+        let ws: Vec<_> = with.statements.iter().map(|n| &n.stmt).collect();
+        let wo: Vec<_> = without.statements.iter().map(|n| &n.stmt).collect();
+        assert_eq!(ws, wo);
     }
 }

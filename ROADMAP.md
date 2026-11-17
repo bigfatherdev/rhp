@@ -85,14 +85,17 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 
 ## Etapas 3–5 — Suporte, DevX e grandes (pós PHP-100 funcional)
 
-- [ ] Etapa 3 (suporte, em andamento): suite de conformidade
+- [x] Etapa 3 (suporte, concluída): suite de conformidade
   (`tests/conformance/`), property tests std-only ampliados, teto de heap
-  (`max_heap_bytes`, RFC 0015); pendentes: fuzz contínuo, otimizações com
-  antes/depois.
-- [ ] Etapa 4 (DevX): `rhp fmt` preservando comentários, stack traces,
-  REPL, debugger/LSP.
-- [ ] Etapa 5 (grandes, cada item com RFC/ADR + aprovação): tipos, OO/
-  classes, geradores, async, Redis/MySQL/sockets.
+  (`max_heap_bytes`, RFC 0015), fuzz determinístico std-only em CI (+1 bug
+  real corrigido), otimização `Rc<Chunk>` nos frames (fib -4% com prova).
+- [x] Etapa 4 (DevX, concluída): `rhp fmt` preserva comentários e linhas
+  em branco, stack traces, REPL com estado, `rhp run --trace`,
+  `rhp lsp` (JSON-RPC stdio + diagnostics).
+- [x] Etapa 5 (grandes, concluída sob autorização prévia, cada item com
+  RFC): tipos com checagem runtime (RFC 0016), OO mínima (RFC 0017),
+  geradores lazy + `for-in` (RFC 0018), async spawn/join (RFC 0019),
+  TCP/Redis/MySQL (RFC 0020, mocks in-process).
 
 ## Fases A–D — RHP para sites/sistemas (plano aprovado, em andamento)
 

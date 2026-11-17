@@ -3,6 +3,7 @@
 //! Separado do nucleo de execucao (`Vm::step`) por responsabilidade:
 //! aqui vivem efeitos (rede, conversoes); la, despacho e pilha.
 
+use super::{redis, tcp};
 use super::{type_name, DbConn, DbHandles, VmError};
 use rhp_bytecode::{Builtin, Value};
 use std::sync::Arc;
@@ -16,6 +17,9 @@ const MAX_HEADERS: usize = 64 * 1024;
 /// Teto de leitura de `fs_read` (protecao contra exaustao de memoria).
 pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 
+/// NOTA: 8 parametros sao os handles paralelos (db/tcp/redis) + contexto;
+/// agrupar mudaria toda a arvore de chamadas por zero ganho.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn call_builtin(
     builtin: Builtin,
     args: &[Value],
@@ -23,8 +27,14 @@ pub(super) fn call_builtin(
     db: &mut DbHandles,
     rng: &mut u64,
     program: Option<Arc<rhp_parser::Program>>,
+    net: &mut tcp::TcpHandles,
+    cache: &mut redis::RedisHandles,
 ) -> Result<Value, VmError> {
     match builtin {
+        // Interceptados no `step_inner` (precisam da VM inteira).
+        Builtin::Next | Builtin::AsyncSpawn | Builtin::AsyncJoin => Err(VmError::new(
+            "interno: builtin de controle fora do protocolo de resume".to_string(),
+        )),
         Builtin::Len => match &args[0] {
             Value::Array(items) => Ok(Value::Int(items.len() as i64)),
             Value::Map(entries) => Ok(Value::Int(entries.len() as i64)),
@@ -99,6 +109,13 @@ pub(super) fn call_builtin(
             ))),
         },
         Builtin::Type => Ok(Value::Str(type_name(&args[0]).to_string())),
+        Builtin::Exhausted => match &args[0] {
+            Value::Generator(gen) => Ok(Value::Bool(gen.0.borrow().done)),
+            other => Err(VmError::new(format!(
+                "`exhausted` exige gerador, encontrou {}",
+                type_name(other)
+            ))),
+        },
         Builtin::Contains => match (&args[0], &args[1]) {
             (Value::Str(hay), Value::Str(needle)) => Ok(Value::Bool(hay.contains(needle as &str))),
             (other, _) => Err(VmError::new(format!(
@@ -367,6 +384,10 @@ pub(super) fn call_builtin(
                     super::pg::Connection::connect(conninfo)
                         .map(DbConn::Postgres)
                         .map_err(VmError::new)?
+                } else if let Some(conninfo) = path.strip_prefix("mysql:") {
+                    super::mysql::Connection::connect(conninfo)
+                        .map(DbConn::Mysql)
+                        .map_err(VmError::new)?
                 } else {
                     super::sqlite::Connection::open(path)
                         .map(DbConn::Sqlite)
@@ -398,6 +419,10 @@ pub(super) fn call_builtin(
                         .map(Value::Int)
                         .map_err(VmError::new)
                 }
+                DbConn::Mysql(conn) => conn
+                    .exec(&sql, &params)
+                    .map(Value::Int)
+                    .map_err(VmError::new),
             }
         }
         Builtin::DbQuery => {
@@ -426,6 +451,36 @@ pub(super) fn call_builtin(
                                                         Value::Str(s)
                                                     }
                                                     super::sqlite::SqlColumn::Null => Value::Null,
+                                                };
+                                                (k, value)
+                                            })
+                                            .collect(),
+                                    )
+                                })
+                                .collect(),
+                        )
+                    })
+                    .map_err(VmError::new),
+                DbConn::Mysql(conn) => conn
+                    .query(&sql, &params)
+                    .map(|rows| {
+                        Value::Array(
+                            rows.into_iter()
+                                .map(|row| {
+                                    Value::Map(
+                                        row.into_iter()
+                                            .map(|(k, v)| {
+                                                let value = match v {
+                                                    super::sqlite::SqlValue::Int(n) => {
+                                                        Value::Int(n)
+                                                    }
+                                                    super::sqlite::SqlValue::Float(n) => {
+                                                        Value::Float(n)
+                                                    }
+                                                    super::sqlite::SqlValue::Text(s) => {
+                                                        Value::Str(s)
+                                                    }
+                                                    super::sqlite::SqlValue::Null => Value::Null,
                                                 };
                                                 (k, value)
                                             })
@@ -478,11 +533,143 @@ pub(super) fn call_builtin(
                 Some(DbConn::Postgres(conn)) => {
                     conn.close().map(|()| Value::Null).map_err(VmError::new)
                 }
+                Some(DbConn::Mysql(conn)) => {
+                    conn.close().map(|()| Value::Null).map_err(VmError::new)
+                }
                 None => Err(VmError::new(format!(
                     "`db_close`: handle {handle} invalido ou ja fechado"
                 ))),
             }
         }
+        Builtin::TcpConnect => match (&args[0], &args[1]) {
+            (Value::Str(host), Value::Int(port)) => {
+                let port: u16 = (*port).try_into().map_err(|_| {
+                    VmError::new(format!("`tcp_connect`: porta invalida {port} (0-65535)"))
+                })?;
+                let conn = super::tcp::TcpConn::connect(host, port).map_err(VmError::new)?;
+                let handle = net.next;
+                net.next += 1;
+                net.conns.insert(handle, conn);
+                Ok(Value::Int(handle))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`tcp_connect` exige (host, porta), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::TcpSend => match (&args[0], &args[1]) {
+            (Value::Int(handle), Value::Str(data)) => {
+                let conn = net.conns.get_mut(handle).ok_or_else(|| {
+                    VmError::new(format!("`tcp_send`: handle {handle} invalido ou fechado"))
+                })?;
+                conn.write_all(data.as_bytes())
+                    .map(|n| Value::Int(n as i64))
+                    .map_err(VmError::new)
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`tcp_send` exige (handle, texto), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::TcpRecv => match (&args[0], &args[1]) {
+            (Value::Int(handle), Value::Int(max)) => {
+                if *max < 0 {
+                    return Err(VmError::new("`tcp_recv`: max negativo".to_string()));
+                }
+                let conn = net.conns.get_mut(handle).ok_or_else(|| {
+                    VmError::new(format!("`tcp_recv`: handle {handle} invalido ou fechado"))
+                })?;
+                let mut buf = Vec::new();
+                match conn
+                    .read_into(*max as usize, &mut buf)
+                    .map_err(VmError::new)?
+                {
+                    Some(_) => String::from_utf8(buf)
+                        .map(Value::Str)
+                        .map_err(|_| VmError::new("`tcp_recv`: bytes nao-UTF-8".to_string())),
+                    None => Ok(Value::Null),
+                }
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`tcp_recv` exige (handle, max), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::TcpClose => match &args[0] {
+            Value::Int(handle) => match net.conns.remove(handle) {
+                Some(conn) => {
+                    conn.close();
+                    Ok(Value::Null)
+                }
+                None => Err(VmError::new(format!(
+                    "`tcp_close`: handle {handle} invalido ou ja fechado"
+                ))),
+            },
+            other => Err(VmError::new(format!(
+                "`tcp_close` exige handle, encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::RedisOpen => match (&args[0], &args[1]) {
+            (Value::Str(host), Value::Int(port)) => {
+                let port: u16 = (*port).try_into().map_err(|_| {
+                    VmError::new(format!("`redis_open`: porta invalida {port} (0-65535)"))
+                })?;
+                let conn = super::redis::RedisConn::open(host, port).map_err(VmError::new)?;
+                let handle = cache.next;
+                cache.next += 1;
+                cache.conns.insert(handle, conn);
+                Ok(Value::Int(handle))
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`redis_open` exige (host, porta), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::RedisExec => match (&args[0], &args[1]) {
+            (Value::Int(handle), Value::Array(parts)) => {
+                let conn = cache.conns.get_mut(handle).ok_or_else(|| {
+                    VmError::new(format!("`redis_exec`: handle {handle} invalido ou fechado"))
+                })?;
+                if parts.is_empty() {
+                    return Err(VmError::new("`redis_exec`: comando vazio".to_string()));
+                }
+                let mut words = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        Value::Str(s) => words.push(s.clone()),
+                        other => {
+                            return Err(VmError::new(format!(
+                                "`redis_exec`: partes devem ser string, encontrado {}",
+                                type_name(other)
+                            )));
+                        }
+                    }
+                }
+                let first = words
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| VmError::new("`redis_exec`: comando vazio".to_string()))?;
+                let rest: Vec<Value> = words[1..].iter().map(|s| Value::Str(s.clone())).collect();
+                conn.exec(&first, &rest).map_err(VmError::new)
+            }
+            (other, _) => Err(VmError::new(format!(
+                "`redis_exec` exige (handle, [comando, ...]), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::RedisClose => match &args[0] {
+            Value::Int(handle) => match cache.conns.remove(handle) {
+                Some(_) => Ok(Value::Null),
+                None => Err(VmError::new(format!(
+                    "`redis_close`: handle {handle} invalido ou ja fechado"
+                ))),
+            },
+            other => Err(VmError::new(format!(
+                "`redis_close` exige handle, encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::HttpServe => super::http_server::serve_builtin(args, program),
         Builtin::Template => match (&args[0], &args[1]) {
             (Value::Str(template), Value::Map(values)) => {
