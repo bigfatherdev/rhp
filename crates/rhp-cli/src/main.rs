@@ -533,6 +533,8 @@ fn run_tests(target: &Path) -> Result<(), String> {
             let chunk = rhp_bytecode::compile(&program)
                 .map_err(|e| LoadError::Plain(format!("erro de compilacao: {e}")))?;
             let mut vm = rhp_vm::Vm::new();
+            // Programa-fonte para `async_spawn` (recompila por thread).
+            vm.set_program(Arc::new(program.clone()));
             // `exit(codigo)` em teste nao mata o corredor: vira falha do arquivo.
             vm.run(&chunk, &mut sink).map_err(|e| match e.exit_code() {
                 Some(code) => LoadError::Plain(format!("exit({code})")),
@@ -638,6 +640,9 @@ fn run_repl() -> Result<(), String> {
     use std::io::{BufRead, IsTerminal};
     let interactive = std::io::stdin().is_terminal();
     let mut vm = rhp_vm::Vm::new();
+    // AST acumulada da sessao: `async_spawn` recompila o programa inteiro
+    // na thread (precisa ver funcoes de linhas anteriores).
+    let mut session: Vec<rhp_parser::StmtNode> = Vec::new();
     let mut lines = std::io::BufReader::new(std::io::stdin()).lines();
     loop {
         if interactive {
@@ -656,6 +661,11 @@ fn run_repl() -> Result<(), String> {
             continue;
         }
         let program = rhp_parser::parse_source(src).map_err(|e| format!("repl:{e}"))?;
+        session.extend(program.statements.iter().cloned());
+        vm.set_program(Arc::new(rhp_parser::Program {
+            statements: session.clone(),
+            trailing_comments: Vec::new(),
+        }));
         let chunk = rhp_bytecode::compile(&program).map_err(|e| {
             let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
             with_code(code, help, &format!("repl: erro de compilacao: {e}"))

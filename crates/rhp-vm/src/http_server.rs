@@ -630,6 +630,8 @@ fn run_handler(
     let req = Value::Map(entries);
     let chunk = compile_handler_call(program, handler, &req).map_err(HandlerFail::Fail)?;
     let mut vm = Vm::new();
+    // Programa-fonte para `async_spawn` dentro de handlers.
+    vm.set_program(Arc::clone(program));
     let mut sink = std::io::sink();
     match vm.run_value(&chunk, &mut sink) {
         Ok(value) => response_from_value(&value).map_err(HandlerFail::Fail),
