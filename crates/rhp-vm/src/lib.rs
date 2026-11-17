@@ -84,12 +84,13 @@ impl fmt::Display for VmError {
 impl std::error::Error for VmError {}
 
 /// Frame de execucao: uma ativacao de chunk (principal ou funcao).
+///
+/// O chunk e compartilhado por `Rc` (Etapa 3): ativar funcao custa um
+/// bump de refcount, sem clonar `code`/`constants`/`names`/`funcs`.
+/// Somente leitura durante a execucao; a pilha/escopos continuam owned.
 #[derive(Debug)]
 struct Frame {
-    code: Vec<Op>,
-    constants: Vec<Value>,
-    names: Vec<String>,
-    funcs: Vec<Rc<FuncDef>>,
+    chunk: Rc<Chunk>,
     ip: usize,
     stack: Vec<Value>,
     /// Pilha de escopos locais; `scopes[0]` e o escopo da ativacao
@@ -290,10 +291,7 @@ impl Vm {
         self.statics.clear();
         self.steps = 0;
         self.frames.push(Frame {
-            code: chunk.code.clone(),
-            constants: chunk.constants.clone(),
-            names: chunk.names.clone(),
-            funcs: chunk.funcs.iter().map(|f| Rc::new(f.clone())).collect(),
+            chunk: Rc::new(chunk.clone()),
             ip: 0,
             stack: Vec::new(),
             scopes: vec![HashMap::new()],
@@ -348,6 +346,7 @@ impl Vm {
                 .get(idx)
                 .ok_or_else(|| VmError::new("frame de execucao inexistente"))?;
             *frame
+                .chunk
                 .code
                 .get(frame.ip)
                 .ok_or_else(|| VmError::new("ponteiro de instrucao fora do codigo"))?
@@ -355,6 +354,7 @@ impl Vm {
         match op {
             Op::Constant(const_idx) => {
                 let value = self.frames[idx]
+                    .chunk
                     .constants
                     .get(const_idx as usize)
                     .cloned()
@@ -519,6 +519,7 @@ impl Vm {
             }
             Op::DefineFunc(func_idx) => {
                 let func = self.frames[idx]
+                    .chunk
                     .funcs
                     .get(func_idx as usize)
                     .cloned()
@@ -532,6 +533,7 @@ impl Vm {
             }
             Op::MakeFunc(func_idx) => {
                 let def = self.frames[idx]
+                    .chunk
                     .funcs
                     .get(func_idx as usize)
                     .cloned()
@@ -810,6 +812,7 @@ impl Vm {
 
     fn name_of(&self, idx: usize, name_idx: u32) -> Result<String, VmError> {
         self.frames[idx]
+            .chunk
             .names
             .get(name_idx as usize)
             .cloned()
@@ -1015,16 +1018,7 @@ impl Vm {
             scope.insert(name, value);
         }
         self.frames.push(Frame {
-            code: func.def.body.code.clone(),
-            constants: func.def.body.constants.clone(),
-            names: func.def.body.names.clone(),
-            funcs: func
-                .def
-                .body
-                .funcs
-                .iter()
-                .map(|f| Rc::new(f.clone()))
-                .collect(),
+            chunk: func.def.body.clone(),
             ip: 0,
             stack: Vec::new(),
             scopes: vec![scope],
@@ -1112,7 +1106,7 @@ impl Vm {
     /// Executa `Op::CallMixed` (RFC 0009): le o descritor, desempilha callee
     /// + valores em ordem do fonte, expande spreads e liga por nome/posicao.
     fn call_mixed(&mut self, idx: usize, desc_idx: u32) -> Result<(), VmError> {
-        let desc = match self.frames[idx].constants.get(desc_idx as usize) {
+        let desc = match self.frames[idx].chunk.constants.get(desc_idx as usize) {
             Some(Value::Array(items)) => items.clone(),
             _ => {
                 return Err(VmError::new(format!(

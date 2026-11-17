@@ -72,6 +72,9 @@ impl fmt::Display for Value {
 }
 
 /// Definicao de funcao compilada.
+///
+/// `body` e `Rc` (o mesmo chunk e referenciado pelo `Frame` da ativacao;
+/// sem clonagem profunda por chamada; Etapa 3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDef {
     pub name: String,
@@ -80,7 +83,7 @@ pub struct FuncDef {
     pub defaults: Vec<Option<Value>>,
     /// `...rest` (no maximo um, por ultimo; RFC 0006).
     pub variadic: Option<String>,
-    pub body: Chunk,
+    pub body: Rc<Chunk>,
 }
 
 /// Builtin da biblioteca-padrao nucleo (Fases 3 e 6).
@@ -569,11 +572,14 @@ impl From<Builtin> for BuiltinId {
 }
 
 /// Chunk de bytecode: constantes, nomes, funcoes e codigo.
+///
+/// `funcs` guarda `Rc` (compartilhado entre a tabela do chunk e os frames
+/// da VM sem clonar por chamada; Etapa 3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub constants: Vec<Value>,
     pub names: Vec<String>,
-    pub funcs: Vec<FuncDef>,
+    pub funcs: Vec<Rc<FuncDef>>,
     pub code: Vec<Op>,
 }
 
@@ -1268,13 +1274,13 @@ impl Compiler {
         if self.chunk.funcs.len() >= u32::MAX as usize {
             return Err(CompileError::new("limite de funcoes excedido"));
         }
-        self.chunk.funcs.push(FuncDef {
+        self.chunk.funcs.push(Rc::new(FuncDef {
             name: name.to_string(),
             params: names,
             defaults,
             variadic: variadic.map(str::to_string),
-            body: body_chunk,
-        });
+            body: Rc::new(body_chunk),
+        }));
         Ok((self.chunk.funcs.len() - 1) as u32)
     }
 
@@ -2982,7 +2988,7 @@ mod tests {
             params: vec![],
             defaults: vec![],
             variadic: None,
-            body: Chunk::new(),
+            body: Rc::new(Chunk::new()),
         });
         assert_eq!(
             Value::Func(FuncValue {
