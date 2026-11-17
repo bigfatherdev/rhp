@@ -60,7 +60,7 @@ JSON ida/volta; ganho medido: 2x1s em ~1s (serial = ~2s).
   (200ms em < 350ms), erro->join, handle invalido/duplo, 4 validacoes
   de spawn, isolamento de global (com helper `run_with_program`, pois
   `run_src` nao define programa — a CLI sempre define).
-- `cargo test --workspace`: 318 passed, 0 failed; `fmt --check` limpo;
+- `cargo test --workspace`: 316 passed, 0 failed; `fmt --check` limpo;
   `clippy -D warnings` 0 warnings.
 - `examples/async.rhp`: `42 lenta`, ~1s, exit 0.
 

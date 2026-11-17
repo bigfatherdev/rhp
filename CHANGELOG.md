@@ -14,6 +14,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- Conectores TCP/Redis/MySQL (RFC 0020, Etapa 5): `tcp_*`, `redis_*`
+  (RESP2), `db_open("mysql:...")` reaproveitando `db_*`. Testes com
+  servidores in-process. Registro:
+  `changes/2026-11-16-feat-conectores-tcp-redis-mysql.md`.
 - Tarefas assíncronas (RFC 0019, Etapa 5): `async_spawn("f")` (thread
   isolada, recompila o programa) + `async_join(h)` (bloqueia, devolve
   o retorno desserializado). Registro:

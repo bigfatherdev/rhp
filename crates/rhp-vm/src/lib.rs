@@ -22,8 +22,11 @@ pub use builtins::MAX_HTTP_BODY;
 
 mod http_server;
 mod json;
+mod mysql;
 mod pg;
+mod redis;
 mod sqlite;
+mod tcp;
 mod time;
 mod tls;
 
@@ -144,6 +147,10 @@ pub struct Vm {
     /// Bytes estimados empilhados desde a ultima varredura da heap
     /// (teto amortizado O(1), RFC 0015; zerado em `set_limits`).
     heap_since_check: u64,
+    /// Sockets TCP crus (`tcp_*`; RFC 0020).
+    tcp: tcp::TcpHandles,
+    /// Conexoes Redis (`redis_*`; RFC 0020).
+    redis: redis::RedisHandles,
     /// Tarefas assincronas em voo (`async_spawn`/`async_join`, RFC 0019).
     tasks: TaskHandles,
 }
@@ -212,6 +219,7 @@ struct DbHandles {
 enum DbConn {
     Sqlite(sqlite::Connection),
     Postgres(pg::Connection),
+    Mysql(mysql::Connection),
 }
 
 /// Semente do xorshift64* de `rand` (RFC 0012): relogio (ns) misturado com
@@ -244,6 +252,8 @@ impl Vm {
             rng: seed_rng(),
             heap_since_check: 0,
             tasks: TaskHandles::default(),
+            tcp: tcp::TcpHandles::default(),
+            redis: redis::RedisHandles::default(),
         }
     }
 
@@ -925,6 +935,8 @@ impl Vm {
                         &mut self.db,
                         &mut self.rng,
                         self.program.clone(),
+                        &mut self.tcp,
+                        &mut self.redis,
                     )?;
                     self.push_checked(idx, result)?;
                     self.frames[idx].ip += 1;

@@ -331,6 +331,20 @@ pub enum Builtin {
     AsyncSpawn,
     /// `async_join(h)` — bloqueia e devolve o retorno (RFC 0019).
     AsyncJoin,
+    /// `tcp_connect(host, porta)` — `Int` (handle; RFC 0020).
+    TcpConnect,
+    /// `tcp_send(h, dados)` — bytes escritos (`Int`; RFC 0020).
+    TcpSend,
+    /// `tcp_recv(h, max)` — ate `max` bytes (`Str`; `Null` em EOF; RFC 0020).
+    TcpRecv,
+    /// `tcp_close(h)` — fecha (`Null`; RFC 0020).
+    TcpClose,
+    /// `redis_open(host, porta)` — `Int` (handle; sem AUTH na v1; RFC 0020).
+    RedisOpen,
+    /// `redis_exec(h, [cmd, args...])` — valor RESP (RFC 0020).
+    RedisExec,
+    /// `redis_close(h)` — fecha (`Null`; RFC 0020).
+    RedisClose,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -405,6 +419,13 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "exhausted" => Some(Builtin::Exhausted),
         "async_spawn" => Some(Builtin::AsyncSpawn),
         "async_join" => Some(Builtin::AsyncJoin),
+        "tcp_connect" => Some(Builtin::TcpConnect),
+        "tcp_send" => Some(Builtin::TcpSend),
+        "tcp_recv" => Some(Builtin::TcpRecv),
+        "tcp_close" => Some(Builtin::TcpClose),
+        "redis_open" => Some(Builtin::RedisOpen),
+        "redis_exec" => Some(Builtin::RedisExec),
+        "redis_close" => Some(Builtin::RedisClose),
         _ => None,
     }
 }
@@ -448,6 +469,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Exhausted
         | Builtin::AsyncSpawn
         | Builtin::AsyncJoin
+        | Builtin::TcpClose
+        | Builtin::RedisClose
         | Builtin::Sha256 => 1,
         Builtin::Push
         | Builtin::Contains
@@ -471,7 +494,12 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::VerifyPassword
         | Builtin::RegexMatch
         | Builtin::RegexSplit
-        | Builtin::HmacSha256 => 2,
+        | Builtin::HmacSha256
+        | Builtin::TcpConnect
+        | Builtin::TcpSend
+        | Builtin::TcpRecv
+        | Builtin::RedisOpen
+        | Builtin::RedisExec => 2,
         Builtin::DbExec
         | Builtin::DbQuery
         | Builtin::HttpServe
@@ -673,6 +701,13 @@ impl BuiltinId {
             65 => Ok(Builtin::Exhausted),
             66 => Ok(Builtin::AsyncSpawn),
             67 => Ok(Builtin::AsyncJoin),
+            68 => Ok(Builtin::TcpConnect),
+            69 => Ok(Builtin::TcpSend),
+            70 => Ok(Builtin::TcpRecv),
+            71 => Ok(Builtin::TcpClose),
+            72 => Ok(Builtin::RedisOpen),
+            73 => Ok(Builtin::RedisExec),
+            74 => Ok(Builtin::RedisClose),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -749,6 +784,13 @@ impl From<Builtin> for BuiltinId {
             Builtin::Exhausted => 65,
             Builtin::AsyncSpawn => 66,
             Builtin::AsyncJoin => 67,
+            Builtin::TcpConnect => 68,
+            Builtin::TcpSend => 69,
+            Builtin::TcpRecv => 70,
+            Builtin::TcpClose => 71,
+            Builtin::RedisOpen => 72,
+            Builtin::RedisExec => 73,
+            Builtin::RedisClose => 74,
         };
         Self(id)
     }
@@ -3314,6 +3356,13 @@ mod tests {
             Builtin::Exhausted,
             Builtin::AsyncSpawn,
             Builtin::AsyncJoin,
+            Builtin::TcpConnect,
+            Builtin::TcpSend,
+            Builtin::TcpRecv,
+            Builtin::TcpClose,
+            Builtin::RedisOpen,
+            Builtin::RedisExec,
+            Builtin::RedisClose,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);
