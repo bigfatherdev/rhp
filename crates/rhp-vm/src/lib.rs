@@ -144,6 +144,60 @@ pub struct Vm {
     /// Bytes estimados empilhados desde a ultima varredura da heap
     /// (teto amortizado O(1), RFC 0015; zerado em `set_limits`).
     heap_since_check: u64,
+    /// Tarefas assincronas em voo (`async_spawn`/`async_join`, RFC 0019).
+    tasks: TaskHandles,
+}
+
+/// Tarefas assincronas por handle (RFC 0019): cada uma roda em thread
+/// propria com programa recompilado; resultado via JSON (fronteira).
+#[derive(Debug, Default)]
+struct TaskHandles {
+    running: HashMap<i64, TaskThread>,
+    next: i64,
+}
+
+/// Tarefa em voo: thread + nome da funcao (para diagnostico).
+#[derive(Debug)]
+struct TaskThread {
+    name: String,
+    handle: std::thread::JoinHandle<TaskResult>,
+}
+
+/// Resultado que cruza a fronteira da thread (JSON serializado; `String`
+/// e `Send`, ao contrario de `Value`).
+type TaskResult = Result<String, String>;
+
+/// Corpo da thread de tarefa (RFC 0019): recompila o programa (owned,
+/// padrao `http_serve`), executa a funcao de nivel superior e serializa
+/// o retorno em JSON. Isolada: sem globais compartilhados; erros viram
+/// `Err(mensagem)` para o `join` re-lancar.
+fn run_task(program: Arc<Program>, argv: Vec<String>, name: String) -> TaskResult {
+    let chunk = rhp_bytecode::compile(&program).map_err(|e| format!("compilacao: {e}"))?;
+    let def = chunk
+        .funcs
+        .iter()
+        .find(|f| f.name == name)
+        .cloned()
+        .ok_or_else(|| format!("funcao `{name}` inexistente"))?;
+    if def.is_generator {
+        return Err(format!("`async_spawn` nao suporta gerador (`{name}`)"));
+    }
+    let func = FuncValue {
+        def: def.clone(),
+        env: HashMap::new(),
+    };
+    let mut vm = Vm::new();
+    vm.set_argv(argv);
+    // Frame raiz com `Halt`: sem ele, o `return` da tarefa pareceria
+    // "fora de funcao"; com ele, o `drive` termina e devolve o valor.
+    let mut root = rhp_bytecode::Chunk::new();
+    root.code.push(rhp_bytecode::Op::Halt);
+    vm.reset(&root);
+    vm.push_call_frame(func, Vec::new())
+        .map_err(|e| e.message.clone())?;
+    let mut sink = std::io::sink();
+    let value = vm.drive(&mut sink).map_err(|e| e.message.clone())?;
+    crate::json::stringify_json(&value).map_err(|e| e.message.clone())
 }
 
 /// Conexoes de banco da VM (B2: SQLite; B3: +PostgreSQL).
@@ -189,6 +243,7 @@ impl Vm {
             statics: Vec::new(),
             rng: seed_rng(),
             heap_since_check: 0,
+            tasks: TaskHandles::default(),
         }
     }
 
@@ -287,11 +342,14 @@ impl Vm {
     }
 
     /// Reinicia frames/globais/passos com um chunk validado.
+    /// Tarefas em voo sao descartadas (threads seguem detached;
+    /// `join` pendente vira `handle invalido`).
     fn reset(&mut self, chunk: &Chunk) {
         self.frames.clear();
         self.globals.clear();
         self.statics.clear();
         self.steps = 0;
+        self.tasks = TaskHandles::default();
         self.push_root(chunk);
     }
 
@@ -855,6 +913,10 @@ impl Vm {
                     // `next(gen)` (RFC 0018): retoma o gerador (precisa dos
                     // frames; nunca passa pelo `call_builtin` sincrono).
                     self.gen_resume(args)?;
+                } else if matches!(builtin, Builtin::AsyncSpawn | Builtin::AsyncJoin) {
+                    // Tarefas (RFC 0019): precisam da VM (programa + tabela).
+                    self.async_begin(idx, builtin, args)?;
+                    self.frames[idx].ip += 1;
                 } else {
                     let result = call_builtin(
                         builtin,
@@ -1540,6 +1602,108 @@ impl Vm {
         };
         self.frames.push(frame);
         Ok(())
+    }
+
+    /// Inicia (`async_spawn("f")`) ou aguarda (`async_join(h)`) tarefa
+    /// (RFC 0019, Etapa 5): thread propria com programa recompilado
+    /// (padrao `http_serve`: `Arc<Program>` e owned+`Send`); resultado
+    /// cruza a fronteira como JSON (fronteira `String`, `Send`).
+    fn async_begin(
+        &mut self,
+        idx: usize,
+        builtin: Builtin,
+        args: Vec<Value>,
+    ) -> Result<(), VmError> {
+        match builtin {
+            Builtin::AsyncSpawn => {
+                let name = match args.as_slice() {
+                    [Value::Str(name)] => name.clone(),
+                    [other] => {
+                        return Err(VmError::new(format!(
+                            "`async_spawn` exige funcao (nome em string), encontrou {}",
+                            type_name(other)
+                        )));
+                    }
+                    _ => return Err(VmError::new("`async_spawn` exige 1 argumento".to_string())),
+                };
+                // Valida ja: `fn` de nivel superior existente, nao-geradora,
+                // sem captura (o worker recompila e revalida pelo nome).
+                let func = match self.lookup(idx, &name) {
+                    Some(Value::Func(func)) => func,
+                    Some(other) => {
+                        return Err(VmError::new(format!(
+                            "`async_spawn` exige funcao, `{name}` e {}",
+                            type_name(&other)
+                        )));
+                    }
+                    None => {
+                        return Err(VmError::new(format!(
+                            "`async_spawn`: funcao `{name}` inexistente (so `fn` de nivel superior)"
+                        )));
+                    }
+                };
+                if func.def.is_generator {
+                    return Err(VmError::new(format!(
+                        "`async_spawn` nao suporta gerador (`{name}`; use `next`/`for`)"
+                    )));
+                }
+                if !func.env.is_empty() {
+                    return Err(VmError::new(format!(
+                        "`async_spawn` exige funcao sem captura (`{name}` captura ambiente)"
+                    )));
+                }
+                let program = self.program.clone().ok_or_else(|| {
+                    VmError::new("`async_spawn` sem programa-fonte (interno)".to_string())
+                })?;
+                let argv = self.argv.clone();
+                let thread_name = name.clone();
+                let handle = std::thread::spawn(move || run_task(program, argv, thread_name));
+                let id = self.tasks.next;
+                self.tasks.next += 1;
+                self.tasks.running.insert(id, TaskThread { name, handle });
+                self.push_checked(idx, Value::Int(id))?;
+                Ok(())
+            }
+            Builtin::AsyncJoin => {
+                let id = match args.as_slice() {
+                    [Value::Int(id)] => *id,
+                    [other] => {
+                        return Err(VmError::new(format!(
+                            "`async_join` exige handle (int), encontrou {}",
+                            type_name(other)
+                        )));
+                    }
+                    _ => return Err(VmError::new("`async_join` exige 1 argumento".to_string())),
+                };
+                let task = self.tasks.running.remove(&id).ok_or_else(|| {
+                    VmError::new(format!(
+                        "`async_join`: handle {id} invalido ou ja consumido"
+                    ))
+                })?;
+                let result = task.handle.join().map_err(|_| {
+                    VmError::new(format!(
+                        "`async_join`: tarefa `{}` abortou (panic)",
+                        task.name
+                    ))
+                })?;
+                match result {
+                    Ok(json) => {
+                        let value = crate::json::parse_json(&json).map_err(|e| {
+                            VmError::new(format!("`async_join`: retorno invalido: {e}"))
+                        })?;
+                        self.push_checked(idx, value)?;
+                        Ok(())
+                    }
+                    Err(message) => Err(VmError::new(format!(
+                        "tarefa `{}` falhou: {message}",
+                        task.name
+                    ))),
+                }
+            }
+            _ => Err(VmError::new(
+                "interno: builtin async desconhecido".to_string(),
+            )),
+        }
     }
 
     /// Inicia `map`/`filter`/`usort` (RFC 0005): valida `(colecao, funcao)`,
@@ -3622,6 +3786,52 @@ mod tests {
             run_src("fn g() { yield 1; x_indefinida; } let x = g(); try { echo next(x); echo next(x); } catch e { echo e[\"tipo\"]; } try { echo next(x); } catch e { echo \"morto\"; }").expect("ok"),
             "1\nruntime\nmorto\n"
         );
+    }
+
+    #[test]
+    fn tasks_run_in_parallel_and_join() {
+        // Etapa 5 (RFC 0019): spawn/join com threads; 2x sleep(200ms)
+        // termina bem abaixo do serial (margem folgada anti-flake).
+        // `run_src` nao define programa; aqui vai o pipeline completo.
+        use std::sync::Arc;
+        use std::time::Instant;
+        fn run_with_program(src: &str) -> Result<String, VmError> {
+            let program = Arc::new(parse_source(src).expect("parse deve passar"));
+            let chunk = rhp_bytecode::compile(&program).expect("compile deve passar");
+            let mut vm = Vm::new();
+            vm.set_program(program);
+            vm.run_to_string(&chunk)
+        }
+        fn run_err_with_program(src: &str) -> String {
+            run_with_program(src).expect_err("deve falhar").message
+        }
+        let src = "fn dorme() { sleep(0.2); return \"ok\"; } fn agora() { return 7; } let a = async_spawn(\"dorme\"); let b = async_spawn(\"agora\"); echo async_join(b); echo async_join(a);";
+        let start = Instant::now();
+        assert_eq!(run_with_program(src).expect("ok"), "7\nok\n");
+        assert!(
+            start.elapsed().as_millis() < 350,
+            "paralelo esperado (< 350ms para 200ms de sono)"
+        );
+        // Erro da tarefa vira erro do join; handle one-shot.
+        assert!(run_err_with_program(
+            "fn ruim() { x_indefinida; } let h = async_spawn(\"ruim\"); echo async_join(h);"
+        )
+        .contains("tarefa"));
+        assert!(run_err_with_program("echo async_join(999);").contains("invalido"));
+        assert!(run_err_with_program("fn f() { return 1; } let h = async_spawn(\"f\"); echo async_join(h); echo async_join(h);").contains("invalido"));
+        // Validacao no spawn: inexistente, nao-funcao, gerador, captura.
+        assert!(run_err_with_program("echo async_spawn(\"naoexiste\");").contains("inexistente"));
+        assert!(run_err_with_program("let x = 1; echo async_spawn(x);").contains("exige funcao"));
+        assert!(
+            run_err_with_program("fn g() { yield 1; } echo async_spawn(\"g\");")
+                .contains("gerador")
+        );
+        assert!(run_err_with_program("fn outer() { let y = 1; fn f() { return y; } return f; } let g = outer(); echo async_spawn(\"g\");").contains("captura"));
+        // Isolamento: global do pai nao existe no worker.
+        assert!(run_err_with_program(
+            "let x = 1; fn f() { return x; } let h = async_spawn(\"f\"); echo async_join(h);"
+        )
+        .contains("nao definida"));
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub(super) fn call_builtin(
     program: Option<Arc<rhp_parser::Program>>,
 ) -> Result<Value, VmError> {
     match builtin {
+        // Interceptados no `step_inner` (precisam da VM inteira).
+        Builtin::Next | Builtin::AsyncSpawn | Builtin::AsyncJoin => Err(VmError::new(
+            "interno: builtin de controle fora do protocolo de resume".to_string(),
+        )),
         Builtin::Len => match &args[0] {
             Value::Array(items) => Ok(Value::Int(items.len() as i64)),
             Value::Map(entries) => Ok(Value::Int(entries.len() as i64)),
@@ -106,11 +110,6 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
-        // `next` nunca chega aqui: interceptado no `step_inner` (precisa
-        // dos frames para retomar; ver `gen_resume`).
-        Builtin::Next => Err(VmError::new(
-            "interno: `next` fora do protocolo de resume".to_string(),
-        )),
         Builtin::Contains => match (&args[0], &args[1]) {
             (Value::Str(hay), Value::Str(needle)) => Ok(Value::Bool(hay.contains(needle as &str))),
             (other, _) => Err(VmError::new(format!(

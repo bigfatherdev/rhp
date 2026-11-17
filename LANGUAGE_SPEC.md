@@ -337,7 +337,7 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `usort(arr, cmp)` | (RFC 0005) Copia ordenada por `cmp(a, b): Int` (`< 0`: `a` antes; `> 0`: depois; `0`: empate, estavel — insertion sort). Retorno nao-`Int` = erro. Vazio/unitario nao chama. Nao muta o original. |
 | `exit(codigo)` | Encerra o programa com codigo 0-255 (fora disso ou nao-`Int` = erro). Desenrola chamadas; em `rhp test`, conta como falha do arquivo. |
 | `now()` | Segundos desde 1970-01-01T00:00:00Z (`Int`; relogio do sistema). |
-| `sleep(s)` | Bloqueia `s` segundos (`Int`/`Float`; fracao = sub-segundo). Negativo, nao-finito ou > 3600 = erro. Devolve `null`. VM single-thread: tudo para junto. |
+| `sleep(s)` | Bloqueia `s` segundos (`Int`/`Float`; fracao = sub-segundo). Negativo, nao-finito ou > 3600 = erro. Devolve `null`. Tarefas `async` rodam em paralelo (cada uma na sua thread). |
 | `date_str(ts)` | Epoch `Int` => `"AAAA-MM-DDTHH:MM:SSZ"` (UTC, sempre; sem timezones). |
 | `json_parse(texto)` | Texto JSON => valor (`null`/`Bool`/`Int` se inteiro em `i64` senao `Float`/`Str`/`Array`/`Mapa`). Gramatica estrita; erro com posicao (byte). Objetos: primeira chave vence (regra dos literais). Teto de 128 niveis. |
 | `json_stringify(valor)` | Valor => texto JSON canonico (chaves ordenadas, sem espacos; `2.0` para floats inteiros). `NaN`/infinito e `Func` = erro. Teto de 128 niveis. |
@@ -349,6 +349,10 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `db_close(h)` | Fecha o handle (reuso = erro); devolve `null`. Fim do programa fecha o resto. |
 | `http_serve(porta, handler, opts)` | (Fase C/D) Servidor HTTP: `porta` 0–65535 (0 = livre do SO), `handler` = nome de `fn(req)` global, `opts` com `max_conexoes` (padrão 64), `max_requisicoes` (padrão 0 = para sempre) e `limite_taxa` (req/s por IP, padrão 0 = sem limite; excedeu = 429). Por request: `req` = mapa `{metodo, caminho, query, cabecalhos (minúsculas), cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Erro no handler = 500 sem vazar; `exit(codigo)` termina o servidor. Handlers sem estado (sem compartilhar nada entre requests). |
 | `template(texto, valores)` | (Fase C) Interpola `{{chave}}` com escape HTML obrigatório (`&<>"'`); chave ausente/`{{` sem fechar/tipo inválido = erro; sem laços/condicionais. |
+| `next(gen)` | (RFC 0018, Etapa 5) Retoma o gerador ate o proximo `yield` (devolve o valor); no fim, marca esgotado e devolve `Null`. Gerador esgotado = erro (teste com `exhausted` antes). Nao-gerador = erro. |
+| `exhausted(gen)` | (RFC 0018, Etapa 5) `Bool`: `true` se o gerador terminou (ou nunca executou? Nao: so apos o fim; antes de qualquer `next` = `false`). Nao-gerador = erro. |
+| `async_spawn("f")` | (RFC 0019, Etapa 5) Roda `f` (só `fn` de nivel superior, sem captura, nao-gerador) em thread propria e devolve handle `Int` imediatamente. Isolada: sem globais compartilhados (o worker recompila o programa). |
+| `async_join(h)` | (RFC 0019, Etapa 5) Bloqueia ate a tarefa terminar; devolve o retorno (desserializado de JSON: null/bool/int/float/string/array/mapa; resto = erro). Handle one-shot (reuso = erro). Erro da tarefa = erro no `join` (`tarefa ... falhou: ...`). |
 
 Exemplo:
 

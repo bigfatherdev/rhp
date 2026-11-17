@@ -14,6 +14,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- Tarefas assíncronas (RFC 0019, Etapa 5): `async_spawn("f")` (thread
+  isolada, recompila o programa) + `async_join(h)` (bloqueia, devolve
+  o retorno desserializado). Registro:
+  `changes/2026-11-16-feat-async-spawn-join.md`.
 - Geradores lazy (RFC 0018, Etapa 5): `yield`, `next`/`exhausted`,
   `for x in gen` (duas formas), `type()` = gerador, `==` por identidade.
   Registro: `changes/2026-11-16-feat-geradores.md`.

@@ -327,6 +327,10 @@ pub enum Builtin {
     Next,
     /// `exhausted(gen)` — `Bool`: gerador terminou (RFC 0018).
     Exhausted,
+    /// `async_spawn("f")` — `Int` (handle); roda `f` em thread (RFC 0019).
+    AsyncSpawn,
+    /// `async_join(h)` — bloqueia e devolve o retorno (RFC 0019).
+    AsyncJoin,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -399,6 +403,8 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "hmac_verify" => Some(Builtin::HmacVerify),
         "next" => Some(Builtin::Next),
         "exhausted" => Some(Builtin::Exhausted),
+        "async_spawn" => Some(Builtin::AsyncSpawn),
+        "async_join" => Some(Builtin::AsyncJoin),
         _ => None,
     }
 }
@@ -440,6 +446,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::HashPassword
         | Builtin::Next
         | Builtin::Exhausted
+        | Builtin::AsyncSpawn
+        | Builtin::AsyncJoin
         | Builtin::Sha256 => 1,
         Builtin::Push
         | Builtin::Contains
@@ -663,6 +671,8 @@ impl BuiltinId {
             63 => Ok(Builtin::HmacVerify),
             64 => Ok(Builtin::Next),
             65 => Ok(Builtin::Exhausted),
+            66 => Ok(Builtin::AsyncSpawn),
+            67 => Ok(Builtin::AsyncJoin),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -737,6 +747,8 @@ impl From<Builtin> for BuiltinId {
             Builtin::HmacVerify => 63,
             Builtin::Next => 64,
             Builtin::Exhausted => 65,
+            Builtin::AsyncSpawn => 66,
+            Builtin::AsyncJoin => 67,
         };
         Self(id)
     }
@@ -3300,6 +3312,8 @@ mod tests {
             Builtin::HmacVerify,
             Builtin::Next,
             Builtin::Exhausted,
+            Builtin::AsyncSpawn,
+            Builtin::AsyncJoin,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);
