@@ -233,10 +233,26 @@ pub enum Stmt {
     Export {
         def: Box<StmtNode>,
     },
+    /// `class Nome { fn m() {} ... }` (RFC 0017, Etapa 5). Sem heranca.
+    ClassDef {
+        name: String,
+        methods: Vec<ClassMethod>,
+    },
     Block(Vec<StmtNode>),
     ExprStmt {
         expr: Expr,
     },
+}
+
+/// Metodo de classe: como `FnDef`, mas sem nome global (vive na tabela
+/// da classe; RFC 0017). `this` e vinculado na chamada (nao e parametro).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassMethod {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub variadic: Option<String>,
+    pub return_ann: Option<TypeTag>,
+    pub body: Vec<StmtNode>,
 }
 
 /// Nome selecionado em `import { } from`: original + alias opcional.
@@ -398,6 +414,18 @@ pub enum Expr {
     Match {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
+    },
+    /// Acesso a membro: `obj.campo` (RFC 0017). Compila para `Index` com
+    /// `Str`; em instancia resolve campo ou metodo vinculado.
+    Member {
+        obj: Box<Expr>,
+        field: String,
+    },
+    /// Instanciacao: `new Nome(args)` (RFC 0017). `args` aceita as formas
+    /// de chamada (posicional, nomeado, spread); a classe vem de `Ident`.
+    New {
+        class: Box<Expr>,
+        args: Vec<CallArg>,
     },
 }
 
@@ -717,6 +745,7 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::Try => parse_try(cursor),
         TokenKind::Throw => parse_throw(cursor),
         TokenKind::Fn => parse_fn_def(cursor),
+        TokenKind::Class => parse_class_def(cursor),
         TokenKind::Return => parse_return(cursor),
         TokenKind::Import => parse_import(cursor),
         TokenKind::Export => parse_export(cursor),
@@ -1398,6 +1427,71 @@ fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     })
 }
 
+/// `class Nome { fn m(params) { } ... }` (RFC 0017, Etapa 5).
+/// So metodos `fn` no corpo (qualquer outra coisa = erro claro);
+/// metodo duplicado = erro (checado aqui, com posicao).
+fn parse_class_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let name = expect_ident(cursor)?;
+    expect_token(
+        cursor,
+        &TokenKind::LBrace,
+        "esperado `{` apos nome da classe",
+    )?;
+    let mut methods = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        match cursor.peek().map(|t| &t.kind) {
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `}` ou metodo, encontrado fim de arquivo",
+                    line,
+                    col,
+                ));
+            }
+            Some(TokenKind::RBrace) => {
+                cursor.next();
+                break;
+            }
+            Some(TokenKind::Fn) => {
+                cursor.next();
+                let mname = expect_ident(cursor)?;
+                if !seen.insert(mname.clone()) {
+                    let (line, col) = cursor.end_pos();
+                    return Err(ParseError::new(
+                        format!("metodo duplicado `{mname}` na classe `{name}`"),
+                        line,
+                        col,
+                    ));
+                }
+                let (params, variadic) = parse_params_list(cursor, "apos nome do metodo")?;
+                let return_ann = parse_type_ann(cursor)?;
+                let body = parse_block(cursor)?;
+                methods.push(ClassMethod {
+                    name: mname,
+                    params,
+                    variadic,
+                    return_ann,
+                    body,
+                });
+            }
+            Some(other) => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    format!(
+                        "no corpo da classe so `fn` (encontrado {})",
+                        describe(other)
+                    ),
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    Ok(Stmt::ClassDef { name, methods })
+}
+
 /// Lista de parametros `(a, b = expr, ...rest)`: `(` ja deve ser o proximo.
 /// Retorna `(params, variadic)`. Regras (RFC 0006): `...rest` so por ultimo;
 /// obrigatorio apos opcional e erro; duplicatas sao checadas na compilacao.
@@ -2055,10 +2149,34 @@ fn parse_postfix(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             Some(TokenKind::LParen) => {
                 expr = parse_call_suffix(cursor, expr)?;
             }
+            Some(TokenKind::Dot) => {
+                expr = parse_member_suffix(cursor, expr)?;
+            }
             _ => break,
         }
     }
     Ok(expr)
+}
+
+/// Corpo do sufixo `.nome` (RFC 0017): acesso a campo/metodo.
+#[inline(never)]
+fn parse_member_suffix(cursor: &mut Cursor<'_>, obj: Expr) -> Result<Expr, ParseError> {
+    cursor.next();
+    let tok = cursor.next().ok_or_else(|| {
+        let (line, col) = cursor.end_pos();
+        ParseError::new("esperado nome apos `.`", line, col)
+    })?;
+    match &tok.kind {
+        TokenKind::Ident(name) => Ok(Expr::Member {
+            obj: Box::new(obj),
+            field: name.clone(),
+        }),
+        other => Err(ParseError::new(
+            format!("esperado nome apos `.`, encontrado {}", describe(other)),
+            tok.line,
+            tok.col,
+        )),
+    }
 }
 
 /// Corpo do sufixo `[indice]` isolado para manter o frame de
@@ -2116,6 +2234,39 @@ fn parse_primary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             let (params, variadic) =
                 parse_params_list(cursor, "apos `fn` (funcao anonima usa `fn (args) { }`)")?;
             parse_fn_body(cursor, params, variadic)
+        }
+        TokenKind::New => {
+            // `new Nome(args)`: a classe e sempre um nome simples (sem
+            // `new expr()` arbitrario; regra unica, RFC 0017).
+            let tok = cursor.next().ok_or_else(|| {
+                let (line, col) = cursor.end_pos();
+                ParseError::new("esperado nome da classe apos `new`", line, col)
+            })?;
+            match &tok.kind {
+                TokenKind::Ident(name) => {
+                    let name = name.clone();
+                    if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
+                        return Err(ParseError::new(
+                            "esperado `(` apos nome da classe".to_string(),
+                            tok.line,
+                            tok.col,
+                        ));
+                    }
+                    let args = parse_call_args(cursor)?;
+                    Ok(Expr::New {
+                        class: Box::new(Expr::Var(name)),
+                        args,
+                    })
+                }
+                other => Err(ParseError::new(
+                    format!(
+                        "esperado nome da classe apos `new`, encontrado {}",
+                        describe(other)
+                    ),
+                    tok.line,
+                    tok.col,
+                )),
+            }
         }
         TokenKind::Match => parse_match(cursor),
         TokenKind::LParen => {
@@ -2263,6 +2414,9 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Continue => "`continue`".to_string(),
         TokenKind::Return => "`return`".to_string(),
         TokenKind::Import => "`import`".to_string(),
+        TokenKind::Class => "`class`".to_string(),
+        TokenKind::New => "`new`".to_string(),
+        TokenKind::Dot => "`.`".to_string(),
         TokenKind::True | TokenKind::False => "booleano".to_string(),
         TokenKind::Null => "`null`".to_string(),
         TokenKind::Ident(_) => "identificador".to_string(),

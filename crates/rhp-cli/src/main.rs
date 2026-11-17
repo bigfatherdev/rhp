@@ -1470,6 +1470,43 @@ impl Renamer<'_> {
                     body,
                 }
             }
+            Stmt::ClassDef { name, methods } => {
+                let renamed = self.declare(name);
+                let methods = methods
+                    .iter()
+                    .map(|m| {
+                        let params = m
+                            .params
+                            .iter()
+                            .map(|p| rhp_parser::Param {
+                                name: p.name.clone(),
+                                ann: p.ann,
+                                default: p.default.as_ref().map(|e| self.expr(e)),
+                            })
+                            .collect::<Vec<_>>();
+                        self.scopes.push(HashSet::new());
+                        for param in &params {
+                            self.declare(&param.name);
+                        }
+                        if let Some(rest) = &m.variadic {
+                            self.declare(rest);
+                        }
+                        let body = m.body.iter().map(|s| self.stmt(s)).collect();
+                        self.scopes.pop();
+                        rhp_parser::ClassMethod {
+                            name: m.name.clone(),
+                            params,
+                            variadic: m.variadic.clone(),
+                            return_ann: m.return_ann,
+                            body,
+                        }
+                    })
+                    .collect();
+                Stmt::ClassDef {
+                    name: renamed,
+                    methods,
+                }
+            }
             Stmt::Return { expr } => Stmt::Return {
                 expr: expr.as_ref().map(|e| self.expr(e)),
             },
@@ -1582,6 +1619,14 @@ impl Renamer<'_> {
             },
             Expr::CallValue { callee, args } => Expr::CallValue {
                 callee: Box::new(self.expr(callee)),
+                args: args.iter().map(|a| self.call_arg(a)).collect(),
+            },
+            Expr::Member { obj, field } => Expr::Member {
+                obj: Box::new(self.expr(obj)),
+                field: field.clone(),
+            },
+            Expr::New { class, args } => Expr::New {
+                class: Box::new(self.expr(class)),
                 args: args.iter().map(|a| self.call_arg(a)).collect(),
             },
             Expr::Match { subject, arms } => Expr::Match {

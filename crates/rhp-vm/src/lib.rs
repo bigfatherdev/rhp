@@ -4,7 +4,9 @@
 //! globais compartilhadas. O bytecode e tratado como entrada potencialmente
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
-use rhp_bytecode::{builtin_arity, Builtin, Chunk, FuncDef, FuncValue, Op, Value, MAX_VALUE_DEPTH};
+use rhp_bytecode::{
+    builtin_arity, Builtin, Chunk, ClassDef, FuncDef, FuncValue, Op, Value, MAX_VALUE_DEPTH,
+};
 use rhp_parser::{Program, TypeTag};
 use std::collections::HashMap;
 use std::fmt;
@@ -103,6 +105,10 @@ impl fmt::Display for VmError {
 
 impl std::error::Error for VmError {}
 
+/// Argumentos separados de chamada mista: posicionais + nomeados
+/// (RFC 0009; reusado por `new` e chamada de metodo, RFC 0017).
+type MixedArgs = (Vec<Value>, Vec<(String, Value)>);
+
 /// Frame de execucao: uma ativacao de chunk (principal ou funcao).
 ///
 /// O chunk e compartilhado por `Rc` (Etapa 3): ativar funcao custa um
@@ -118,6 +124,14 @@ struct Frame {
     scopes: Vec<HashMap<String, Value>>,
     /// Pilha de handlers de `try` (RFC 0001); o mais interno por ultimo.
     handlers: Vec<Handler>,
+    /// `new` em voo (RFC 0017): nome da classe enquanto o construtor
+    /// `novo` executa; vive no frame DO CONSTRUTOR (morre com ele no
+    /// unwind, sem stale). No `Return`, entrega o `this` final.
+    /// Mesmo protocolo do `pending` de HOFs (RFC 0005).
+    pending_new: Option<String>,
+    /// Metodo em voo (`var.metodo()`; RFC 0017): nome da variavel para
+    /// write-back do `this` final. Vive no frame DO METODO.
+    pending_method: Option<String>,
     /// HOF com callback em voo (RFC 0005): progresso da iteracao enquanto
     /// as ativacoes do callback executam e retornam. `None` no comum.
     pending: Option<PendingHof>,
@@ -358,6 +372,8 @@ impl Vm {
             scopes: vec![HashMap::new()],
             handlers: Vec::new(),
             pending: None,
+            pending_new: None,
+            pending_method: None,
             func: None,
         });
     }
@@ -621,6 +637,39 @@ impl Vm {
             Op::CallMixed(desc_idx) => {
                 self.call_mixed(idx, desc_idx)?;
             }
+            Op::BuildClass(name_idx, count) => {
+                // Desempilha `count` pares [nome(Str), metodo(Func)] e
+                // empilha a classe (tabela de metodos compartilhada).
+                let name = self.name_of(idx, name_idx)?;
+                let mut methods = HashMap::new();
+                for _ in 0..count {
+                    let func = self.pop(idx, "metodo de classe")?;
+                    let method_name = self.pop(idx, "nome de metodo")?;
+                    let (method_name, func) = match (method_name, func) {
+                        (Value::Str(method_name), Value::Func(func)) => (method_name, func),
+                        (method_name, func) => {
+                            return Err(VmError::new(format!(
+                                "bytecode invalido: metodo de classe espera (Str, Func), encontrou ({} {})",
+                                type_name(&method_name),
+                                type_name(&func),
+                            )));
+                        }
+                    };
+                    if methods.insert(method_name.clone(), func).is_some() {
+                        return Err(VmError::new(format!(
+                            "metodo duplicado `{method_name}` (invalido fora do compilador)"
+                        )));
+                    }
+                }
+                self.push_checked(idx, Value::Class(Rc::new(ClassDef { name, methods })))?;
+                self.frames[idx].ip += 1;
+            }
+            Op::NewMixed(desc_idx) => {
+                self.new_mixed(idx, desc_idx)?;
+            }
+            Op::CallMethod(var_idx, field_idx, desc_idx) => {
+                self.call_method(idx, var_idx, field_idx, desc_idx)?;
+            }
             Op::Return => {
                 let value = self.pop(idx, "`return`")?;
                 if self.frames.len() == 1 {
@@ -630,12 +679,54 @@ impl Vm {
                 if let Some(tag) = self.frames[idx].func.as_ref().and_then(|d| d.return_type) {
                     check_type(&value, tag)?;
                 }
+                // `new` (RFC 0017): o `this` final sai desta ativacao
+                // (construtor); o retorno e descartado. A flag morre com
+                // o frame no unwind — nunca fica obsoleta.
+                let closing_new = self.frames[idx].pending_new.take();
+                let closing_method = self.frames[idx].pending_method.take();
+                let final_this = if closing_new.is_some() || closing_method.is_some() {
+                    self.frames[idx].scopes[0].get("this").cloned()
+                } else {
+                    None
+                };
                 self.frames.pop();
                 let caller = self.frames.len() - 1;
                 // Retomada de HOF (RFC 0005): o valor e o retorno do callback;
                 // sem HOF pendente, entrega normal ao chamador.
                 if let Some(pending) = self.frames[caller].pending.take() {
                     self.advance_hof(caller, pending, value)?;
+                } else if let Some(class_name) = closing_new {
+                    // `new` (RFC 0017): descarta o retorno do construtor e
+                    // entrega o `this` final (deve ser instancia da classe).
+                    let ok = matches!(&final_this, Some(Value::Instance { class, .. }) if class.name == class_name);
+                    if ok {
+                        self.push_checked(caller, final_this.expect("this verificado"))?;
+                    } else {
+                        return Err(VmError::new(format!(
+                            "construtor `novo` de `{class_name}` deve preservar `this` como instancia"
+                        )));
+                    }
+                } else if let Some(var_name) = closing_method {
+                    // Metodo sobre variavel (RFC 0017): o retorno e o valor
+                    // da chamada; o `this` final volta para a variavel
+                    // (mutacoes via `obj.metodo()` persistem; coerente com
+                    // `a[i] = v`, que tambem exige variavel nomeada).
+                    match final_this {
+                        Some(Value::Instance { .. }) => {
+                            if !self.assign(caller, &var_name, final_this.expect("this verificado"))
+                            {
+                                return Err(VmError::new(format!(
+                                    "variavel nao definida: {var_name}"
+                                )));
+                            }
+                            self.push_checked(caller, value)?;
+                        }
+                        _ => {
+                            return Err(VmError::new(
+                                "metodo deve preservar `this` como instancia".to_string(),
+                            ));
+                        }
+                    }
                 } else {
                     self.push_checked(caller, value)?;
                 }
@@ -1116,6 +1207,8 @@ impl Vm {
             scopes: vec![scope],
             handlers: Vec::new(),
             pending: None,
+            pending_new: None,
+            pending_method: None,
             func: Some(func.def.clone()),
         });
         Ok(())
@@ -1195,9 +1288,10 @@ impl Vm {
         self.activate(func, bindings)
     }
 
-    /// Executa `Op::CallMixed` (RFC 0009): le o descritor, desempilha callee
-    /// + valores em ordem do fonte, expande spreads e liga por nome/posicao.
-    fn call_mixed(&mut self, idx: usize, desc_idx: u32) -> Result<(), VmError> {
+    /// Desempilha os valores de uma chamada com descritor e os separa em
+    /// posicionais/nomeados (expandindo spreads). Compartilhado por
+    /// `CallMixed`, `NewMixed` e `CallMethod` (RFCs 0009 e 0017).
+    fn mixed_args(&mut self, idx: usize, desc_idx: u32, what: &str) -> Result<MixedArgs, VmError> {
         let desc = match self.frames[idx].chunk.constants.get(desc_idx as usize) {
             Some(Value::Array(items)) => items.clone(),
             _ => {
@@ -1207,8 +1301,8 @@ impl Vm {
             }
         };
         let n = desc.len();
-        if self.frames[idx].stack.len() < n + 1 {
-            return Err(VmError::new("pilha insuficiente para chamada"));
+        if self.frames[idx].stack.len() < n {
+            return Err(VmError::new(format!("pilha insuficiente para {what}")));
         }
         let mut values = Vec::with_capacity(n);
         for _ in 0..n {
@@ -1217,19 +1311,6 @@ impl Vm {
             }
         }
         values.reverse();
-        let callee = self.frames[idx]
-            .stack
-            .pop()
-            .ok_or_else(|| VmError::new("pilha insuficiente para chamada"))?;
-        let func = match callee {
-            Value::Func(func) => func,
-            other => {
-                return Err(VmError::new(format!(
-                    "tentativa de chamar {} como funcao",
-                    type_name(&other)
-                )));
-            }
-        };
         let mut pos = Vec::new();
         let mut named = Vec::new();
         for (marker, value) in desc.iter().zip(values) {
@@ -1253,9 +1334,154 @@ impl Vm {
                 }
             }
         }
+        Ok((pos, named))
+    }
+
+    /// Executa `Op::CallMixed` (RFC 0009): le o descritor, desempilha callee
+    /// + valores em ordem do fonte, expande spreads e liga por nome/posicao.
+    fn call_mixed(&mut self, idx: usize, desc_idx: u32) -> Result<(), VmError> {
+        let (pos, named) = self.mixed_args(idx, desc_idx, "chamada")?;
+        let callee = self.frames[idx]
+            .stack
+            .pop()
+            .ok_or_else(|| VmError::new("pilha insuficiente para chamada"))?;
+        let func = match callee {
+            Value::Func(func) => func,
+            other => {
+                return Err(VmError::new(format!(
+                    "tentativa de chamar {} como funcao",
+                    type_name(&other)
+                )));
+            }
+        };
         self.push_call_frame_mixed(func, pos, named)?;
         self.frames[idx].ip += 1;
         Ok(())
+    }
+
+    /// Executa `Op::NewMixed` (RFC 0017): como `call_mixed`, mas o callee
+    /// deve ser `Value::Class` e o alvo e sempre o construtor `novo`.
+    /// Ativa com `this` = instancia vazia e arma `pending_new` no frame
+    /// do construtor (o `Return` entrega o `this` final).
+    fn new_mixed(&mut self, idx: usize, desc_idx: u32) -> Result<(), VmError> {
+        let (pos, named) = self.mixed_args(idx, desc_idx, "`new`")?;
+        let callee = self.frames[idx]
+            .stack
+            .pop()
+            .ok_or_else(|| VmError::new("pilha insuficiente para `new`"))?;
+        let class = match callee {
+            Value::Class(class) => class,
+            other => {
+                return Err(VmError::new(format!(
+                    "`new` exige classe, encontrou {}",
+                    type_name(&other)
+                )));
+            }
+        };
+        let novo = class.methods.get("novo").cloned().ok_or_else(|| {
+            VmError::new(format!(
+                "classe `{}` sem construtor `novo` (defina `fn novo(...)`)",
+                class.name
+            ))
+        })?;
+        let instance = Value::Instance {
+            class: class.clone(),
+            fields: HashMap::new(),
+        };
+        let mut func = novo;
+        // `this` disponivel no corpo do construtor (e em closures dele).
+        func.env.insert("this".to_string(), instance);
+        self.push_call_frame_mixed(func, pos, named)?;
+        self.frames[idx].ip += 1;
+        if let Some(frame) = self.frames.last_mut() {
+            frame.pending_new = Some(class.name.clone());
+        }
+        Ok(())
+    }
+
+    /// Executa `Op::CallMethod` (RFC 0017): `variavel.metodo(args)`.
+    /// Como `Index` + chamada, mas com write-back: apos o retorno, o
+    /// `this` final e gravado de volta na variavel (mutacoes de metodo
+    /// sobre variaveis nomeadas persistem; coerente com `a[i] = v`, que
+    /// tambem exige variavel). Sobre expressoes temporarias, use
+    /// `obj.metodo()` via `Index` (sem write-back).
+    fn call_method(
+        &mut self,
+        idx: usize,
+        var_idx: u32,
+        field_idx: u32,
+        desc_idx: u32,
+    ) -> Result<(), VmError> {
+        let var_name = self.name_of(idx, var_idx)?;
+        let field = match self.frames[idx].chunk.constants.get(field_idx as usize) {
+            Some(Value::Str(field)) => field.clone(),
+            _ => {
+                return Err(VmError::new(format!(
+                    "bytecode invalido: campo de metodo {field_idx} invalido"
+                )));
+            }
+        };
+        let (pos, named) = self.mixed_args(idx, desc_idx, "chamada de metodo")?;
+        let base = self
+            .lookup(idx, &var_name)
+            .ok_or_else(|| VmError::new(format!("variavel nao definida: {var_name}")))?;
+        match base {
+            Value::Instance { class, fields } => {
+                // Campos primeiro (como no `Index`): funcao em campo
+                // chama sem `this` e sem write-back.
+                if let Some(value) = fields.get(&field) {
+                    let func = match value.clone() {
+                        Value::Func(func) => func,
+                        other => {
+                            return Err(VmError::new(format!(
+                                "tentativa de chamar {} como funcao",
+                                type_name(&other)
+                            )));
+                        }
+                    };
+                    self.push_call_frame_mixed(func, pos, named)?;
+                    self.frames[idx].ip += 1;
+                    return Ok(());
+                }
+                let func = class.methods.get(&field).cloned().ok_or_else(|| {
+                    VmError::new(format!(
+                        "membro inexistente na instancia de `{}`: `{field}` (sem campo nem metodo)",
+                        class.name,
+                    ))
+                })?;
+                let mut func = func;
+                func.env.insert(
+                    "this".to_string(),
+                    Value::Instance {
+                        class: class.clone(),
+                        fields,
+                    },
+                );
+                self.push_call_frame_mixed(func, pos, named)?;
+                self.frames[idx].ip += 1;
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.pending_method = Some(var_name);
+                }
+                Ok(())
+            }
+            other => {
+                // Nao-instancia: equivale a `Index` + chamada comum (sem
+                // write-back; ex.: mapa com campo funcao).
+                let member = index_value(&other, &Value::Str(field))?;
+                let func = match member {
+                    Value::Func(func) => func,
+                    other => {
+                        return Err(VmError::new(format!(
+                            "tentativa de chamar {} como funcao",
+                            type_name(&other)
+                        )));
+                    }
+                };
+                self.push_call_frame_mixed(func, pos, named)?;
+                self.frames[idx].ip += 1;
+                Ok(())
+            }
+        }
     }
 
     /// Inicia `map`/`filter`/`usort` (RFC 0005): valida `(colecao, funcao)`,
@@ -1512,6 +1738,10 @@ fn heap_size_of(value: &Value, depth: usize) -> u64 {
         }
         Value::Map(entries) => heap_size_of_entries(entries, depth),
         Value::Func(f) => heap_size_of_entries(&f.env, depth),
+        Value::Class(def) => def.name.len() as u64,
+        Value::Instance { class, fields } => {
+            (class.name.len() as u64).saturating_add(heap_size_of_entries(fields, depth))
+        }
         _ => 0,
     }
 }
@@ -1538,6 +1768,8 @@ fn type_name(value: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Map(_) => "mapa",
         Value::Func(_) => "funcao",
+        Value::Class(_) => "classe",
+        Value::Instance { .. } => "instancia",
     }
 }
 
@@ -1553,7 +1785,8 @@ fn check_type(value: &Value, tag: TypeTag) -> Result<(), VmError> {
             | (Value::Array(_), TypeTag::Array)
             | (Value::Map(_), TypeTag::Map)
             | (Value::Null, TypeTag::Null)
-            | (Value::Func(_), TypeTag::Func)
+            | (Value::Func(_), TypeTag::Func) // (Classes/instancias nao tem tag: nunca casam, pois nenhum
+                                              // braco acima as aceita.)
     );
     if ok {
         Ok(())
@@ -1832,6 +2065,35 @@ fn index_value(base: &Value, index: &Value) -> Result<Value, VmError> {
             .get(key)
             .cloned()
             .ok_or_else(|| VmError::new(format!("chave inexistente no mapa: {key}"))),
+        (Value::Instance { class, fields }, Value::Str(key)) => {
+            // Campos primeiro; depois metodos (vinculados a `this`).
+            // Sem aliasing: a instancia e por valor (copia), como mapas.
+            if let Some(value) = fields.get(key) {
+                Ok(value.clone())
+            } else if let Some(func) = class.methods.get(key) {
+                // Metodo vinculado: env capturado na definicao + `this`.
+                let mut env = func.env.clone();
+                env.insert(
+                    "this".to_string(),
+                    Value::Instance {
+                        class: class.clone(),
+                        fields: fields.clone(),
+                    },
+                );
+                Ok(Value::Func(FuncValue {
+                    def: func.def.clone(),
+                    env,
+                }))
+            } else {
+                Err(VmError::new(format!(
+                    "membro inexistente na instancia de `{}`: `{key}` (sem campo nem metodo)",
+                    class.name,
+                )))
+            }
+        }
+        (Value::Class(_), _) => Err(VmError::new(
+            "indexacao de classe nao suportada (instancie com `new`)".to_string(),
+        )),
         _ => Err(VmError::new(format!(
             "indexacao nao suportada para {}[{}]",
             type_name(base),
@@ -1858,6 +2120,21 @@ fn store_index_value(container: &Value, index: &Value, value: Value) -> Result<V
             let mut updated = entries.clone();
             updated.insert(key.clone(), value);
             Ok(Value::Map(updated))
+        }
+        (Value::Instance { class, fields }, Value::Str(key)) => {
+            // Campos sao mutaveis (`this["n"] = ...`); metodos nao sao
+            // sobrescreviveis por atribuicao (erro claro).
+            if class.methods.contains_key(key) {
+                return Err(VmError::new(format!(
+                    "metodo `{key}` nao pode ser sobrescrito por atribuicao"
+                )));
+            }
+            let mut updated = fields.clone();
+            updated.insert(key.clone(), value);
+            Ok(Value::Instance {
+                class: class.clone(),
+                fields: updated,
+            })
         }
         _ => Err(VmError::new(format!(
             "atribuicao indexada nao suportada para {}[{}]",
@@ -2841,7 +3118,7 @@ mod tests {
     /// proposito). `n_consts`/`n_names` = tamanho do pool; saltos miram
     /// `0..code_len+2` (podem cair fora).
     fn fuzz_op(rng: &mut Lcg, n_consts: u32, n_names: u32, code_len: u32) -> Op {
-        match rng.next(48) {
+        match rng.next(51) {
             0 => Op::Constant(rng.next(n_consts as u64 + 2) as u32),
             1 => Op::LoadName(rng.next(n_names as u64 + 2) as u32),
             2 => Op::StoreName(rng.next(n_names as u64 + 2) as u32),
@@ -2899,6 +3176,13 @@ mod tests {
                 6 => TypeTag::Null,
                 _ => TypeTag::Func,
             }),
+            48 => Op::BuildClass(rng.next(n_names as u64 + 2) as u32, rng.next(3) as u32),
+            49 => Op::NewMixed(rng.next(n_consts as u64 + 2) as u32),
+            50 => Op::CallMethod(
+                rng.next(n_names as u64 + 2) as u32,
+                rng.next(n_consts as u64 + 2) as u32,
+                rng.next(n_consts as u64 + 2) as u32,
+            ),
             _ => Op::EnterScope,
         }
     }
@@ -3139,6 +3423,52 @@ mod tests {
         });
         let out = vm_t.run_to_string(&chunk_t).expect("transiente passa");
         assert_eq!(out, "50\n");
+    }
+
+    #[test]
+    fn classes_methods_and_this() {
+        // Etapa 5 (RFC 0017): ciclo completo; mutacao via `c.m()` persiste
+        // (write-back); metodo destacado nao persiste (documentado).
+        let cls = "class Contador { fn novo() { this[\"n\"] = 0; } fn inc() { this[\"n\"] = this[\"n\"] + 1; return this[\"n\"]; } fn get() { return this[\"n\"]; } } ";
+        assert_eq!(
+            run_src(&format!(
+                "{cls} let c = new Contador(); echo c.inc(); echo c.inc(); echo c.get();"
+            ))
+            .expect("ok"),
+            "1\n2\n2\n"
+        );
+        assert_eq!(
+            run_src(&format!(
+                "{cls} let c = new Contador(); let f = c.inc; echo f(); echo c.get();"
+            ))
+            .expect("ok"),
+            "1\n0\n"
+        );
+        // Erros: sem `novo`, metodo ausente, `new` em nao-classe, aridade.
+        assert!(run_err("class A { } let a = new A();").contains("sem construtor"));
+        assert!(
+            run_err(&format!("{cls} let c = new Contador(); echo c.ausente;"))
+                .contains("membro inexistente")
+        );
+        assert!(run_err("let x = 1; let y = new x();").contains("`new` exige classe"));
+        assert!(run_err(&format!("{cls} let c = new Contador(1);")).contains("espera"));
+        // `this` fora de metodo = variavel indefinida; construtor que
+        // descarta `this` = erro.
+        assert!(run_err("echo this;").contains("nao definida"));
+        assert!(
+            run_err("class B { fn novo() { this = 5; } } let b = new B();")
+                .contains("preservar `this`")
+        );
+        // Metodo com named/spread + retorno anotado + `try`.
+        assert_eq!(
+            run_src("class S { fn novo(s) { this[\"s\"] = s; } fn rep(n) { return this[\"s\"]; } } let s = new S(s: \"ab\"); echo s.rep(...[1]);").expect("ok"),
+            "ab\n"
+        );
+        assert_eq!(
+            run_src("class T { fn novo(): int { return 1; } } let t = new T(); echo type(t);")
+                .expect("ok"),
+            "instancia\n"
+        );
     }
 
     #[test]

@@ -268,6 +268,32 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             out.push_str("}\n");
         }
+        Stmt::ClassDef { name, methods } => {
+            indent(level, out);
+            out.push_str(&format!("class {name} {{\n"));
+            for method in methods {
+                indent(level + 1, out);
+                let ret = method
+                    .return_ann
+                    .map(|t| format!(": {}", t.name()))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "fn {}({}){ret} {{",
+                    method.name,
+                    fmt_params(&method.params, method.variadic.as_deref())
+                );
+                // Corpo com indentacao absoluta (metodos nao aninham em
+                // expressoes, ao contrario de closures).
+                let mut body = String::new();
+                fmt_block(&method.body, level + 2, &mut body);
+                out.push_str(&body);
+                indent(level + 1, out);
+                out.push_str("}\n");
+            }
+            indent(level, out);
+            out.push_str("}\n");
+        }
         Stmt::Return { expr } => {
             indent(level, out);
             match expr {
@@ -512,6 +538,13 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
             format!("{name}({})", inner.join(", "))
         }
+        Expr::Member { obj, field } => {
+            format!("{}.{field}", fmt_atom(obj))
+        }
+        Expr::New { class, args } => {
+            let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
+            format!("new {}({})", fmt_atom(class), inner.join(", "))
+        }
         Expr::CallValue { callee, args } => {
             let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
             format!("{}({})", fmt_atom(callee), inner.join(", "))
@@ -582,6 +615,8 @@ fn fmt_atom(expr: &Expr) -> String {
         | Expr::CallValue { .. }
         | Expr::Closure(_)
         | Expr::Index { .. }
+        | Expr::Member { .. }
+        | Expr::New { .. }
         | Expr::Array(_)
         | Expr::Map(_)
         | Expr::StringLiteral(_)
@@ -848,6 +883,20 @@ mod tests {
             "let d = fn (v: int): int {\n  return v * 2;\n};\n"
         );
         check_idempotent("let x: int = 1;\nfn f(a: string): bool {\n  return true;\n}\n");
+    }
+
+    #[test]
+    fn preserves_classes_and_members() {
+        // Etapa 5 (RFC 0017): classe, `new`, `.campo`, `this`.
+        let src = "class Contador {\n  fn novo() {\n    this[\"n\"] = 0;\n  }\n  fn inc(): int {\n    return this[\"n\"];\n  }\n}\n";
+        assert_eq!(
+            fmt("class Contador{fn novo(){this[\"n\"]=0;}fn inc():int{return this[\"n\"];}}"),
+            src
+        );
+        check_idempotent(src);
+        assert_eq!(fmt("echo c.n;"), "echo c.n;\n");
+        assert_eq!(fmt("let c=new Contador();"), "let c = new Contador();\n");
+        check_idempotent("let c = new Contador();\necho c.inc(1, x: 2);\n");
     }
 
     #[test]

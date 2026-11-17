@@ -79,6 +79,8 @@ ThrowStmt  := "throw" Expr ";"
 BreakStmt  := "break" Int? ";"     // N >= 1, padrao 1 (sai de N breakables)
 ContinueStmt := "continue" Int? ";" // N >= 1, padrao 1 (conta laco e `switch`)
 FnDef      := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" (":" Tipo)? Block
+ClassDef   := "class" Ident "{" Metodo* "}"
+Metodo     := "fn" Ident "(" (Param ("," Param)*)? ("," "..." Ident)? ")" (":" Tipo)? Block
 Param      := Ident (":" Tipo)? ("=" Expr)?   // padrao: so expressao constante (dobra em compilacao)
 ReturnStmt := "return" Expr? ";"
 ImportStmt := "import" String ";"
@@ -98,6 +100,15 @@ ExprStmt   := Expr ";"
   `let x: int;` falha (nulo implicito nao satisfaz `int`). Sem anotacao,
   zero checagem (nenhuma instrucao nova). `static`/destructuring sem
   anotacao (nao-objetivo).
+- Classes (RFC 0017, Etapa 5): `class Nome { fn m(params) { } ... }`,
+  `new Nome(args)`, `obj.metodo(args)`, `obj.campo`, `obj.campo = v`,
+  `this` (vinculado no metodo). Construtor = metodo `novo` (obrigatorio;
+  retorno ignorado). Instancias sao POR VALOR (copia, como mapas/arrays;
+  sem aliasing): mutacoes via `obj.metodo()` sobre variavel nomeada
+  persistem (write-back do `this` final; coerente com `a[i] = v`, que
+  tambem exige variavel); metodo destacado (`let f = obj.m; f()`) nao
+  persiste; `type()` = `"classe"`/`"instancia"`; `echo` mostra campos.
+  Sem heranca, sem `private`, sem estaticos de classe (nao-objetivos).
 - `static n = e;` dentro de funcao (RFC 0010): estado por definicao,
   avaliado a cada chamada mas atribuido so na primeira; visivel no corpo
   inteiro (lookup: escopos, statics, globais); fora de funcao = erro.

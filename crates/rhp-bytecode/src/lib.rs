@@ -25,6 +25,22 @@ pub enum Value {
     /// Funcao de primeira classe (RFC 0003): definicao compilada +
     /// ambiente capturado por valor no momento da criacao (`MakeFunc`).
     Func(FuncValue),
+    /// Classe (tabela de metodos; RFC 0017, Etapa 5). Valor de `class Nome`.
+    Class(Rc<ClassDef>),
+    /// Instancia de classe (`new`): classe + campos mutaveis.
+    Instance {
+        class: Rc<ClassDef>,
+        fields: HashMap<String, Value>,
+    },
+}
+
+/// Definicao de classe compilada (RFC 0017, Etapa 5): nome + tabela de
+/// metodos (cada um um `FuncValue` com ambiente capturado na definicao;
+/// `this` e vinculado na chamada).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassDef {
+    pub name: String,
+    pub methods: HashMap<String, FuncValue>,
 }
 
 /// Valor funcional de primeira classe: definicao + ambiente capturado.
@@ -61,6 +77,21 @@ impl fmt::Display for Value {
                         write!(f, ", ")?;
                     }
                     if let Some(value) = entries.get(*key) {
+                        write!(f, "{key}: {value}")?;
+                    }
+                }
+                write!(f, "}}")
+            }
+            Self::Class(def) => write!(f, "<classe {}>", def.name),
+            Self::Instance { fields, .. } => {
+                let mut keys: Vec<&String> = fields.keys().collect();
+                keys.sort();
+                write!(f, "{{")?;
+                for (i, key) in keys.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    if let Some(value) = fields.get(*key) {
                         write!(f, "{key}: {value}")?;
                     }
                 }
@@ -428,6 +459,17 @@ pub enum Op {
     /// Checa o topo da pilha contra a tag (anotacao `: tipo`, RFC 0016;
     /// sem desempilhar; erro `tipos incompativeis: esperava ...`).
     CheckType(TypeTag),
+    /// Constroi classe (`BuildClass(nome_idx, n)`): desempilha `n` pares
+    /// `[nome(Str), metodo(Func)]` e empilha `Value::Class` (RFC 0017).
+    BuildClass(u32, u32),
+    /// Instancia (`NewMixed(desc_idx)`, como `CallMixed`): desempilha os
+    /// valores + a classe, ativa `novo` com `this` e entrega a
+    /// instancia (retorno do construtor ignorado; RFC 0017).
+    NewMixed(u32),
+    /// Chamada de metodo sobre variavel (`CallMethod(var, campo, desc)`;
+    /// RFC 0017): como `Index` + chamada, mas com write-back do `this`
+    /// final na variavel (mutacoes via `obj.metodo()` persistem).
+    CallMethod(u32, u32, u32),
 }
 
 /// Identificador numerico estavel de builtin (para o bytecode).
@@ -661,6 +703,11 @@ impl Chunk {
                         "chunk invalido em `{context}`: nome {idx} fora do pool"
                     )));
                 }
+                Op::BuildClass(name_idx, _) if (name_idx as usize) >= self.names.len() => {
+                    return Err(CompileError::new(format!(
+                        "chunk invalido em `{context}`: nome {name_idx} fora do pool"
+                    )));
+                }
                 Op::DefineFunc(idx) | Op::MakeFunc(idx) if (idx as usize) >= self.funcs.len() => {
                     return Err(CompileError::new(format!(
                         "chunk invalido em `{context}`: funcao {idx} inexistente"
@@ -679,8 +726,24 @@ impl Chunk {
                 Op::CallBuiltin(id) => {
                     id.resolve()?;
                 }
-                Op::CallMixed(desc) => {
+                Op::CallMixed(desc) | Op::NewMixed(desc) => {
                     // Descritor existe; o tipo e checado em `call_mixed_slots`.
+                    call_mixed_slots(&self.constants, desc, context)?;
+                }
+                Op::CallMethod(var_idx, field_idx, desc) => {
+                    if (var_idx as usize) >= self.names.len() {
+                        return Err(CompileError::new(format!(
+                            "chunk invalido em `{context}`: nome {var_idx} fora do pool"
+                        )));
+                    }
+                    match self.constants.get(field_idx as usize) {
+                        Some(Value::Str(_)) => {}
+                        _ => {
+                            return Err(CompileError::new(format!(
+                                "chunk invalido em `{context}`: campo de metodo {field_idx} invalido"
+                            )));
+                        }
+                    }
                     call_mixed_slots(&self.constants, desc, context)?;
                 }
                 _ => {}
@@ -821,6 +884,25 @@ fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(
                 let slots = call_mixed_slots(constants, desc, context)? as i64;
                 check_depth(height, slots + 1, op, context)?;
                 (height - slots, Some(vec![ip + 1]))
+            }
+            Op::NewMixed(desc) => {
+                // Como `CallMixed` (desempilha valores + classe, empilha
+                // a instancia): mesma aritmetica de pilha.
+                let slots = call_mixed_slots(constants, desc, context)? as i64;
+                check_depth(height, slots + 1, op, context)?;
+                (height - slots, Some(vec![ip + 1]))
+            }
+            Op::CallMethod(_, _, desc) => {
+                // Desempilha so os argumentos (a variavel e lida pelo nome);
+                // empilha o retorno.
+                let slots = call_mixed_slots(constants, desc, context)? as i64;
+                check_depth(height, slots, op, context)?;
+                (height - slots + 1, Some(vec![ip + 1]))
+            }
+            Op::BuildClass(_, count) => {
+                let pairs = count as i64;
+                check_depth(height, pairs * 2, op, context)?;
+                (height - pairs * 2 + 1, Some(vec![ip + 1]))
             }
             Op::CallBuiltin(id) => {
                 // `validate_shallow` ja rejeitou ids desconhecidos.
@@ -1187,9 +1269,13 @@ impl Compiler {
             Value::Str(s) => Some(ConstKey::Str(s.clone())),
             Value::Bool(b) => Some(ConstKey::Bool(*b)),
             Value::Null => Some(ConstKey::Null),
-            // Compostos e funcoes: sem dedup (comparacao profunda cara,
-            // beneficio atipico).
-            Value::Array(_) | Value::Map(_) | Value::Func(_) => None,
+            // Compostos, funcoes e objetos: sem dedup (comparacao profunda
+            // cara, beneficio atipico).
+            Value::Array(_)
+            | Value::Map(_)
+            | Value::Func(_)
+            | Value::Class(_)
+            | Value::Instance { .. } => None,
         }
     }
 
@@ -1759,6 +1845,15 @@ impl Compiler {
                 self.compile_expr(other)?;
             }
         }
+        let desc_idx = self.emit_call_args(args)?;
+        self.emit(Op::CallMixed(desc_idx));
+        Ok(())
+    }
+
+    /// Emite os valores dos argumentos + descritor da chamada mista
+    /// (`0` = posicional, `1` = spread, `Str` = nomeado); devolve o indice
+    /// do descritor. Compartilhado por `CallMixed` e `NewMixed` (RFC 0017).
+    fn emit_call_args(&mut self, args: &[CallArg]) -> Result<u32, CompileError> {
         for arg in args {
             self.compile_expr(arg.value())?;
         }
@@ -1773,8 +1868,15 @@ impl Compiler {
                 CallArg::Named(name, _) => Value::Str(name.clone()),
             })
             .collect();
-        let desc_idx = self.add_constant(Value::Array(desc))?;
-        self.emit(Op::CallMixed(desc_idx));
+        self.add_constant(Value::Array(desc))
+    }
+
+    /// Compila `new Nome(args)` (RFC 0017): avalia a classe e os argumentos
+    /// e emite `NewMixed` (mesmo descritor da chamada mista).
+    fn compile_new(&mut self, class: &Expr, args: &[CallArg]) -> Result<(), CompileError> {
+        self.compile_expr(class)?;
+        let desc_idx = self.emit_call_args(args)?;
+        self.emit(Op::NewMixed(desc_idx));
         Ok(())
     }
 
@@ -2099,6 +2201,25 @@ impl Compiler {
                 catch_body,
                 finally_body,
             } => self.compile_try(body, catch_var, catch_body, finally_body)?,
+            Stmt::ClassDef { name, methods } => {
+                let name_idx = self.intern_name(name)?;
+                for method in methods {
+                    let func_idx = self.compile_func_body(
+                        &format!("{name}::{}", method.name),
+                        &method.params,
+                        method.variadic.as_deref(),
+                        method.return_ann,
+                        &method.body,
+                    )?;
+                    let method_name_idx = self.add_constant(Value::Str(method.name.clone()))?;
+                    self.emit(Op::Constant(method_name_idx));
+                    self.emit(Op::MakeFunc(func_idx));
+                }
+                let count = u32::try_from(methods.len())
+                    .map_err(|_| CompileError::new("classe com metodos demais".to_string()))?;
+                self.emit(Op::BuildClass(name_idx, count));
+                self.emit(Op::DeclareName(name_idx));
+            }
             Stmt::Block(stmts) => {
                 self.emit_scope_open();
                 self.compile_stmts(stmts)?;
@@ -2189,6 +2310,17 @@ impl Compiler {
                 self.compile_expr(base)?;
                 self.compile_expr(index)?;
                 self.emit(Op::Index);
+            }
+            Expr::Member { obj, field } => {
+                // `obj.campo` = `obj["campo"]`; em instancia resolve campo
+                // ou metodo vinculado (RFC 0017).
+                self.compile_expr(obj)?;
+                let field_idx = self.add_constant(Value::Str(field.clone()))?;
+                self.emit(Op::Constant(field_idx));
+                self.emit(Op::Index);
+            }
+            Expr::New { class, args } => {
+                self.compile_new(class, args)?;
             }
             Expr::Unary { op, expr } => {
                 self.compile_expr(expr)?;
@@ -2295,6 +2427,19 @@ impl Compiler {
                         name: name.clone(),
                         args: args.clone(),
                     })?;
+                } else if let Expr::Member { obj, field } = callee.as_ref() {
+                    if let Expr::Var(var) = obj.as_ref() {
+                        // `var.metodo(args)`: chamada de metodo com
+                        // write-back do `this` (RFC 0017; coerente com
+                        // `a[i] = v`, que tambem exige variavel nomeada).
+                        let var_idx = self.intern_name(var)?;
+                        let field_idx = self.add_constant(Value::Str(field.clone()))?;
+                        let desc_idx = self.emit_call_args(args)?;
+                        self.emit(Op::CallMethod(var_idx, field_idx, desc_idx));
+                    } else {
+                        // `expr.metodo(args)`: via `Index`, sem write-back.
+                        self.compile_call_mixed(callee, args)?;
+                    }
                 } else if args.iter().all(|a| matches!(a, CallArg::Pos(_))) {
                     self.compile_expr(callee)?;
                     for arg in args {

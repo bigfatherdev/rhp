@@ -38,6 +38,10 @@ pub enum TokenKind {
     Fn,
     Return,
     Static,
+    /// `class` (RFC 0017, Etapa 5).
+    Class,
+    /// `new` (RFC 0017, Etapa 5).
+    New,
     Import,
     True,
     False,
@@ -75,8 +79,10 @@ pub enum TokenKind {
     Semicolon,
     Comma,
     Colon,
-    /// `...` (resto de parametros, RFC 0006). `.` isolado e erro lexico.
+    /// `...` (resto de parametros, RFC 0006); `.` e `Dot` (membro).
     Ellipsis,
+    /// `.` (acesso a membro, RFC 0017). `..` continua erro lexico.
+    Dot,
     LParen,
     RParen,
     LBrace,
@@ -168,8 +174,8 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 col += 1;
             }
             '.' => {
-                // `...` (RFC 0006); `.`/`..` sao erro claro (RHP nao tem
-                // ponto flutuante lider nem acesso por ponto).
+                // `...` (RFC 0006) e `.` (membro, RFC 0017); `..` e erro
+                // claro. Ponto flutuante (`3.5`) e tratado no numero.
                 let start_col = col;
                 let mut dots = 0;
                 while chars.peek().copied().is_some_and(|(_, c)| c == '.') && dots < 3 {
@@ -179,9 +185,11 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 col += dots;
                 if dots == 3 {
                     tokens.push(Token::new(TokenKind::Ellipsis, line, start_col));
+                } else if dots == 1 {
+                    tokens.push(Token::new(TokenKind::Dot, line, start_col));
                 } else {
                     return Err(LexError::new(
-                        "esperado `...` (resto de parametros)".to_string(),
+                        "esperado `...` (resto de parametros) ou `.` (membro)".to_string(),
                         line,
                         start_col,
                     ));
@@ -631,6 +639,8 @@ fn lex_ident_or_keyword(
         "fn" => TokenKind::Fn,
         "return" => TokenKind::Return,
         "static" => TokenKind::Static,
+        "class" => TokenKind::Class,
+        "new" => TokenKind::New,
         "import" => TokenKind::Import,
         "true" => TokenKind::True,
         "false" => TokenKind::False,

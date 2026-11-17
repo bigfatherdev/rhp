@@ -14,6 +14,10 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- Classes mínimas (RFC 0017, Etapa 5): `class`, `new` (construtor `novo`),
+  `obj.metodo()` com `this` e write-back, `type()` classe/instância.
+  Por valor, sem herança. Registro:
+  `changes/2026-11-16-feat-classes-minimas.md`.
 - Anotações de tipo com checagem em runtime (RFC 0016, Etapa 5):
   `let x: int`, `fn f(a: int): int`, 8 tipos, erro `tipos incompativeis`
   (E3001). Opt-in, sem coercao. Registro:

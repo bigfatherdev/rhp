@@ -367,6 +367,29 @@ fn stringify_into(value: &Value, out: &mut String, depth: usize) -> Result<(), V
                 func.def.name
             )));
         }
+        Value::Instance { fields, .. } => {
+            // Instancia vira o objeto dos campos (RFC 0017).
+            let mut keys: Vec<&String> = fields.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                stringify_str(key, out);
+                out.push(':');
+                let item = fields.get(*key).expect("chave existe");
+                stringify_into(item, out, depth + 1)?;
+            }
+            out.push('}');
+        }
+        Value::Class(def) => {
+            return Err(VmError::new(format!(
+                "`json_stringify` nao representa {} (`{}`)",
+                type_name(value),
+                def.name
+            )));
+        }
     }
     Ok(())
 }
