@@ -2870,6 +2870,46 @@ mod tests {
         }
     }
 
+    /// Gerador pseudoaleatorio deterministico (LCG; sem dependencias).
+    struct FuzzRng(u64);
+
+    impl FuzzRng {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % bound
+        }
+    }
+
+    #[test]
+    fn fuzz_random_tokens_never_panic() {
+        // Etapa 3: sequencias aleatorias de fragmentos (seed fixa).
+        // Lexer e parser nunca entram em panico: so Ok ou Err.
+        const FRAGS: [&str; 51] = [
+            "let", "const", "fn", "if", "else", "while", "for", "in", "return", "echo", "true",
+            "false", "null", "match", "switch", "case", "default", "break", "continue", "try",
+            "catch", "finally", "throw", "import", "export", "from", "as", "static", "x", "f",
+            "123", "4.5", "\"s\"", "(", ")", "{", "}", "[", "]", ",", ";", ":", ".", "=", "==",
+            "+", "-", "*", "<", ">", "!",
+        ];
+        let mut rng = FuzzRng(0x9A55_1EED_0A25_E5E0);
+        for _ in 0..5000 {
+            let mut src = String::new();
+            let n = 1 + rng.next(20_usize);
+            for i in 0..n {
+                if i > 0 {
+                    src.push(' ');
+                }
+                src.push_str(FRAGS[rng.next(FRAGS.len())]);
+            }
+            if let Ok(tokens) = rhp_lexer::lex(&src) {
+                let _ = parse(&tokens);
+            }
+        }
+    }
+
     #[test]
     fn rejects_excessive_expression_nesting() {
         let src = format!("echo {}1{};", "(".repeat(400), ")".repeat(400));

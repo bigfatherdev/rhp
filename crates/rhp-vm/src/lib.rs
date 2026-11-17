@@ -732,10 +732,16 @@ impl Vm {
 
     fn check_stack_depth(&self, idx: usize) -> Result<(), VmError> {
         if let Some(max) = self.limits.max_stack_depth {
-            if self.frames[idx].stack.len() > max {
-                return Err(VmError::new(format!(
-                    "pilha de operandos excedeu o limite ({max})"
-                )));
+            // O frame pode ter sido removido por `Return` (idx obsoleto):
+            // sem frame vivo, nao ha pilha a medir. O topo corrente e
+            // medido no passo seguinte (o `run` recalcula o idx a cada
+            // iteracao), entao a fiscalizacao nao enfraquece.
+            if let Some(frame) = self.frames.get(idx) {
+                if frame.stack.len() > max {
+                    return Err(VmError::new(format!(
+                        "pilha de operandos excedeu o limite ({max})"
+                    )));
+                }
             }
         }
         Ok(())
@@ -2636,6 +2642,157 @@ mod tests {
             let got = run_src(&format!("echo {src};")).expect("programa gerado deve rodar");
             assert_eq!(got, format!("{expected}\n"), "fonte: {src}");
         }
+    }
+
+    /// Gera uma instrucao aleatoria (operandos as vezes fora da faixa, de
+    /// proposito). `n_consts`/`n_names` = tamanho do pool; saltos miram
+    /// `0..code_len+2` (podem cair fora).
+    fn fuzz_op(rng: &mut Lcg, n_consts: u32, n_names: u32, code_len: u32) -> Op {
+        match rng.next(48) {
+            0 => Op::Constant(rng.next(n_consts as u64 + 2) as u32),
+            1 => Op::LoadName(rng.next(n_names as u64 + 2) as u32),
+            2 => Op::StoreName(rng.next(n_names as u64 + 2) as u32),
+            3 => Op::DeclareName(rng.next(n_names as u64 + 2) as u32),
+            4 => Op::DeclareStatic(rng.next(n_names as u64 + 2) as u32),
+            5 => Op::DefineFunc(rng.next(2) as u32),
+            6 => Op::MakeFunc(rng.next(2) as u32),
+            7 => Op::Call(rng.next(3) as u32),
+            8 => Op::CallMixed(rng.next(n_consts as u64 + 2) as u32),
+            9 => Op::CallBuiltin(rhp_bytecode::BuiltinId(rng.next(70) as u32)),
+            10 => Op::Jump(rng.next(code_len as u64 + 2) as u32),
+            11 => Op::JumpIfFalse(rng.next(code_len as u64 + 2) as u32),
+            12 => Op::JumpIfNotNull(rng.next(code_len as u64 + 2) as u32),
+            13 => Op::TryBegin(rng.next(code_len as u64 + 2) as u32),
+            14 => Op::BuildArray(rng.next(4) as u32),
+            15 => Op::BuildMap(rng.next(4) as u32),
+            16 => Op::StoreIndex(rng.next(n_names as u64 + 2) as u32),
+            17 => Op::Print,
+            18 => Op::Halt,
+            19 => Op::Add,
+            20 => Op::Sub,
+            21 => Op::Mul,
+            22 => Op::Div,
+            23 => Op::Mod,
+            24 => Op::Neg,
+            25 => Op::Not,
+            26 => Op::BitNot,
+            27 => Op::BitAnd,
+            28 => Op::BitOr,
+            29 => Op::BitXor,
+            30 => Op::Shl,
+            31 => Op::Shr,
+            32 => Op::Dup,
+            33 => Op::Pop,
+            34 => Op::Eq,
+            35 => Op::StrictEq,
+            36 => Op::Ne,
+            37 => Op::Lt,
+            38 => Op::Le,
+            39 => Op::Gt,
+            40 => Op::Ge,
+            41 => Op::Index,
+            42 => Op::IterList,
+            43 => Op::TryEnd,
+            44 => Op::Throw,
+            45 => Op::Rethrow,
+            46 => Op::Return,
+            _ => Op::EnterScope,
+        }
+    }
+
+    /// Executa um chunk sob tetos estritos; nunca entra em panico (o
+    /// resultado, Ok ou Err, e descartado de proposito).
+    fn run_hostile(chunk: &Chunk) {
+        let _ = chunk.validate();
+        let mut vm = Vm::new();
+        vm.set_limits(VmLimits {
+            max_steps: Some(500),
+            max_stack_depth: Some(16),
+            max_collection_len: Some(32),
+        });
+        let mut out = Vec::new();
+        let _ = vm.run(chunk, &mut out);
+    }
+
+    #[test]
+    fn fuzz_hostile_bytecode_never_panics() {
+        // Etapa 3: chunks aleatorios + mutacoes de chunks validos, com seed
+        // fixa e sem dependencias (GOVERNANCE §8.5/§9). Validador e VM so
+        // retornam Ok/Err, nunca panico — mesmo com operandos fora da
+        // faixa, saltos invalidos e `Halt` ausente.
+        let pool = vec![
+            Value::Int(0),
+            Value::Int(1),
+            Value::Str("x".to_string()),
+            Value::Bool(true),
+            Value::Null,
+            Value::Array(vec![Value::Int(0)]),
+        ];
+        let names = vec!["a".to_string(), "b".to_string()];
+        let mut rng = Lcg(0x0BAD_C0DE_F00D_C0DE);
+        for _ in 0..8000 {
+            let n = 1 + rng.next(12) as usize;
+            let mut code = Vec::with_capacity(n + 1);
+            for _ in 0..n {
+                code.push(fuzz_op(
+                    &mut rng,
+                    pool.len() as u32,
+                    names.len() as u32,
+                    n as u32,
+                ));
+            }
+            if rng.next(2) == 0 {
+                code.push(Op::Halt);
+            }
+            run_hostile(&Chunk {
+                constants: pool.clone(),
+                names: names.clone(),
+                funcs: vec![],
+                code,
+            });
+        }
+        // Mutacoes de programas validos (formas realistas).
+        let seeds = [
+            "echo 1;",
+            "let a = [1, 2]; echo a[0];",
+            "fn f(x) { return x + 1; } echo f(41);",
+            "try { throw \"e\"; } catch e { echo e; }",
+            "for x in [1, 2] { echo x; }",
+            "echo match 1 { 1 => \"um\", default => \"outro\" };",
+        ];
+        for src in seeds {
+            let base = compile_src(src);
+            for _ in 0..100 {
+                let mut chunk = base.clone();
+                for _ in 0..(1 + rng.next(3)) {
+                    let i = rng.next(chunk.code.len() as u64) as usize;
+                    chunk.code[i] = fuzz_op(
+                        &mut rng,
+                        chunk.constants.len() as u32,
+                        chunk.names.len() as u32,
+                        chunk.code.len() as u32,
+                    );
+                }
+                run_hostile(&chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn respects_stack_depth_across_return() {
+        // Regressao do fuzz (Etapa 3): `Return` remove o frame e o idx
+        // fica obsoleto; a checagem final de profundidade nao pode
+        // entrar em panico com `max_stack_depth` configurado.
+        let chunk = compile_src("fn f() { return 1; } echo f();");
+        let mut vm = Vm::new();
+        vm.set_limits(VmLimits {
+            max_stack_depth: Some(16),
+            ..Default::default()
+        });
+        let out = vm
+            .run_to_string(&chunk)
+            .expect("return com teto folgado passa");
+        assert_eq!(out, "1\n");
     }
 
     #[test]
