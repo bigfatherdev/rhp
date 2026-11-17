@@ -14,6 +14,17 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- `fmt` preserva comentários e linhas em branco (Etapa 4, DevX):
+  trivia `//` no lexer, `StmtNode` com decoracao, reemissao idempotente.
+  Registro: `changes/2026-11-16-feat-fmt-comentarios.md`.
+- Stack traces em erros de runtime (Etapa 4): `VmError.trace` + `  em f`
+  na CLI (message intacta p/ `try`). Registro:
+  `changes/2026-11-16-feat-stack-traces.md`.
+- REPL com estado persistente (Etapa 4): `rhp repl` + `Vm::run_continue`.
+  Registro: `changes/2026-11-16-feat-repl.md`.
+- Trace de execucao + LSP minimo (Etapa 4): `rhp run --trace`,
+  `rhp lsp` (JSON-RPC stdio, diagnostics). Registro:
+  `changes/2026-11-16-feat-trace-lsp.md`.
 - Conectores TCP/Redis/MySQL (RFC 0020, Etapa 5): `tcp_*`, `redis_*`
   (RESP2), `db_open("mysql:...")` reaproveitando `db_*`. Testes com
   servidores in-process. Registro:
