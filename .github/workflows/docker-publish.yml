@@ -90,6 +90,9 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
+            # PRs nao fazem push, mas precisam de ao menos uma tag valida
+            # para o build nao falhar por lista vazia.
+            type=ref,event=pr
 
       - name: Build + push multi-arch (cache GHA)
         uses: docker/build-push-action@v6
