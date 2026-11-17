@@ -99,6 +99,18 @@ pub(super) fn call_builtin(
             ))),
         },
         Builtin::Type => Ok(Value::Str(type_name(&args[0]).to_string())),
+        Builtin::Exhausted => match &args[0] {
+            Value::Generator(gen) => Ok(Value::Bool(gen.0.borrow().done)),
+            other => Err(VmError::new(format!(
+                "`exhausted` exige gerador, encontrou {}",
+                type_name(other)
+            ))),
+        },
+        // `next` nunca chega aqui: interceptado no `step_inner` (precisa
+        // dos frames para retomar; ver `gen_resume`).
+        Builtin::Next => Err(VmError::new(
+            "interno: `next` fora do protocolo de resume".to_string(),
+        )),
         Builtin::Contains => match (&args[0], &args[1]) {
             (Value::Str(hay), Value::Str(needle)) => Ok(Value::Bool(hay.contains(needle as &str))),
             (other, _) => Err(VmError::new(format!(

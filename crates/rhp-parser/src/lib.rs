@@ -199,6 +199,11 @@ pub enum Stmt {
     Throw {
         expr: Expr,
     },
+    /// `yield EXPR?;` — suspende o gerador entregando o valor (`Null` sem
+    /// EXPR; RFC 0018, Etapa 5). So dentro de funcao (checado na compilacao).
+    Yield {
+        expr: Option<Expr>,
+    },
     FnDef {
         name: String,
         params: Vec<Param>,
@@ -744,6 +749,7 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::Switch => parse_switch(cursor),
         TokenKind::Try => parse_try(cursor),
         TokenKind::Throw => parse_throw(cursor),
+        TokenKind::Yield => parse_yield(cursor),
         TokenKind::Fn => parse_fn_def(cursor),
         TokenKind::Class => parse_class_def(cursor),
         TokenKind::Return => parse_return(cursor),
@@ -1346,6 +1352,19 @@ fn parse_throw(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     let expr = parse_expr(cursor)?;
     expect_semicolon(cursor)?;
     Ok(Stmt::Throw { expr })
+}
+
+/// `yield EXPR?;` (RFC 0018, Etapa 5): sem EXPR entrega `Null`.
+/// So valido dentro de funcao (checado na compilacao, como `return`).
+fn parse_yield(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let expr = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Semicolon)) {
+        None
+    } else {
+        Some(parse_expr(cursor)?)
+    };
+    expect_semicolon(cursor)?;
+    Ok(Stmt::Yield { expr })
 }
 
 fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
@@ -2406,6 +2425,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Catch => "`catch`".to_string(),
         TokenKind::Finally => "`finally`".to_string(),
         TokenKind::Throw => "`throw`".to_string(),
+        TokenKind::Yield => "`yield`".to_string(),
         TokenKind::Export => "`export`".to_string(),
         TokenKind::Fn => "`fn`".to_string(),
         TokenKind::Const => "`const`".to_string(),

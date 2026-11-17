@@ -5,9 +5,11 @@
 //! nao confiavel e sempre validado (recursivamente) antes da execucao.
 
 use rhp_bytecode::{
-    builtin_arity, Builtin, Chunk, ClassDef, FuncDef, FuncValue, Op, Value, MAX_VALUE_DEPTH,
+    builtin_arity, Builtin, Chunk, ClassDef, Frame, FuncDef, FuncValue, GenHandle, GenState,
+    Handler, Op, PendingHof, Value, MAX_VALUE_DEPTH,
 };
 use rhp_parser::{Program, TypeTag};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
@@ -109,76 +111,7 @@ impl std::error::Error for VmError {}
 /// (RFC 0009; reusado por `new` e chamada de metodo, RFC 0017).
 type MixedArgs = (Vec<Value>, Vec<(String, Value)>);
 
-/// Frame de execucao: uma ativacao de chunk (principal ou funcao).
-///
-/// O chunk e compartilhado por `Rc` (Etapa 3): ativar funcao custa um
-/// bump de refcount, sem clonar `code`/`constants`/`names`/`funcs`.
-/// Somente leitura durante a execucao; a pilha/escopos continuam owned.
-#[derive(Debug)]
-struct Frame {
-    chunk: Rc<Chunk>,
-    ip: usize,
-    stack: Vec<Value>,
-    /// Pilha de escopos locais; `scopes[0]` e o escopo da ativacao
-    /// (parametros no caso de funcao).
-    scopes: Vec<HashMap<String, Value>>,
-    /// Pilha de handlers de `try` (RFC 0001); o mais interno por ultimo.
-    handlers: Vec<Handler>,
-    /// `new` em voo (RFC 0017): nome da classe enquanto o construtor
-    /// `novo` executa; vive no frame DO CONSTRUTOR (morre com ele no
-    /// unwind, sem stale). No `Return`, entrega o `this` final.
-    /// Mesmo protocolo do `pending` de HOFs (RFC 0005).
-    pending_new: Option<String>,
-    /// Metodo em voo (`var.metodo()`; RFC 0017): nome da variavel para
-    /// write-back do `this` final. Vive no frame DO METODO.
-    pending_method: Option<String>,
-    /// HOF com callback em voo (RFC 0005): progresso da iteracao enquanto
-    /// as ativacoes do callback executam e retornam. `None` no comum.
-    pending: Option<PendingHof>,
-    /// Definicao da funcao desta ativacao (`None` no programa principal).
-    /// Usada pelo estado `static` (RFC 0010: por definicao).
-    func: Option<Rc<FuncDef>>,
-}
-
-/// Estado de `map`/`filter`/`usort` entre chamadas do callback (RFC 0005).
-/// O frame chamador guarda o progresso; cada retorno do callback avanca
-/// (`advance_hof`) ate finalizar com o resultado empilhado.
-#[derive(Debug, Clone)]
-enum PendingHof {
-    /// `map`: aplica `func` a cada item, acumulando resultados.
-    Map {
-        func: FuncValue,
-        items: Vec<Value>,
-        /// Indice do item cuja chamada esta em voo.
-        next: usize,
-        acc: Vec<Value>,
-    },
-    /// `filter`: como `map`, mas so acumula quando o retorno e `Bool(true)`.
-    Filter {
-        func: FuncValue,
-        items: Vec<Value>,
-        next: usize,
-        acc: Vec<Value>,
-    },
-    /// `usort`: insertion sort estavel dirigido por comparacoes.
-    Sort {
-        func: FuncValue,
-        sorted: Vec<Value>,
-        /// Proximo par a comparar: `(sorted[j], sorted[j-1])`, `j = max(1, ..)`.
-        i: usize,
-        j: usize,
-    },
-}
-
-/// Handler de `try`: para onde saltar e com que escopos/pilha.
-#[derive(Debug, Clone, Copy)]
-struct Handler {
-    /// Instrucao do `catch` ou do bloco `finally`+`Rethrow`.
-    target: usize,
-    /// `scopes.len()` ao registrar (restaura no unwinding).
-    scope_len: usize,
-}
-
+/// Passo de execucao: continua no mesmo frame ou termina (`Halt`).
 enum Step {
     Continue,
     Done,
@@ -372,6 +305,7 @@ impl Vm {
             scopes: vec![HashMap::new()],
             handlers: Vec::new(),
             pending: None,
+            pending_gen: None,
             pending_new: None,
             pending_method: None,
             func: None,
@@ -548,6 +482,24 @@ impl Vm {
                     }
                 }
             }
+            Op::JumpIfTrue(target) => {
+                let value = self.pop(idx, "condicao")?;
+                match value {
+                    Value::Bool(cond) => {
+                        if cond {
+                            self.frames[idx].ip = target as usize;
+                        } else {
+                            self.frames[idx].ip += 1;
+                        }
+                    }
+                    other => {
+                        return Err(VmError::new(format!(
+                            "condicao deve ser bool, encontrado {}",
+                            type_name(&other)
+                        )));
+                    }
+                }
+            }
             Op::Jump(target) => {
                 self.frames[idx].ip = target as usize;
             }
@@ -670,14 +622,41 @@ impl Vm {
             Op::CallMethod(var_idx, field_idx, desc_idx) => {
                 self.call_method(idx, var_idx, field_idx, desc_idx)?;
             }
+            Op::Yield => {
+                let value = self.pop(idx, "`yield`")?;
+                // Entrega ao retomador e salva o frame para continuar depois.
+                // `pending_gen` foi armado pelo `gen_resume` no resume.
+                let gen = self.frames[idx].pending_gen.take().ok_or_else(|| {
+                    VmError::new("`yield` fora de retomada de gerador (interno)".to_string())
+                })?;
+                let mut frame = self.frames.pop().expect("frame do gerador");
+                // Avanca PARA ALEM do `yield`: o resume continua na proxima.
+                frame.ip += 1;
+                gen.0.borrow_mut().frame = Some(frame);
+                let caller = self.frames.len() - 1;
+                self.push_checked(caller, value)?;
+                self.frames[caller].ip += 1;
+            }
             Op::Return => {
                 let value = self.pop(idx, "`return`")?;
                 if self.frames.len() == 1 {
                     return Err(VmError::new("`return` fora de funcao"));
                 }
+                // Gerador terminando (RFC 0018): marca `done`, descarta o
+                // retorno e entrega `Null` (use `yield` para valores).
+                // Tem precedencia: nada mais se aplica a este frame.
+                if let Some(gen) = self.frames[idx].pending_gen.take() {
+                    gen.0.borrow_mut().done = true;
+                    gen.0.borrow_mut().frame = None;
+                    self.frames.pop();
+                    let caller = self.frames.len() - 1;
+                    self.push_checked(caller, Value::Null)?;
+                    self.frames[caller].ip += 1;
+                    return Ok(Step::Continue);
+                }
                 // Anotacao de retorno (`: tipo`; RFC 0016).
                 if let Some(tag) = self.frames[idx].func.as_ref().and_then(|d| d.return_type) {
-                    check_type(&value, tag)?;
+                    check_type_or_err(&value, tag)?;
                 }
                 // `new` (RFC 0017): o `this` final sai desta ativacao
                 // (construtor); o retorno e descartado. A flag morre com
@@ -831,7 +810,7 @@ impl Vm {
                     .stack
                     .last()
                     .ok_or_else(|| VmError::new("pilha vazia em checagem de tipo".to_string()))?;
-                check_type(value, tag)?;
+                check_type_or_err(value, tag)?;
                 self.frames[idx].ip += 1;
             }
             Op::IterList => {
@@ -845,7 +824,7 @@ impl Vm {
                     }
                     other => {
                         return Err(VmError::new(format!(
-                            "`for` exige array ou mapa, encontrado {}",
+                            "`for` exige array, mapa ou gerador, encontrado {}",
                             type_name(&other)
                         )));
                     }
@@ -872,6 +851,10 @@ impl Vm {
                 // (nunca passam pelo `call_builtin` sincrono).
                 if matches!(builtin, Builtin::Map | Builtin::Filter | Builtin::Usort) {
                     self.hof_begin(idx, builtin, args)?;
+                } else if matches!(builtin, Builtin::Next) {
+                    // `next(gen)` (RFC 0018): retoma o gerador (precisa dos
+                    // frames; nunca passa pelo `call_builtin` sincrono).
+                    self.gen_resume(args)?;
                 } else {
                     let result = call_builtin(
                         builtin,
@@ -1179,6 +1162,27 @@ impl Vm {
     /// Empilha a ativacao com vinculos ja resolvidos (ordem irrelevante:
     /// vao direto para o escopo unico). Checa profundidade e preserva a
     /// guarda de `ExitScope` (base com 1 escopo). Nao avanca o `ip`.
+    /// Monta o frame de ativacao (sem empilhar, sem checar profundidade).
+    fn make_frame(func: &FuncValue, scope: HashMap<String, Value>) -> Frame {
+        Frame {
+            chunk: func.def.body.clone(),
+            ip: 0,
+            stack: Vec::new(),
+            scopes: vec![scope],
+            handlers: Vec::new(),
+            pending_new: None,
+            pending_method: None,
+            pending_gen: None,
+            pending: None,
+            func: Some(func.def.clone()),
+        }
+    }
+
+    /// Empilha a ativacao com vinculos ja resolvidos (ordem irrelevante:
+    /// vao direto para o escopo unico). Checa profundidade e preserva a
+    /// guarda de `ExitScope` (base com 1 escopo). Nao avanca o `ip`.
+    /// Funcao geradora NAO executa: empilha `Value::Generator` lazy
+    /// (RFC 0018) no chamador.
     fn activate(&mut self, func: FuncValue, bindings: Vec<(String, Value)>) -> Result<(), VmError> {
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(VmError::new(
@@ -1196,21 +1200,22 @@ impl Vm {
         for (i, name) in func.def.params.iter().enumerate() {
             if let Some(tag) = func.def.param_types.get(i).copied().flatten() {
                 if let Some(value) = scope.get(name) {
-                    check_type(value, tag)?;
+                    check_type_or_err(value, tag)?;
                 }
             }
         }
-        self.frames.push(Frame {
-            chunk: func.def.body.clone(),
-            ip: 0,
-            stack: Vec::new(),
-            scopes: vec![scope],
-            handlers: Vec::new(),
-            pending: None,
-            pending_new: None,
-            pending_method: None,
-            func: Some(func.def.clone()),
-        });
+        if func.def.is_generator {
+            let frame = Self::make_frame(&func, scope);
+            let gen = Value::Generator(GenHandle(Rc::new(RefCell::new(GenState {
+                func,
+                frame: Some(frame),
+                done: false,
+            }))));
+            let top = self.frames.len() - 1;
+            self.push_checked(top, gen)?;
+            return Ok(());
+        }
+        self.frames.push(Self::make_frame(&func, scope));
         Ok(())
     }
 
@@ -1384,6 +1389,12 @@ impl Vm {
                 class.name
             ))
         })?;
+        if novo.def.is_generator {
+            return Err(VmError::new(format!(
+                "construtor `novo` de `{}` nao pode ser gerador",
+                class.name
+            )));
+        }
         let instance = Value::Instance {
             class: class.clone(),
             fields: HashMap::new(),
@@ -1457,10 +1468,14 @@ impl Vm {
                         fields,
                     },
                 );
+                // Metodo gerador: lazy, sem write-back (nunca executa aqui).
+                let is_gen = func.def.is_generator;
                 self.push_call_frame_mixed(func, pos, named)?;
                 self.frames[idx].ip += 1;
-                if let Some(frame) = self.frames.last_mut() {
-                    frame.pending_method = Some(var_name);
+                if !is_gen {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.pending_method = Some(var_name);
+                    }
                 }
                 Ok(())
             }
@@ -1484,6 +1499,49 @@ impl Vm {
         }
     }
 
+    /// Retoma um gerador (`next`; RFC 0018, Etapa 5): empilha o frame
+    /// suspenso e arma `pending_gen` nele. O chamador NAO avanca: quem
+    /// avancar e o `Yield` (valor) ou o `Return` (fim) do gerador.
+    /// Gerador esgotado = erro (teste com `exhausted` antes de `next`).
+    fn gen_resume(&mut self, args: Vec<Value>) -> Result<(), VmError> {
+        let gen = match args.as_slice() {
+            [Value::Generator(gen)] => gen.clone(),
+            [other] => {
+                return Err(VmError::new(format!(
+                    "`next` exige gerador, encontrou {}",
+                    type_name(other)
+                )));
+            }
+            _ => return Err(VmError::new("`next` exige 1 argumento".to_string())),
+        };
+        let frame = {
+            let mut state = gen.0.borrow_mut();
+            if state.done {
+                return Err(VmError::new(
+                    "gerador esgotado (teste com `exhausted` antes de `next`)".to_string(),
+                ));
+            }
+            match state.frame.take() {
+                Some(mut frame) => {
+                    frame.pending_gen = Some(gen.clone());
+                    frame
+                }
+                None => {
+                    // Sem frame e sem `done`: retomada reentrante (o frame
+                    // esta na pilha) ou frame destruido por unwind de erro.
+                    // Nos dois casos nao ha como continuar: marca esgotado.
+                    state.done = true;
+                    return Err(VmError::new(
+                        "gerador interrompido (retomada reentrante ou erro anterior; crie outro)"
+                            .to_string(),
+                    ));
+                }
+            }
+        };
+        self.frames.push(frame);
+        Ok(())
+    }
+
     /// Inicia `map`/`filter`/`usort` (RFC 0005): valida `(colecao, funcao)`,
     /// guarda o progresso em `pending` e empilha a primeira ativacao do
     /// callback. Array vazio finaliza sem chamar.
@@ -1503,6 +1561,11 @@ impl Vm {
                 )));
             }
         };
+        if func.def.is_generator {
+            return Err(VmError::new(format!(
+                "callback de `{name}` nao pode ser gerador (use `for x in gen` ou `next`)"
+            )));
+        }
         if items.is_empty() {
             self.push_checked(idx, Value::Array(Vec::new()))?;
             self.frames[idx].ip += 1;
@@ -1742,6 +1805,24 @@ fn heap_size_of(value: &Value, depth: usize) -> u64 {
         Value::Instance { class, fields } => {
             (class.name.len() as u64).saturating_add(heap_size_of_entries(fields, depth))
         }
+        Value::Generator(gen) => {
+            // `try_borrow`: se o frame suspenso (transitivamente) contem
+            // este mesmo gerador, o borrow aninhado falharia (`panic`) —
+            // nesse caso conta 0 (estimativa; fail-safe documentado).
+            let Ok(state) = gen.0.try_borrow() else {
+                return 0;
+            };
+            let mut total = heap_size_of_entries(&state.func.env, depth);
+            if let Some(frame) = &state.frame {
+                for value in &frame.stack {
+                    total = total.saturating_add(heap_size_of(value, depth + 1));
+                }
+                for scope in &frame.scopes {
+                    total = total.saturating_add(heap_size_of_entries(scope, depth + 1));
+                }
+            }
+            total
+        }
         _ => 0,
     }
 }
@@ -1770,25 +1851,30 @@ fn type_name(value: &Value) -> &'static str {
         Value::Func(_) => "funcao",
         Value::Class(_) => "classe",
         Value::Instance { .. } => "instancia",
+        Value::Generator(_) => "gerador",
     }
 }
 
 /// Checagem de anotacao de tipo (`: tipo`; RFC 0016, Etapa 5). So valida,
 /// nunca converte. Mensagem com prefixo `tipos incompativeis` (faixa E3001).
-fn check_type(value: &Value, tag: TypeTag) -> Result<(), VmError> {
-    let ok = matches!(
-        (value, tag),
+fn check_type(value: &Value, tag: TypeTag) -> bool {
+    match (value, tag) {
         (Value::Int(_), TypeTag::Int)
-            | (Value::Float(_), TypeTag::Float)
-            | (Value::Str(_), TypeTag::String)
-            | (Value::Bool(_), TypeTag::Bool)
-            | (Value::Array(_), TypeTag::Array)
-            | (Value::Map(_), TypeTag::Map)
-            | (Value::Null, TypeTag::Null)
-            | (Value::Func(_), TypeTag::Func) // (Classes/instancias nao tem tag: nunca casam, pois nenhum
-                                              // braco acima as aceita.)
-    );
-    if ok {
+        | (Value::Float(_), TypeTag::Float)
+        | (Value::Str(_), TypeTag::String)
+        | (Value::Bool(_), TypeTag::Bool)
+        | (Value::Array(_), TypeTag::Array)
+        | (Value::Map(_), TypeTag::Map)
+        | (Value::Null, TypeTag::Null)
+        | (Value::Func(_), TypeTag::Func) => true,
+        // Classes/instancias/geradores nao tem tag (distintos de
+        // mapa/funcao): nunca casam.
+        _ => false,
+    }
+}
+
+fn check_type_or_err(value: &Value, tag: TypeTag) -> Result<(), VmError> {
+    if check_type(value, tag) {
         Ok(())
     } else {
         Err(VmError::new(format!(
@@ -3118,7 +3204,7 @@ mod tests {
     /// proposito). `n_consts`/`n_names` = tamanho do pool; saltos miram
     /// `0..code_len+2` (podem cair fora).
     fn fuzz_op(rng: &mut Lcg, n_consts: u32, n_names: u32, code_len: u32) -> Op {
-        match rng.next(51) {
+        match rng.next(53) {
             0 => Op::Constant(rng.next(n_consts as u64 + 2) as u32),
             1 => Op::LoadName(rng.next(n_names as u64 + 2) as u32),
             2 => Op::StoreName(rng.next(n_names as u64 + 2) as u32),
@@ -3183,6 +3269,8 @@ mod tests {
                 rng.next(n_consts as u64 + 2) as u32,
                 rng.next(n_consts as u64 + 2) as u32,
             ),
+            51 => Op::JumpIfTrue(rng.next(code_len as u64 + 2) as u32),
+            52 => Op::Yield,
             _ => Op::EnterScope,
         }
     }
@@ -3468,6 +3556,71 @@ mod tests {
             run_src("class T { fn novo(): int { return 1; } } let t = new T(); echo type(t);")
                 .expect("ok"),
             "instancia\n"
+        );
+    }
+
+    #[test]
+    fn generators_yield_resume_and_finish() {
+        // Etapa 5 (RFC 0018): chamada nao executa (lazy); `next` retoma;
+        // `exhausted` marca o fim; valor de `return` e descartado.
+        let src = "fn g() { echo \"ini\"; yield 1; echo \"mei\"; yield 2; echo \"fim\"; return 99; } let x = g(); echo \"criado\"; echo next(x); echo exhausted(x); echo next(x); echo exhausted(x); echo next(x);";
+        assert_eq!(
+            run_src(src).expect("ok"),
+            "criado\nini\n1\nfalse\nmei\n2\nfalse\nfim\nnull\n"
+        );
+        assert!(run_err(
+            "fn g() { yield 1; } let x = g(); echo next(x); echo next(x); echo next(x);"
+        )
+        .contains("esgotado"));
+        // `yield` sem valor entrega `Null`; `yield null` nao confunde o fim.
+        assert_eq!(run_src("fn g() { yield; yield null; } let x = g(); echo next(x) == null; echo next(x) == null; echo exhausted(x);").expect("ok"), "true\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn generators_for_in_and_control_flow() {
+        // `for x in gen`: break/continue, parada antecipada, vazio, reuso.
+        assert_eq!(
+            run_src("fn g() { yield 1; yield 2; yield 3; } for x in g() { if x == 2 { continue; } if x == 3 { break; } echo x; } echo \"ok\";").expect("ok"),
+            "1\nok\n"
+        );
+        assert_eq!(
+            run_src("fn v() { if false { yield 1; } } for x in v() { echo x; } echo \"fim\";")
+                .expect("ok"),
+            "fim\n"
+        );
+        assert_eq!(
+            run_src("fn nats() { let i = 0; while true { yield i; i = i + 1; } } for x in nats() { if x > 2 { break; } echo x; }").expect("ok"),
+            "0\n1\n2\n"
+        );
+        // Gerador esgotado em novo `for`: zero iteracoes (sem erro).
+        assert_eq!(
+            run_src("fn g() { yield 1; } let x = g(); echo next(x); for y in x { echo y; } echo \"fim\";").expect("ok"),
+            "1\nfim\n"
+        );
+    }
+
+    #[test]
+    fn generators_reject_misuse() {
+        // `new` em nao-classe, `yield` fora de funcao, `next`/`exhausted`
+        // em nao-gerador, construtor/metodo gerador, callback gerador.
+        assert!(run_err("fn f() { return 1; } echo next(f);").contains("exige gerador"));
+        assert!(run_err("echo exhausted(1);").contains("exige gerador"));
+        {
+            let prog = parse_source("yield 1;").expect("parse deve passar");
+            assert!(rhp_bytecode::compile(&prog)
+                .expect_err("yield fora de funcao deve falhar")
+                .message
+                .contains("fora de funcao"));
+        }
+        assert!(
+            run_err("class C { fn novo() { yield 1; } } let c = new C();")
+                .contains("nao pode ser gerador")
+        );
+        assert!(run_err("fn g() { yield 1; } echo map([1], g);").contains("nao pode ser gerador"));
+        // Erro dentro do gerador: `try` externo captura; resume abortado.
+        assert_eq!(
+            run_src("fn g() { yield 1; x_indefinida; } let x = g(); try { echo next(x); echo next(x); } catch e { echo e[\"tipo\"]; } try { echo next(x); } catch e { echo \"morto\"; }").expect("ok"),
+            "1\nruntime\nmorto\n"
         );
     }
 
@@ -3875,9 +4028,9 @@ mod tests {
         assert!(err.contains("nao definida"), "obteve: {err}");
         // Nao iteravel e erro com tipo.
         let err = run_err("for x in 42 { echo x; }");
-        assert!(err.contains("array ou mapa"), "obteve: {err}");
+        assert!(err.contains("array, mapa ou gerador"), "obteve: {err}");
         let err = run_err("for x in \"ab\" { echo x; }");
-        assert!(err.contains("array ou mapa"), "obteve: {err}");
+        assert!(err.contains("array, mapa ou gerador"), "obteve: {err}");
     }
 
     #[test]

@@ -208,6 +208,15 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             indent(level, out);
             let _ = writeln!(out, "throw {};", fmt_expr(expr, 0));
         }
+        Stmt::Yield { expr } => {
+            indent(level, out);
+            match expr {
+                Some(expr) => {
+                    let _ = writeln!(out, "yield {};", fmt_expr(expr, 0));
+                }
+                None => out.push_str("yield;\n"),
+            }
+        }
         Stmt::For { var, iter, body } => {
             indent(level, out);
             let _ = writeln!(out, "for {var} in {} {{", fmt_expr(iter, 0));
@@ -902,6 +911,16 @@ mod tests {
     #[test]
     fn reports_syntax_errors() {
         assert!(format_source("echo \"x\"").is_err());
+    }
+
+    #[test]
+    fn preserves_yield() {
+        // Etapa 5 (RFC 0018): `yield` com e sem valor, idempotente.
+        assert_eq!(
+            fmt("fn g(){yield 1;yield;}"),
+            "fn g() {\n  yield 1;\n  yield;\n}\n"
+        );
+        check_idempotent("fn g() {\n  yield 1;\n  yield;\n}\n");
     }
 
     #[test]

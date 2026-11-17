@@ -1,0 +1,22 @@
+// Geradores (RFC 0018): lazy, `next`/`exhausted`, `for-in`.
+fn contador(n) {
+  let i = 0;
+  while i < n {
+    yield i;
+    i = i + 1;
+  }
+}
+
+for x in contador(3) {
+  echo x;
+}
+
+// Padrao manual while + next/exhausted.
+let g = contador(2);
+while !exhausted(g) {
+  let v = next(g);
+  if exhausted(g) {
+    break;
+  }
+  echo v;
+}

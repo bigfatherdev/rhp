@@ -1513,6 +1513,9 @@ impl Renamer<'_> {
             Stmt::Throw { expr } => Stmt::Throw {
                 expr: self.expr(expr),
             },
+            Stmt::Yield { expr } => Stmt::Yield {
+                expr: expr.as_ref().map(|e| self.expr(e)),
+            },
             Stmt::Try {
                 body,
                 catch_var,
@@ -1712,6 +1715,12 @@ fn check_stmt_expr_imports(stmt: &Stmt) -> Result<(), LoadError> {
             Ok(())
         }
         Stmt::Throw { expr } => check_expr_imports(expr),
+        Stmt::Yield { expr } => {
+            if let Some(expr) = expr {
+                check_expr_imports(expr)?;
+            }
+            Ok(())
+        }
         Stmt::Destructure { init, .. } => check_expr_imports(init),
         Stmt::Static { init, .. } => check_expr_imports(init),
         Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::For { iter: cond, .. } => {

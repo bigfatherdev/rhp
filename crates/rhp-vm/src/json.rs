@@ -367,6 +367,14 @@ fn stringify_into(value: &Value, out: &mut String, depth: usize) -> Result<(), V
                 func.def.name
             )));
         }
+        Value::Generator(handle) => {
+            let name = handle.0.borrow().func.def.name.clone();
+            return Err(VmError::new(format!(
+                "`json_stringify` nao representa {} (`{}`)",
+                type_name(value),
+                name
+            )));
+        }
         Value::Instance { fields, .. } => {
             // Instancia vira o objeto dos campos (RFC 0017).
             let mut keys: Vec<&String> = fields.keys().collect();

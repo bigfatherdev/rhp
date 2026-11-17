@@ -125,9 +125,10 @@ ExprStmt   := Expr ";"
 - `if`/`while` exigem condicao `Bool` (sem truthiness implicita). `while`
   reavalia a condicao a cada iteracao. `for x in e { ... }` avalia `e` uma
   vez: array itera os elementos em ordem; mapa itera as chaves `Str` em
-  ordem (mesma ordem de `keys`); outro tipo = erro de runtime ("`for`
-  exige array ou mapa"). `x` e declarada a cada iteracao no escopo do
-  corpo (atribuir a `x` nao afeta a iteracao; para strings, use
+  ordem (mesma ordem de `keys`); gerador consome sob demanda (forma lazy,
+  RFC 0018); outro tipo = erro de runtime ("`for` exige array, mapa ou
+  gerador"). `x` e declarada a cada iteracao no escopo do corpo (atribuir
+  a `x` nao afeta a iteracao; para strings, use
   `for c in split(s, "")`). `break` (dentro de `while`, `for` ou `switch`,
   mesmo aninhados em `if`/blocos) sai do laco/`switch` mais interno e fecha
   tambem o escopo do corpo — `let`s internos nao vazam para fora; fora de
@@ -137,6 +138,17 @@ ExprStmt   := Expr ";"
   elemento. `in` e contextual (identificador comum fora do `for`), mas
   `for` e palavra reservada. Blocos `{}` criam escopo; shadowing
   com `let` interno e permitido.
+- Geradores (RFC 0018, Etapa 5): `fn g() { yield 1; yield 2; }` — chamar
+  NAO executa (devolve gerador lazy); `next(g)` retoma ate o proximo
+  `yield` (valor) ou fim (`Null`, marca esgotado); `exhausted(g)` testa o
+  fim sem executar. `next` apos o fim = erro; `yield` fora de funcao =
+  erro de compilacao; `return` dentro de gerador descarta o valor.
+  Padrao manual: `while !exhausted(g) { let v = next(g); if exhausted(g)
+  { break; } ... }` (o `next` final entrega `Null` descartavel).
+  `for x in gen` consome (com `break`/`continue`); gerador esgotado em
+  novo `for` = zero iteracoes. `this` em metodos-geradores e vinculado
+  na criacao (sem write-back). `type()` = `"gerador"`; `==` por
+  identidade.
 - `switch e { case c { ... } default { ... } }` (RFC 0004): avalia `e` uma
   vez; cada `case` compara com `==` do RHP em ordem ate o primeiro match
   (preguicoso); sem `break`, o controle cai no proximo ramo (fallthrough);
