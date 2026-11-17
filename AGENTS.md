@@ -6,7 +6,7 @@
 
 Antes de qualquer tarefa, todo agente DEVE:
 
-1. Ler integralmente `GOVERNANCE.md` (copiado de `RHP_GOVERNANCE.md`).
+1. Ler integralmente `GOVERNANCE.md`.
 2. Ler as especificações e ADRs relevantes para a tarefa:
    - `LANGUAGE_SPEC.md`, `BYTECODE_SPEC.md`, `VM_SPEC.md`, `MEMORY_MODEL.md`,
      `ARCHITECTURE.md`, `ROADMAP.md`.

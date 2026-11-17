@@ -4,6 +4,12 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ## [unreleased]
 
+### Removed
+
+- `RHP_GOVERNANCE.md` (duplicata byte-idêntica de `GOVERNANCE.md`);
+  `RHP_PROMPT_INICIAL_v2.md` restaurado (revert de `5ef8b9a`).
+  Registro: `changes/2026-11-16-docs-restaurar-prompt-limpar-duplicata.md`.
+
 ### Fixed
 
 - Panic com `max_stack_depth` + `return` (Etapa 3, achado do fuzz):
