@@ -2,7 +2,7 @@
 
 Uso geral: `rhp <comando> [opcoes] <arquivo.rhp>`
 
-## `rhp run [--max-steps N] <arquivo.rhp> [args...]`
+## `rhp run [--max-steps N] [--max-heap-bytes N] [--trace] <arquivo.rhp> [args...]`
 
 Executa o programa (resolve `import`s antes de compilar). Argumentos apos
 o arquivo vao para `argv()` (ex.: `rhp run prog.rhp a b` => `argv()` e
@@ -16,12 +16,38 @@ o arquivo vao para `argv()` (ex.: `rhp run prog.rhp a b` => `argv()` e
 | N (3–255) | `exit(N)` no programa (sem mensagem; stdout anterior preservado) |
 
 `--max-steps N` aborta apos N instrucoes (`limite de instrucoes excedido`).
+`--max-heap-bytes N` limita a heap estimada (RFC 0015).
+`--trace` despeja `f<frame>:<ip> <op>` em stderr a cada instrucao.
 Exemplos:
 
 ```bash
 rhp run hello.rhp
 rhp run --max-steps 1000 loop.rhp
+rhp run --trace fib.rhp 2> trace.log
 ```
+
+Erros de runtime mostram a pilha de chamadas (`  em f`, da mais interna
+para a mais externa); sem frames nomeados, sem pilha.
+
+## `rhp repl` (Etapa 4)
+
+REPL interativo: le linhas do stdin, compila e executa cada uma com
+estado persistente (globais e funcoes sobrevivem; erro nao mata a
+sessao). Prompt `> ` so em terminal; `sair` ou EOF encerra com 0.
+
+```bash
+rhp repl
+> let x = 40;
+> echo x + 2;
+42
+```
+
+## `rhp lsp` (Etapa 4)
+
+Servidor LSP minimo sobre stdio (JSON-RPC + `Content-Length`):
+`initialize`, `textDocument/didOpen`, `textDocument/didChange`,
+`shutdown`/`exit`; publica `textDocument/publishDiagnostics` com erros
+lexicos/sintaticos (faixa de 1 caractere no ponto do erro).
 
 ## Variaveis de ambiente
 
