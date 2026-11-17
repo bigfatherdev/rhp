@@ -463,6 +463,25 @@ fn rhp_run_http_serve_basic() {
 }
 
 #[test]
+fn rhp_run_http_serve_com_async_no_handler() {
+    // Regressao: `handle_one` define o programa (senao `async_spawn`
+    // no handler falha com "sem programa-fonte").
+    let server = ServerChild::spawn(
+        "srv_async.rhp",
+        "fn trabalho() {\n  return \"feito-ok\";\n}\nfn app(req) {\n  let h = async_spawn(\"trabalho\");\n  return async_join(h);\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 1});\n",
+    );
+    let r1 = server.get("/u");
+    assert!(r1.contains("200 OK"), "obteve: {r1}");
+    assert!(r1.ends_with("feito-ok"), "obteve: {r1}");
+    let out = server.wait();
+    assert!(
+        out.status.success(),
+        "servidor falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn rhp_run_http_serve_500_sem_vazar() {
     let server = ServerChild::spawn(
         "srv500.rhp",
