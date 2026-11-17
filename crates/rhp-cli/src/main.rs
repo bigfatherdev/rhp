@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt, StmtNode};
 
+mod lsp;
 mod pkg;
 
 const USAGE: &str = "uso: rhp run [--max-steps N] [--max-heap-bytes N] [--trace] <arquivo.rhp> [args] | rhp repl | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
@@ -152,6 +153,18 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        [_, cmd] if cmd == "lsp" => {
+            let stdin = std::io::stdin();
+            let input = std::io::BufReader::new(stdin.lock());
+            let output = std::io::stdout();
+            match lsp::run(input, output) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         [_, cmd] if cmd == "test" => match run_tests(Path::new(".")) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
