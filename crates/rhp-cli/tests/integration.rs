@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-
 fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
@@ -1141,6 +1140,38 @@ fn rhp_run_error_shows_call_stack() {
     assert!(
         !flat_err.contains("  em "),
         "nivel superior nao tem pilha, obteve: {flat_err}"
+    );
+}
+
+#[test]
+fn rhp_repl_keeps_state_across_lines() {
+    // Etapa 4: `rhp repl` com stdin redirecionado; estado sobrevive,
+    // erro de uma linha nao mata a sessao.
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let mut child = Command::new(rhp_bin)
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("falha ao iniciar rhp repl");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin do repl")
+        .write_all(
+            b"let x = 40;\nfn soma(a) { return a + 2; }\necho soma(x);\necho x_ruim;\necho x;\n",
+        )
+        .expect("escrever no stdin do repl");
+    let output = child.wait_with_output().expect("aguardar repl");
+    assert!(output.status.success(), "repl nao deveria falhar");
+    assert_eq!(output.stdout, b"42\n40\n", "stdout={:?}", output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("x_ruim"),
+        "erro da linha ruim, obteve: {stderr}"
     );
 }
 

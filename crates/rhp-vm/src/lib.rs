@@ -272,16 +272,42 @@ impl Vm {
             .validate()
             .map_err(|e| VmError::new(format!("bytecode invalido: {e}")))?;
         self.reset(chunk);
+        self.drive(output).map(|_| ())
+    }
 
+    /// Executa ate `Halt` (ou erro), devolvendo o valor no topo da pilha
+    /// em `Done` (`Null` se vazia). Nucleo compartilhado de `run`,
+    /// `run_value` e `run_continue` (com trace anexado no erro).
+    fn drive(&mut self, output: &mut dyn Write) -> Result<Value, VmError> {
         while !self.frames.is_empty() {
             let idx = self.frames.len() - 1;
             match self.step(idx, output) {
                 Ok(Step::Continue) => {}
-                Ok(Step::Done) => return Ok(()),
+                Ok(Step::Done) => {
+                    let value = self.frames[idx].stack.pop().unwrap_or(Value::Null);
+                    return Ok(value);
+                }
                 Err(error) => return Err(error.with_trace(self.call_stack())),
             }
         }
         Err(VmError::new("execucao terminou sem `Halt`"))
+    }
+
+    /// Executa um chunk sobre o estado atual, sem reiniciar (REPL, Etapa 4):
+    /// globais, statics, argv e limites sobrevivem entre linhas; frames e
+    /// passos reiniciam. Erro descarta os frames, preservando o estado.
+    pub fn run_continue(&mut self, chunk: &Chunk, output: &mut dyn Write) -> Result<(), VmError> {
+        chunk
+            .validate()
+            .map_err(|e| VmError::new(format!("bytecode invalido: {e}")))?;
+        self.unwind_all();
+        self.steps = 0;
+        self.push_root(chunk);
+        let result = self.drive(output).map(|_| ());
+        if result.is_err() {
+            self.unwind_all();
+        }
+        result
     }
 
     /// Pilha de chamadas ativas (nomes de funcao, da mais interna para a
@@ -301,19 +327,7 @@ impl Vm {
             .validate()
             .map_err(|e| VmError::new(format!("bytecode invalido: {e}")))?;
         self.reset(chunk);
-
-        while !self.frames.is_empty() {
-            let idx = self.frames.len() - 1;
-            match self.step(idx, output) {
-                Ok(Step::Continue) => {}
-                Ok(Step::Done) => {
-                    let value = self.frames[idx].stack.pop().unwrap_or(Value::Null);
-                    return Ok(value);
-                }
-                Err(error) => return Err(error.with_trace(self.call_stack())),
-            }
-        }
-        Err(VmError::new("execucao terminou sem `Halt`"))
+        self.drive(output)
     }
 
     /// Reinicia frames/globais/passos com um chunk validado.
@@ -322,6 +336,12 @@ impl Vm {
         self.globals.clear();
         self.statics.clear();
         self.steps = 0;
+        self.push_root(chunk);
+    }
+
+    /// Empilha o frame raiz de um chunk validado (sem tocar em globais,
+    /// statics, argv ou limites).
+    fn push_root(&mut self, chunk: &Chunk) {
         self.frames.push(Frame {
             chunk: Rc::new(chunk.clone()),
             ip: 0,
@@ -331,6 +351,12 @@ impl Vm {
             pending: None,
             func: None,
         });
+    }
+
+    /// Desenrola frames ate a base, descartando pilhas/escopos/handlers.
+    /// Globais e statics sobrevivem (estado do REPL entre linhas).
+    fn unwind_all(&mut self) {
+        self.frames.clear();
     }
 
     /// Executa e retorna a saida como `String` (conveniencia para testes).
@@ -2954,6 +2980,25 @@ mod tests {
         let out = run_src("fn f() { x_indefinida; } try { f(); } catch e { echo e[\"tipo\"]; }")
             .expect("catch passa");
         assert_eq!(out, "runtime\n");
+    }
+
+    #[test]
+    fn run_continue_preserves_state_across_lines() {
+        // Etapa 4 (REPL): globais/funcoes sobrevivem; erro nao corrompe.
+        let mut vm = Vm::new();
+        let mut out = Vec::new();
+        let line = |vm: &mut Vm, out: &mut Vec<u8>, src: &str| {
+            let chunk = compile_src(src);
+            vm.run_continue(&chunk, out).map(|_| ())
+        };
+        line(&mut vm, &mut out, "let x = 40;").expect("linha 1 passa");
+        line(&mut vm, &mut out, "fn soma(a) { return a + 2; }").expect("linha 2 passa");
+        line(&mut vm, &mut out, "echo soma(x);").expect("linha 3 passa");
+        assert_eq!(String::from_utf8(out.clone()).expect("utf8"), "42\n");
+        out.clear();
+        line(&mut vm, &mut out, "echo x_indefinida;").expect_err("linha com erro falha");
+        line(&mut vm, &mut out, "echo x;").expect("sessao sobrevive ao erro");
+        assert_eq!(String::from_utf8(out).expect("utf8"), "40\n");
     }
 
     #[test]

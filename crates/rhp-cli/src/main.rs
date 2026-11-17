@@ -13,7 +13,7 @@ use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt, StmtNode};
 
 mod pkg;
 
-const USAGE: &str = "uso: rhp run [--max-steps N] [--max-heap-bytes N] <arquivo.rhp> [args] | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
+const USAGE: &str = "uso: rhp run [--max-steps N] [--max-heap-bytes N] <arquivo.rhp> [args] | rhp repl | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -124,6 +124,13 @@ fn main() -> ExitCode {
             println!("RHP (linguagem experimental)\n\n{USAGE}");
             ExitCode::SUCCESS
         }
+        [_, cmd] if cmd == "repl" => match run_repl() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                ExitCode::from(1)
+            }
+        },
         [_, cmd] if cmd == "test" => match run_tests(Path::new(".")) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
@@ -587,6 +594,52 @@ impl Fail {
 /// Executa um arquivo `.rhp`, repassando argumentos extras para `argv()`.
 fn run_file_with_args(path: &str, args: &[String], output: &mut dyn Write) -> Result<(), Fail> {
     run_file_limited(path, args, output, rhp_vm::VmLimits::default())
+}
+
+/// REPL interativo (Etapa 4, DevX): le linhas do stdin, compila e executa
+/// cada uma com `Vm::run_continue` (globais/funcoes sobrevivem; erro nao
+/// mata a sessao). Prompt `> ` so em terminal (com pipe, sem ruido).
+/// EOF (ou linha `sair`) encerra com codigo 0.
+fn run_repl() -> Result<(), String> {
+    use std::io::{BufRead, IsTerminal};
+    let interactive = std::io::stdin().is_terminal();
+    let mut vm = rhp_vm::Vm::new();
+    let mut lines = std::io::BufReader::new(std::io::stdin()).lines();
+    loop {
+        if interactive {
+            print!("> ");
+            let _ = std::io::stdout().flush();
+        }
+        let Some(line) = lines.next() else {
+            break;
+        };
+        let line = line.map_err(|e| format!("falha lendo stdin: {e}"))?;
+        let src = line.trim();
+        if src.is_empty() || src == "sair" {
+            if src == "sair" {
+                break;
+            }
+            continue;
+        }
+        let program = rhp_parser::parse_source(src).map_err(|e| format!("repl:{e}"))?;
+        let chunk = rhp_bytecode::compile(&program).map_err(|e| {
+            let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
+            with_code(code, help, &format!("repl: erro de compilacao: {e}"))
+        })?;
+        let mut out = std::io::stdout();
+        if let Err(e) = vm.run_continue(&chunk, &mut out) {
+            if e.exit_code().is_some() {
+                break;
+            }
+            let (code, help) = rhp_diagnostic::runtime_code(&e.to_string());
+            let mut message = format!("repl: erro de execucao: {e}");
+            for name in e.trace() {
+                message.push_str(&format!("\n  em {name}"));
+            }
+            eprintln!("rhp: {}", with_code(code, help, &message));
+        }
+    }
+    Ok(())
 }
 
 /// Executa um arquivo `.rhp` com tetos opcionais (`VmLimits`).
