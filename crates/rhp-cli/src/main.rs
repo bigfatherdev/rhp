@@ -13,7 +13,7 @@ use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt};
 
 mod pkg;
 
-const USAGE: &str = "uso: rhp run [--max-steps N] <arquivo.rhp> [args] | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
+const USAGE: &str = "uso: rhp run [--max-steps N] [--max-heap-bytes N] <arquivo.rhp> [args] | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -23,7 +23,15 @@ fn main() -> ExitCode {
         [_, cmd, flag, value, path, rest @ ..] if cmd == "run" && flag == "--max-steps" => {
             match value.parse::<u64>() {
                 Ok(max_steps) => {
-                    match run_file_limited(path, rest, &mut std::io::stdout(), Some(max_steps)) {
+                    match run_file_limited(
+                        path,
+                        rest,
+                        &mut std::io::stdout(),
+                        rhp_vm::VmLimits {
+                            max_steps: Some(max_steps),
+                            ..Default::default()
+                        },
+                    ) {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(Fail::Exit(code)) => ExitCode::from(code as u8),
                         Err(Fail::Msg(message)) => {
@@ -36,6 +44,37 @@ fn main() -> ExitCode {
                     let _ = writeln!(
                         std::io::stderr(),
                         "rhp: valor invalido para --max-steps: `{value}`"
+                    );
+                    ExitCode::from(2)
+                }
+            }
+        }
+        // `--max-heap-bytes` (RFC 0015): teto de heap opt-in; `0` e erro
+        // de uso (teto zero rejeitaria ate programa vazio).
+        [_, cmd, flag, value, path, rest @ ..] if cmd == "run" && flag == "--max-heap-bytes" => {
+            match value.parse::<u64>() {
+                Ok(max_heap_bytes) if max_heap_bytes > 0 => {
+                    match run_file_limited(
+                        path,
+                        rest,
+                        &mut std::io::stdout(),
+                        rhp_vm::VmLimits {
+                            max_heap_bytes: Some(max_heap_bytes),
+                            ..Default::default()
+                        },
+                    ) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(Fail::Exit(code)) => ExitCode::from(code as u8),
+                        Err(Fail::Msg(message)) => {
+                            let _ = writeln!(std::io::stderr(), "rhp: {message}");
+                            ExitCode::from(1)
+                        }
+                    }
+                }
+                _ => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "rhp: valor invalido para --max-heap-bytes: `{value}` (use inteiro > 0)"
                     );
                     ExitCode::from(2)
                 }
@@ -541,27 +580,18 @@ impl Fail {
 
 /// Executa um arquivo `.rhp`, repassando argumentos extras para `argv()`.
 fn run_file_with_args(path: &str, args: &[String], output: &mut dyn Write) -> Result<(), Fail> {
-    run_file_limited(path, args, output, None)
+    run_file_limited(path, args, output, rhp_vm::VmLimits::default())
 }
 
-/// Executa um arquivo `.rhp` com teto opcional de instrucoes.
+/// Executa um arquivo `.rhp` com tetos opcionais (`VmLimits`).
 fn run_file_limited(
     path: &str,
     args: &[String],
     output: &mut dyn Write,
-    max_steps: Option<u64>,
+    limits: rhp_vm::VmLimits,
 ) -> Result<(), Fail> {
     let program = load_program(path).map_err(|e| Fail::Msg(e.human()))?;
-    run_program(
-        &program,
-        path,
-        args,
-        output,
-        rhp_vm::VmLimits {
-            max_steps,
-            ..Default::default()
-        },
-    )
+    run_program(&program, path, args, output, limits)
 }
 
 /// Pipeline programa -> bytecode -> VM (erros com codigo estavel).
@@ -2344,10 +2374,41 @@ mod tests {
         let dir = temp_dir("limite");
         let main = write_temp_module(&dir, "loop.rhp", "while true {\n}\n");
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_file_limited(&main.to_string_lossy(), &[], &mut buf, Some(500))
-            .expect_err("deve falhar")
-            .into_message();
+        let err = run_file_limited(
+            &main.to_string_lossy(),
+            &[],
+            &mut buf,
+            rhp_vm::VmLimits {
+                max_steps: Some(500),
+                ..Default::default()
+            },
+        )
+        .expect_err("deve falhar")
+        .into_message();
         assert!(err.contains("limite de instrucoes"), "obteve: {err}");
+    }
+
+    #[test]
+    fn rejects_heap_over_budget_via_loader() {
+        let dir = temp_dir("heap");
+        let main = write_temp_module(
+            &dir,
+            "grande.rhp",
+            "let a = []; let i = 0; while i < 10 { a = push(a, \"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\"); i = i + 1; } echo len(a);\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let err = run_file_limited(
+            &main.to_string_lossy(),
+            &[],
+            &mut buf,
+            rhp_vm::VmLimits {
+                max_heap_bytes: Some(512),
+                ..Default::default()
+            },
+        )
+        .expect_err("deve falhar")
+        .into_message();
+        assert!(err.contains("heap excedeu o limite"), "obteve: {err}");
     }
 
     #[test]

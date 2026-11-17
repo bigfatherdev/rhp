@@ -86,8 +86,9 @@ Auditoria: `reports/PHP_PARITY_AUDIT.md` (referencia PHP 8.5.12).
 ## Etapas 3–5 — Suporte, DevX e grandes (pós PHP-100 funcional)
 
 - [ ] Etapa 3 (suporte, em andamento): suite de conformidade
-  (`tests/conformance/`), property tests std-only ampliados; pendentes:
-  teto de heap em bytes, fuzz contínuo, otimizações com antes/depois.
+  (`tests/conformance/`), property tests std-only ampliados, teto de heap
+  (`max_heap_bytes`, RFC 0015); pendentes: fuzz contínuo, otimizações com
+  antes/depois.
 - [ ] Etapa 4 (DevX): `rhp fmt` preservando comentários, stack traces,
   REPL, debugger/LSP.
 - [ ] Etapa 5 (grandes, cada item com RFC/ADR + aprovação): tipos, OO/

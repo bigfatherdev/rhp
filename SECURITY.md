@@ -30,7 +30,9 @@
 - Sem TLS no servidor, limite de taxa ou autenticacao; cliente HTTPS
   verificado (raizes embutidas + `RHP_CA_BUNDLE`); redirects so via
   `http_fetch` (teto de 10, sem downgrade https->http).
-- `VmLimits` e opt-in (padrao ilimitado); heap sem teto medido em bytes.
+- `VmLimits` e opt-in (padrao ilimitado); teto de heap em bytes do modelo
+  via `max_heap_bytes`/`--max-heap-bytes` (RFC 0015; nao mede o alocador —
+  teto rigido de RSS = cgroup/ulimit).
 - Sem auditoria externa, fuzz continuo ou testes em Windows.
 - `rand()`/`rand_range()` NAO sao criptograficos (xorshift64; so para
   sorteio/jogos). Segredos, tokens e CSRF exigem CSPRNG — ainda ausente
