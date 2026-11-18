@@ -21,6 +21,7 @@ Familiar como o PHP na sintaxe. Própria na semântica, no compilador e na máqu
 - [Características principais](#características-principais)
 - [Documentação](#documentação)
 - [Instalação](#instalação)
+- [Docker](#docker)
 - [Primeiro programa](#primeiro-programa)
 - [Tour pela sintaxe](#tour-pela-sintaxe)
 - [CLI](#cli)
@@ -96,6 +97,22 @@ git clone https://github.com/bigfatherdev/rhp.git
 cd rhp
 cargo build                    # binario em ./target/debug/rhp
 ```
+
+## Docker
+
+Imagem oficial multi-arquitetura (`linux/amd64`, `linux/arm64`):
+[`bigfatherdev/rhp`](https://hub.docker.com/r/bigfatherdev/rhp)
+(publicada pelo CI a cada `main` verde e a cada tag `v*`; detalhes e
+operacao em [`docs/DOCKER.md`](docs/DOCKER.md)).
+
+```bash
+docker pull bigfatherdev/rhp:latest
+docker run --rm bigfatherdev/rhp:latest --version   # rhp 0.1.0
+docker run --rm -v "$PWD:/work" bigfatherdev/rhp:latest run hello.rhp
+```
+
+Tags: `latest` (main atual), `0.1.0` (fixa), `0.1`, `0`.
+Roda como usuario nao privilegiado (`rhp`, UID 10001).
 
 ## Primeiro programa
 

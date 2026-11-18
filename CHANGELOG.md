@@ -4,6 +4,14 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ## [unreleased]
 
+### Added
+
+- Distribuição oficial via Docker Hub (`bigfatherdev/rhp`, Etapa DevOps):
+  `Dockerfile` multi-stage multi-arch, workflow `docker-publish`
+  (gates + build amd64/arm64 + push condicional + cache + tags semver
+  reais), `docs/DOCKER.md`, ADR 0015. Registro:
+  `changes/2026-11-17-tooling-docker-publish.md`.
+
 ### Removed
 
 - `RHP_GOVERNANCE.md` (duplicata byte-idêntica de `GOVERNANCE.md`).

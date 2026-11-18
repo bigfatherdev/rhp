@@ -1,0 +1,108 @@
+# RHP — CI: testes obrigatorios + publicacao Docker Hub.
+#
+# - Todo push/PR: fmt + clippy + testes (gates do repositorio).
+# - Push na `main` e tags `v*`: build multi-arch (amd64/arm64) e push
+#   para `bigfatherdev/rhp` (push SOMENTE fora de PR; PRs so constroem).
+# - Tags Docker geradas da versao real (nunca ficticias):
+#   tag git `v0.1.0` => `0.1.0`, `0.1`, `0`; `main` => `latest`.
+# - Segredos (criados a mao em Settings > Secrets and variables >
+#   Actions; NUNCA no codigo): `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`
+#   (token de acesso Docker Hub com permissoes Read/Write/Delete... na
+#   pratica: Read & Write bastam; veja `docs/DOCKER.md`).
+# - Repositorio Docker Hub `bigfatherdev/rhp`: criado automaticamente no
+#   primeiro push (conta com permissao de escrita); conferir visibilidade.
+
+name: docker-publish
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY_IMAGE: bigfatherdev/rhp
+  RUST_VERSION: "1.100"
+
+jobs:
+  # Gates do repositorio (iguais ao pre-commit): sem verde, sem imagem.
+  # Postgres de teste (exigido por `rhp_run_postgres_end_to_end`; ver
+  # ADR 0011 — sem mock, so servidor real).
+  test:
+    name: fmt + clippy + testes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rhp
+          POSTGRES_PASSWORD: rhp
+          POSTGRES_DB: rhp
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd="pg_isready -U rhp -d rhp"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  docker:
+    name: build + push (amd64, arm64)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: QEMU (emulacao arm64)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no Docker Hub (só fora de PR)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tags e labels (semver real; latest na main)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            # PRs nao fazem push, mas precisam de ao menos uma tag valida
+            # para o build nao falhar por lista vazia.
+            type=ref,event=pr
+
+      - name: Build + push multi-arch (cache GHA)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          # Push real só fora de PR (em PR, só constrói e valida).
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,13 @@
+# Exclui do contexto de build o que o builder nunca usa.
+# (O Dockerfile copia o resto com `COPY . .`; a imagem final leva
+# SOMENTE o binario compilado — ver o estagio `runtime`.)
+target/
+.git/
+.github/
+*.log
+*.orig
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
