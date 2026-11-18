@@ -16,11 +16,20 @@
 #   docker run --rm -v "$PWD:/work" -w /work rhp:local run hello.rhp
 
 # ---------- builder ----------
-FROM rust:1.100-bookworm AS builder
+FROM rust:1.100-trixie AS builder
 
 # Dependencia nativa do link: `libsqlite3` (FFI direto, sem bindgen nem
 # vendoring; `gcc` para o `ring`/`rustls`).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `upgrade` aplica backports de seguranca do Debian (openssl, zlib,
+# glibc, util-linux, libsqlite3, etc.) no momento do build — ver
+# SECURITY_REMEDIATION.md (CVEs 2026-119373/119374/119379, 2026-76844,
+# 2026-85091, 2026-95691, 2026-107493, 2026-53615, 2026-78410,
+# 2026-13595, 2026-86805, 2025-6020 e demais). Sem `upgrade`, a imagem
+# congelaria versoes vulneraveis da base. Base `trixie` (estavel atual):
+# pacotes mais novos que `bookworm` e backports aplicados mais rapido
+# (ex.: util-linux e zlib ja corrigidos em `trixie-security`).
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     ca-certificates \
     gcc \
     libsqlite3-dev \
@@ -44,9 +53,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && /usr/local/bin/rhp --version
 
 # ---------- runtime ----------
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     ca-certificates \
     libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/* \

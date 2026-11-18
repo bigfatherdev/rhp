@@ -12,7 +12,7 @@ docker pull bigfatherdev/rhp:latest
 Versão fixada (recomendado para produção):
 
 ```bash
-docker pull bigfatherdev/rhp:0.2.0
+docker pull bigfatherdev/rhp:0.3.0
 ```
 
 ## Executar
@@ -21,7 +21,7 @@ docker pull bigfatherdev/rhp:0.2.0
 
 ```bash
 docker run --rm bigfatherdev/rhp:latest --version
-# rhp 0.2.0
+# rhp 0.3.0
 ```
 
 Programa local (monte o diretório como volume; o `WORKDIR` é `/work`):
@@ -53,12 +53,12 @@ Arquivos criados via volume pertencem ao UID 10001 no host (use
 | Tag | Significado |
 |---|---|
 | `latest` | `main` atual (sempre com CI verde) |
-| `0.2.0` | Release exata (imutavel) |
-| `0.2` | Ultimo `0.2.x` |
+| `0.3.0` | Release exata (imutavel) |
+| `0.3` | Ultimo `0.3.x` |
 | `0` | Ultimo `0.x` |
 
 Tags `X.Y.Z`/`X.Y`/`X` sao geradas automaticamente da tag git
-(`v0.2.0` => `0.2.0`, `0.2`, `0`); `latest` acompanha a `main`.
+(`v0.3.0` => `0.3.0`, `0.3`, `0`); `latest` acompanha a `main`.
 Quando sair a `1.0.0` real, `1.0.0`/`1.0`/`1` passam a existir sem
 mudar o pipeline.
 
@@ -68,14 +68,14 @@ mudar o pipeline.
    `crates/*/Cargo.toml` (mantidos sincronizados).
 2. Crie e envie a tag (o `v` inicial e removido nas tags Docker):
    ```bash
-   git tag v0.2.0 && git push origin v0.2.0
+   git tag v0.3.0 && git push origin v0.3.0
    ```
 3. O workflow `docker-publish` (gatilho: tags `v*`): roda fmt + clippy +
    testes (com Postgres de servico), depois build amd64+arm64 e push
-   (`0.2.0`, `0.2`, `0`; conferir no Docker Hub).
+   (`0.3.0`, `0.3`, `0`; conferir no Docker Hub).
 
 > `latest` acompanha a `main` (qualquer push nela republica `latest`,
-> sempre com CI verde). Versoes fixadas (`0.2.0` etc.) so mudam com a
+> sempre com CI verde). Versoes fixadas (`0.3.0` etc.) so mudam com a
 > tag correspondente — use-as em producao.
 
 ## Secrets do GitHub (obrigatorio, manual)
@@ -100,14 +100,18 @@ visibilidade (publico) na pagina do repositorio.
 
 ## Arquitetura da imagem
 
-- `builder` (`rust:1.100-bookworm` + `gcc` + `libsqlite3-dev`):
+- `builder` (`rust:1.100-trixie` + `gcc` + `libsqlite3-dev`):
   `cargo build --release --locked` + smoke (`rhp --version`).
   A suite completa roda no job `test` do CI (com Postgres real),
   nao dentro do build da imagem.
-- `runtime` (`debian:bookworm-slim` + `libsqlite3-0` — o RHP vincula
+- `runtime` (`debian:trixie-slim` + `libsqlite3-0` — o RHP vincula
   o SQLite do sistema via FFI — + `ca-certificates`): so o binario
   (`/usr/local/bin/rhp`); usuario `rhp` (UID 10001); `ENTRYPOINT`
   `["rhp"]`, `CMD ["--help"]`. Sem toolchain, sem fonte, sem root,
   sem `--privileged`, sem `HEALTHCHECK` (CLI, nao daemon).
+  Ambos os estagios executam `apt-get upgrade` no build para aplicar
+  os backports de seguranca do Debian (ver `SECURITY_REMEDIATION.md`).
+  Base `trixie` (estavel atual) desde 2026-11-18 (antes: `bookworm`;
+  ver ADR 0015, emenda).
 
 ~100 MB (base 85 + apt 11 + binario ~6,5).

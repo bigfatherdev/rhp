@@ -1,6 +1,6 @@
 # RHP — Referência completa da linguagem e da biblioteca-padrão
 
-> Versão desta referência: acompanha o RHP `0.2.0` (`rhp --version`).
+> Versão desta referência: acompanha o RHP `0.3.0` (`rhp --version`).
 > Fonte normativa continua sendo `LANGUAGE_SPEC.md` (+ specs);
 > aqui vai o panorama consolidado: sintaxe, todas as funções built-in,
 > erros, CLI e exemplos.
@@ -399,7 +399,7 @@ programa passa pelo validador) nunca exibem pilha interna.
 | `rhp test [dir\|arq]` | Roda `*_test.rhp` (assert; exit != 0 = falha). |
 | `rhp doctor` | Autodiagnostico do ambiente. |
 | `rhp init [dir]` / `rhp pkg add/install` / `rhp build` | Pacotes v0 + bundle autocontido. |
-| `rhp --help`, `rhp --version` | Ajuda e versao (`rhp 0.2.0`). |
+| `rhp --help`, `rhp --version` | Ajuda e versao (`rhp 0.3.0`). |
 
 Detalhes operacionais (Docker, CI, publicacao): ver `docs/DOCKER.md`.
 
