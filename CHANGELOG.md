@@ -8,6 +8,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ### Added
 
+- Referência completa da linguagem (`docs/REFERENCIA.md`): sintaxe,
+  74 builtins, tipos, erros E0xxx–E3xxx, CLI, exemplos verificados.
+  Registro: `changes/2026-11-18-docs-referencia.md`.
 - Distribuição oficial via Docker Hub (`bigfatherdev/rhp`, Etapa DevOps):
   `Dockerfile` multi-stage multi-arch, workflow `docker-publish`
   (gates + build amd64/arm64 + push condicional + cache + tags semver
@@ -104,6 +107,9 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   `http_serve` (so `rhp run` definia; worker precisa recompilar). Achado
   na verificação pós-merge (auditoria de todos os caminhos + servidor
   real). Registro: `changes/2026-11-17-fix-async-program-context.md`.
+- `==` sempre falso para classes, instancias e geradores (braços
+  ausentes em `values_equal`; achado ao escrever exemplos). Registro:
+  `changes/2026-11-18-fix-eq-novos-tipos.md`.
 - Panic com `max_stack_depth` + `return` (Etapa 3, achado do fuzz):
   `Return` remove o frame e a checagem final de profundidade usava
   índice obsoleto; agora tolera frame removido (topo corrente medido
