@@ -2,7 +2,23 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
-## [unreleased]
+## [0.3.0] — 2026-11-18 (Segurança: auditoria 20 CVEs + base Docker `trixie`)
+
+### Changed
+
+- Base Docker `bookworm` → `trixie` (`rust:1.100-trixie`,
+  `debian:trixie-slim`; backports de segurança mais rápidos; sem mudança
+  de arquitetura, usuário ou pacotes). Registro:
+  `changes/2026-11-18-tooling-docker-trixie.md`.
+
+### Security
+
+- Auditoria das 20 CVEs do escopo: 18 NÃO AFETADAS (evidências por
+  componente em `SECURITY_REMEDIATION.md`), 2 MITIGADAS (SQLite FTS5 via
+  `libsqlite3` do sistema; eliminação total aguarda backport Debian
+  ≥ 3.54.0). `Dockerfile` (builder + runtime) passa a aplicar
+  `apt-get upgrade` no build. Registro:
+  `changes/2026-11-18-security-remediacao-20-cves.md`.
 
 ## [0.2.0] — 2026-11-18 (Etapas 3-5 + DevOps: conformidade, heap, fuzz, fmt, DevX, tipos, OO, geradores, async, conectores, Docker)
 

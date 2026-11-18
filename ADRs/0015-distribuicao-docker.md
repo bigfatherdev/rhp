@@ -48,6 +48,18 @@
   (amd64 integral; arm64 em andamento — ver registro), mas a
   publicacao oficial e sempre pelo CI (reprodutibilidade + segredos).
 
+## Emenda 2026-11-18 — base `bookworm` → `trixie` (aprovada pelo solicitante)
+
+- `rust:1.100-bookworm` → `rust:1.100-trixie` (tag verificada como ativa
+  no Docker Hub); `debian:bookworm-slim` → `debian:trixie-slim`.
+- Motivo: `trixie` e o estavel atual — pacotes mais novos e backports de
+  seguranca aplicados mais rapido (ex.: util-linux e zlib ja corrigidos
+  em `trixie-security`; ver `SECURITY_REMEDIATION.md`). Limite honesto:
+  o SQLite do `trixie` (3.46.1) continua `< 3.54.0`, logo as CVEs FTS5
+  seguem MITIGADAS, nao corrigidas, ate backport do Debian.
+- Sem mudanca de arquitetura: multi-stage, runtime minimo, usuario
+  `rhp`, `apt-get upgrade` nos dois estagios (da entrega anterior).
+
 ## Consequencias
 
 - Novo CI (`.github/workflows/docker-publish.yml`) + `Dockerfile` +

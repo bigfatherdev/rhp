@@ -1,6 +1,6 @@
 [package]
 name = "rhp-vm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Maquina virtual baseada em pilha para o RHP (Fase 1)"
 license = "MIT OR Apache-2.0"
