@@ -4,6 +4,8 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
 ## [unreleased]
 
+## [0.2.0] — 2026-11-18 (Etapas 3-5 + DevOps: conformidade, heap, fuzz, fmt, DevX, tipos, OO, geradores, async, conectores, Docker)
+
 ### Added
 
 - Distribuição oficial via Docker Hub (`bigfatherdev/rhp`, Etapa DevOps):
@@ -11,26 +13,6 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   (gates + build amd64/arm64 + push condicional + cache + tags semver
   reais), `docs/DOCKER.md`, ADR 0015. Registro:
   `changes/2026-11-17-tooling-docker-publish.md`.
-
-### Removed
-
-- `RHP_GOVERNANCE.md` (duplicata byte-idêntica de `GOVERNANCE.md`).
-  Registro: `changes/2026-11-16-docs-remover-governanca-duplicada.md`.
-
-### Fixed
-
-- `async_spawn` sem programa-fonte no REPL, no `rhp test` e nos handlers
-  `http_serve` (so `rhp run` definia; worker precisa recompilar). Achado
-  na verificação pós-merge (auditoria de todos os caminhos + servidor
-  real). Registro: `changes/2026-11-17-fix-async-program-context.md`.
-- Panic com `max_stack_depth` + `return` (Etapa 3, achado do fuzz):
-  `Return` remove o frame e a checagem final de profundidade usava
-  índice obsoleto; agora tolera frame removido (topo corrente medido
-  no passo seguinte). Regressão pinada. Registro:
-  `changes/2026-11-16-fix-fuzz-vm-panic.md`.
-
-### Added
-
 - `fmt` preserva comentários e linhas em branco (Etapa 4, DevX):
   trivia `//` no lexer, `StmtNode` com decoracao, reemissao idempotente.
   Registro: `changes/2026-11-16-feat-fmt-comentarios.md`.
@@ -110,6 +92,23 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   `regex_split` (sem lookaround/backrefs), `sha256` + `hmac_sha256`/`hmac_verify`
   (RustCrypto puro, teto anti-DoS).
   Registro: `changes/2026-11-16-feat-regex-hmac.md`.
+
+### Removed
+
+- `RHP_GOVERNANCE.md` (duplicata byte-idêntica de `GOVERNANCE.md`).
+  Registro: `changes/2026-11-16-docs-remover-governanca-duplicada.md`.
+
+### Fixed
+
+- `async_spawn` sem programa-fonte no REPL, no `rhp test` e nos handlers
+  `http_serve` (so `rhp run` definia; worker precisa recompilar). Achado
+  na verificação pós-merge (auditoria de todos os caminhos + servidor
+  real). Registro: `changes/2026-11-17-fix-async-program-context.md`.
+- Panic com `max_stack_depth` + `return` (Etapa 3, achado do fuzz):
+  `Return` remove o frame e a checagem final de profundidade usava
+  índice obsoleto; agora tolera frame removido (topo corrente medido
+  no passo seguinte). Regressão pinada. Registro:
+  `changes/2026-11-16-fix-fuzz-vm-panic.md`.
 
 ## [0.1.0] — 2026-11-15 (primeira release: linguagem + runtime web + persistencia)
 
