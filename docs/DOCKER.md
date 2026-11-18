@@ -12,7 +12,7 @@ docker pull bigfatherdev/rhp:latest
 Versão fixada (recomendado para produção):
 
 ```bash
-docker pull bigfatherdev/rhp:0.1.0
+docker pull bigfatherdev/rhp:0.2.0
 ```
 
 ## Executar
@@ -21,7 +21,7 @@ docker pull bigfatherdev/rhp:0.1.0
 
 ```bash
 docker run --rm bigfatherdev/rhp:latest --version
-# rhp 0.1.0
+# rhp 0.2.0
 ```
 
 Programa local (monte o diretório como volume; o `WORKDIR` é `/work`):
@@ -53,12 +53,12 @@ Arquivos criados via volume pertencem ao UID 10001 no host (use
 | Tag | Significado |
 |---|---|
 | `latest` | `main` atual (sempre com CI verde) |
-| `0.1.0` | Release exata (imutavel) |
-| `0.1` | Ultimo `0.1.x` |
+| `0.2.0` | Release exata (imutavel) |
+| `0.2` | Ultimo `0.2.x` |
 | `0` | Ultimo `0.x` |
 
 Tags `X.Y.Z`/`X.Y`/`X` sao geradas automaticamente da tag git
-(`v0.1.0` => `0.1.0`, `0.1`, `0`); `latest` acompanha a `main`.
+(`v0.2.0` => `0.2.0`, `0.2`, `0`); `latest` acompanha a `main`.
 Quando sair a `1.0.0` real, `1.0.0`/`1.0`/`1` passam a existir sem
 mudar o pipeline.
 
@@ -75,7 +75,7 @@ mudar o pipeline.
    (`0.2.0`, `0.2`, `0`; conferir no Docker Hub).
 
 > `latest` acompanha a `main` (qualquer push nela republica `latest`,
-> sempre com CI verde). Versoes fixadas (`0.1.0` etc.) so mudam com a
+> sempre com CI verde). Versoes fixadas (`0.2.0` etc.) so mudam com a
 > tag correspondente — use-as em producao.
 
 ## Secrets do GitHub (obrigatorio, manual)
