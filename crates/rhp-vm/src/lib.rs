@@ -2188,6 +2188,24 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Array(a), Value::Array(b)) => a == b,
         (Value::Map(a), Value::Map(b)) => a == b,
         (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(&a.def, &b.def) && a.env == b.env,
+        // Classes: igualdade por nome (tabelas de metodos sao imutaveis e
+        // compartilhadas; comparar corpos seria profundo e fragil).
+        (Value::Class(a), Value::Class(b)) => a.name == b.name,
+        // Instancias: mesma classe (por nome) + campos iguais.
+        // Sem risco de recursao infinita: valores sao arvores finitas
+        // (copias por valor nunca formam ciclos; vide MEMORY_MODEL).
+        (
+            Value::Instance {
+                class: ca,
+                fields: fa,
+            },
+            Value::Instance {
+                class: cb,
+                fields: fb,
+            },
+        ) => ca.name == cb.name && fa == fb,
+        // Geradores: identidade (`Rc::ptr_eq` + `done`).
+        (Value::Generator(a), Value::Generator(b)) => a == b,
         _ => false,
     }
 }
@@ -3797,6 +3815,17 @@ mod tests {
         assert_eq!(
             run_src("fn g() { yield 1; x_indefinida; } let x = g(); try { echo next(x); echo next(x); } catch e { echo e[\"tipo\"]; } try { echo next(x); } catch e { echo \"morto\"; }").expect("ok"),
             "1\nruntime\nmorto\n"
+        );
+        // Igualdade: gerador so e igual a si mesmo; instancias e classes
+        // comparam por estrutura/nome.
+        assert_eq!(
+            run_src("fn g() { yield 1; } let a = g(); let b = g(); echo a == a; echo a == b;")
+                .expect("ok"),
+            "true\nfalse\n"
+        );
+        assert_eq!(
+            run_src("class C { fn novo() { this[\"n\"] = 0; } } let c1 = new C(); let c2 = new C(); echo c1 == c2; c2[\"n\"] = 5; echo c1 == c2; echo C == C;").expect("ok"),
+            "true\nfalse\ntrue\n"
         );
     }
 
