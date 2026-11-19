@@ -436,15 +436,24 @@ Exemplos invalidos:
   handle `Int` imediatamente (compativel com `async_join`).
 - `await expr`: handle valido = bloqueia ate concluir (erros propagam);
   outro valor = identidade.
-- Fronteira da tarefa (item 1): args posicionais planos; captura por nome
-  transporta so valores planos (`null/bool/int/float/string/array/mapa`;
-  resto fica indisponivel). Codigo compartilhado: o worker executa as
-  definicoes de topo (funcoes, classes, `import native`) e resolve a
-  definicao exata — tarefas chamam outras funcoes, usam classes e aninham
-  `async`. Estado nao compartilhado: globais mutaveis nao atravessam.
-- Restricoes (erro claro): async com `this` (metodo), geradores async,
-  nomeados/spread em chamada mista async, instancia/funcao/classe/gerador
-  como argumento.
+- Fronteira da tarefa (item 1 + metodos-async): args posicionais planos ou
+  instancias (com classe, via envelope; chave `__rhp_instancia__` reservada);
+  funcao/classe/gerador como argumento = erro. Captura por nome transporta
+  planos e instancias; o resto fica indisponivel. Codigo compartilhado: o
+  worker executa as definicoes de topo (funcoes, classes, `import native`)
+  e resolve a definicao exata — tarefas chamam outras funcoes, usam classes
+  e aninham `async`. Estado nao compartilhado: globais mutaveis nao
+  atravessam.
+- Metodos `async`: `async fn` em classe/trait; `obj.m()`, destacada
+  (`let f = obj.m`) e `super.m()` geram tarefa sobre SNAPSHOT do `this`
+  (sem write-back: mutacoes nao voltam; devolva valores com `return`).
+- Combinadores (RFC 0030): `await_timeout(h, s)` (0–3600s; estouro = erro
+  capturavel, tarefa segue em voo); `async_cancel(h)` + `async_cancelled()`
+  (cooperativo); `await_all([h, ...])` (ordem, falha rapida);
+  `await_race([h, ...])` (primeiro pronto vence, resto segue).
+  Handles one-shot (reuso apos join = erro), exceto apos timeout.
+- Restricoes (erro claro): geradores async, nomeados/spread em chamada mista
+  async, funcao/classe/gerador como argumento, mapa com chave reservada.
 - `async_spawn`/`async_join` legados intactos e interoperaveis com `await`.
 
 ## 11. Excecoes tipadas (Next Generation)
@@ -457,11 +466,20 @@ Exemplos invalidos:
 - Sem match no ultimo tipado = propaga (`Rethrow` apos `finally`).
   `finally` sempre executa (normal, `catch`, propagacao).
 
-## 12. Generics por apagamento (Next Generation)
+## 12. Generics por apagamento + bounds (Next Generation, RFC 0029)
 
 - `class Caixa<T>`, `fn f<T>(x: T)`, `new Caixa<int>(...)`, `f<int>(...)`:
-  parse valida forma (duplicatas = erro); tudo apagado (sem checagem, sem
-  custo). `T` em anotacao = sem checagem.
+  parse valida forma (duplicatas = erro); apagados no runtime (sem custo).
+  `T` em anotacao = sem checagem.
+- Bounds: `class Repo<T: Entidade>`, `fn g<T: Salva>(v)`, `interface R<T: X>`:
+  bound deve nomear classe ou interface definida antes (senao erro).
+- Checagem no uso (compilacao): aridade dos type args; nao-generica com args
+  = erro; builtin com args = erro; bound violado = erro
+  (`` `Outra` nao satisfaz `T: Entidade` em `Repo` ``); tipo desconhecido
+  (inclui primitivos como `int` contra bound) = erro.
+- Sem argumentos de tipo (`new Caixa(v)`, `f(x)`) = apagado, sem checagem
+  (legado). Parametro de tipo visivel no escopo adia a checagem
+  (`new Caixa<T>` dentro de `fn f<T>` passa; verificado ao instanciar).
 - `<` binario preservado: so e lista de tipos se houver `< T (, T)* > (`
   adiante; senao e comparacao (ex.: `i < n` em `for` segue funcionando).
 

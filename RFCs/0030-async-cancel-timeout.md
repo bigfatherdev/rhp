@@ -1,9 +1,9 @@
 # RFC 0030 (proposta) — Cancelamento, timeout e combinadores async
 
 - ID: RFC 0030
-- Status: proposta (nao implementada)
+- Status: aceita e implementada (nucleo; thread-pool segue adiado)
 - Data: 2026-11-19
-- Versao: —
+- Versao: unreleased (0.5.0 planejada)
 - Depende de: RFC 0023 (async/await) + item 1 (captura/codigo compartilhado)
 
 ## 1. Problema
@@ -21,7 +21,7 @@ alternativas nao sao redutiveis a primeira pronta.
 - Nao-objetivos: preempcao/interrupcao de thread, `select` generico,
   thread-pool, backpressure automatica.
 
-## 3. Proposta
+## 3. Proposta (implementada: ids de builtin 75–79; sem thread-pool)
 
 ```rhp
 async fn lenta() { sleep(10); return "demorou"; }
@@ -31,6 +31,7 @@ try {
 } catch e {
   echo "tempo esgotado";
 }
+echo await h; // a tarefa seguiu em voo; junta aqui ("demorou")
 
 async fn trabalho() {
   let i = 0;
@@ -85,12 +86,18 @@ docs de padroes (timeout + retry + cancel).
 
 ## 9. Plano de testes
 
-Timeout estoura e e capturavel; cancel cooperativo retorna; `all` ordena;
-`race` pega o primeiro; handle reusado = erro; sem flaky (margens 10x).
+Timeout estoura e e capturavel (e a tarefa segue juntavel); timeout 0 em
+tarefa pronta devolve na hora; cancel cooperativo retorna; `async_cancelled`
+fora de tarefa = `false`; `all` ordena + falha rapida; `race` pega o
+primeiro pronto; handle reusado/inexistente = erro; args invalidos = erro.
+Implementado: `nextgen_await_timeout`, `nextgen_async_cancel`,
+`nextgen_await_all_race` (margens folgadas, sem flaky).
 
 ## 10. Migracao e rollout
 
-Opcional; padroes novos nao afetam codigo existente.
+Opcional; padroes novos nao afetam codigo existente. `await`/`async_join`
+agora juntam via canal (mesmas mensagens de erro); retorno de instancia
+volta decodificado (antes degradava em mapa — correcao).
 
 ## 11. Criterios de aceitacao
 

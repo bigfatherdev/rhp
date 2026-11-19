@@ -17,7 +17,7 @@
 - [Geradores](#8-geradores-rfc-0018)
 - [Concorrência](#9-concorrencia-rfc-0019)
 - [Módulos e pacotes](#10-modulos-e-pacotes)
-- [Biblioteca-padrão (74 builtins)](#11-biblioteca-padrao-74-builtins)
+- [Biblioteca-padrão (79 builtins)](#11-biblioteca-padrao-79-builtins)
 - [Erros e códigos](#12-erros-e-codigos)
 - [CLI](#13-cli)
 - [Exemplo completo](#14-exemplo-completo)
@@ -191,21 +191,33 @@ echo exhausted(g);              // false
   ("interrompido"; crie outro). `this` de metodo-gerador e vinculado na
   criacao (sem write-back). `yield` fora de funcao = erro de compilacao.
 
-## 9. Concorrencia (RFC 0019)
+## 9. Concorrencia (RFCs 0019/0023/0030)
 
 ```rhp
 fn lenta() { sleep(1); return "pronta"; }
 let h = async_spawn("lenta");   // Int (handle); roda em thread propria
 echo async_join(h);              // bloqueia; devolve o retorno ("pronta")
+
+async fn buscarA() { sleep(0.2); return "A"; }
+let a = buscarA();               // gera tarefa na hora (nao bloqueia)
+echo await a;                    // "A"
+echo await_timeout(a, 5);         // com prazo (estouro = erro capturavel)
+async_cancel(a);                 // cooperativo (a tarefa sonda async_cancelled())
+echo await_all([a(), b()]);      // junta em ordem
+echo await_race([a(), b()]);     // primeiro pronto vence
 ```
 
-- Tarefas isoladas: sem globais compartilhados (a thread recompila o
-  programa); comunicacao so pelo retorno (desserializado de JSON:
-  null/bool/int/float/string/array/mapa; funcao/classe/gerador = erro).
-- Zero-arg na v1 (sem parametros); so `fn` de nivel superior sem
-  captura; nao-generator (erros claros em cada caso).
+- Tarefas isoladas: compartilham o CODIGO (definicoes de topo: funcoes,
+  classes, `import native`), nao o ESTADO (globais mutaveis nao atravessam).
+  Captura cruza so valores planos e instancias (com classe); funcao, classe
+  e gerador nao atravessam (erro claro). Metodos `async` rodam sobre snapshot
+  (sem write-back; devolva valores com `return`).
+- Args posicionais (nao nomeados/spread); funcao sem captura vira tarefa;
+  `await`/`async_join` interoperam (handles one-shot, exceto apos timeout).
 - Erro da tarefa vira erro do `join` (`tarefa ... falhou: ...`).
-- `join` e one-shot (reuso = `handle invalido`).
+- Cancelamento e cooperativo (`async_cancel` + `async_cancelled`); timeout
+  nao mata a tarefa (segue em voo; junte depois). Sem thread-pool (1 thread
+  por tarefa; documentado).
 - Paralelismo real: 2x `sleep(1)` em ~1s (nao ~2s).
 
 ## 10. Modulos e pacotes
@@ -230,7 +242,7 @@ import {u} from "./c1.rhp";
 - Comentarios `//` de linha e linhas em branco sao preservados pelo
   `rhp fmt` na mesma ordem relativa ao statement.
 
-## 11. Biblioteca-padrao (74 builtins)
+## 11. Biblioteca-padrao (79 builtins)
 
 Aridade checada na compilacao; erros sao `VmError` com mensagem em
 portugues (ver [codigos](#12-erros-e-codigos)).
@@ -354,8 +366,13 @@ Padrao manual: `while !exhausted(g) { let v = next(g); if exhausted(g) { break; 
 
 | Funcao | Efeito |
 |---|---|
-| `async_spawn("f")` | Roda `fn` de nivel superior sem captura em thread propria (recompila o programa); devolve handle `Int` imediatamente. Isolada: sem globais compartilhados. Gerador/closure/nao-funcao = erro. |
-| `async_join(h)` | Bloqueia ate terminar; devolve o retorno (desserializado de JSON: null/bool/int/float/string/array/mapa; resto = erro). One-shot (reuso = `handle invalido`). Erro da tarefa = `tarefa ... falhou: ...`. |
+| `async_spawn("f")` | Roda `fn` de nivel superior sem captura em thread propria (recompila o programa; definicoes de topo reconstruidas no worker); devolve handle `Int` imediatamente. Gerador/closure/nao-funcao = erro. |
+| `async_join(h)` | Bloqueia ate terminar; devolve o retorno (desserializado de JSON + instancias com classe; resto = erro). One-shot (reuso = `handle invalido`). Erro da tarefa = `tarefa ... falhou: ...`. |
+| `await_timeout(h, s)` | Como `await`, com prazo em segundos (0–3600; `0` = sondagem); estouro = erro capturavel e a tarefa segue em voo (junte depois). |
+| `async_cancel(h)` | Sinaliza cancelamento cooperativo (`Null`); a tarefa precisa sondar `async_cancelled()`. |
+| `async_cancelled()` | `Bool`: `true` dentro de tarefa cancelada; `false` fora de tarefa. |
+| `await_all([h, ...])` | Junta em ordem, devolve array; falha rapida (demais seguem no mapa). |
+| `await_race([h, ...])` | Devolve o primeiro pronto (demais seguem no mapa); vazio = erro. |
 
 ### Sockets e Redis (RFC 0020)
 

@@ -16,10 +16,11 @@ nome em string — ergonomico para paralelismo simples, insuficiente para
 - Objetivo: `async fn` (chamada gera tarefa, devolve handle) + `await`
   (junta; identidade para nao-tarefas), com args posicionais e I/O
   bloqueante isolado por thread.
-- Nao-objetivos: executor com poll/wakeup, `select`/`cancel`/`timeout`,
-  milhares de tarefas (uma thread por tarefa; documentado), async em
-  metodos/`new` (rejeitado com erro claro), globais mutaveis no worker
-  (arquitetura: codigo compartilhado, estado nao).
+- Nao-objetivos: executor com poll/wakeup, `select`/`cancel`/`timeout`
+  (ver RFC 0030, proposta), milhares de tarefas (uma thread por tarefa;
+  documentado), write-back em metodos async (snapshot; ver abaixo),
+  globais mutaveis no worker (arquitetura: codigo compartilhado, estado
+  nao).
 
 ## 3. Proposta
 
@@ -37,12 +38,17 @@ echo await b; // 42
   de empilhar frame; devolvem handle `Int` (compativel com `async_join`).
 - `await v`: novo op `Await`; handle valido = join (erros propagam);
   outro valor = identidade.
-- `async fn` com `this` (metodo) ou gerador = erro. Nomeados/spread em
-  chamada mista async = erro.
-- Captura: transporta valores planos (`null/bool/int/float/string/array/
-  mapa` recursivos); o resto fica indisponivel (se usado, falha com
-  `variavel nao definida`). Instancia/funcao/classe/gerador em ARGS =
-  erro claro (antes, instancia degradava em mapa silencioso — corrigido).
+- `async fn` com gerador = erro. Nomeados/spread em chamada mista async =
+  erro.
+- Captura: transporta valores planos e instancias (com classe, via envelope
+  `{"__rhp_instancia__": {"classe", "campos"}}`; mapas com a chave reservada
+  sao rejeitados no spawn). Funcao, classe e gerador nao atravessam (erro
+  claro). O resto fica indisponivel (se o corpo usar, falha com `variavel
+  nao definida`).
+- Metodos `async` (item metodos-async): `async fn` em classe/trait; chamada
+  (`obj.m()`, destacada ou `super.m()`) gera tarefa sobre um SNAPSHOT do
+  `this` (reconstruido no worker com a classe local) — SEM write-back:
+  mutacoes nao voltam ao chamador; devolva valores com `return`.
 - Codigo compartilhado: o worker executa as definicoes de topo (funcoes,
   classes, `import native`) e resolve a definicao exata (closures tem nomes
   unicos `{closure:N}`); tarefas chamam outras funcoes de topo, usam

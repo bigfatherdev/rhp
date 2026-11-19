@@ -14,7 +14,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::time::Duration;
 
 mod builtins;
 use builtins::call_builtin;
@@ -158,6 +161,10 @@ pub struct Vm {
     /// Extensoes nativas ja carregadas (`import native`; Fase Next-Gen 6).
     /// Segunda carga da mesma extensao = erro (evita sombra silenciosa).
     loaded_extensions: std::collections::HashSet<String>,
+    /// Flag cooperativa de cancelamento desta tarefa (item RFC 0030):
+    /// `Some` dentro de workers (lida por `async_cancelled`), `None` na VM
+    /// principal (fora de tarefa = nunca cancelada).
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Tarefas assincronas por handle (RFC 0019): cada uma roda em thread
@@ -168,16 +175,67 @@ struct TaskHandles {
     next: i64,
 }
 
-/// Tarefa em voo: thread + nome da funcao (para diagnostico).
+/// Tarefa em voo: canal de resultado + flag cooperativa de cancelamento +
+/// nome da funcao (para diagnostico). A thread e destacada: envia o
+/// resultado pelo canal e termina (sem `join`; panico = canal fechado).
+/// (Item RFC 0030: timeout/cancelamento/all/race.)
 #[derive(Debug)]
 struct TaskThread {
     name: String,
-    handle: std::thread::JoinHandle<TaskResult>,
+    rx: Receiver<TaskResult>,
+    cancel: Arc<AtomicBool>,
 }
 
 /// Resultado que cruza a fronteira da thread (JSON serializado; `String`
 /// e `Send`, ao contrario de `Value`).
 type TaskResult = Result<String, String>;
+
+/// Dispara a thread da tarefa (item RFC 0030): a thread executa, envia o
+/// resultado pelo canal e termina destacada (sem `join`; panico = canal
+/// fechado, detectado como `abortou (panic)` no join).
+/// Devolve `(rx, cancel)`: o receptor do resultado e a flag cooperativa.
+fn spawn_task_thread(
+    program: Arc<Program>,
+    argv: Vec<String>,
+    name: String,
+    args_json: String,
+    env_json: String,
+) -> (Receiver<TaskResult>, Arc<AtomicBool>) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let thread_cancel = Arc::clone(&cancel);
+    std::thread::spawn(move || {
+        let result = run_task_with_args(program, argv, name, args_json, env_json, thread_cancel);
+        let _ = tx.send(result);
+    });
+    (rx, cancel)
+}
+
+/// Valida segundos para `await_timeout` (item RFC 0030): numero, finito,
+/// `0 <= s <= 3600` (mesmos limites do `sleep`; `0` = sondagem sem bloqueio).
+fn timeout_secs(value: &Value, builtin: &str) -> Result<f64, VmError> {
+    let secs = match value {
+        Value::Int(v) => *v as f64,
+        Value::Float(v) => *v,
+        other => {
+            return Err(VmError::new(format!(
+                "`{builtin}` exige segundos (numero), encontrado {}",
+                type_name(other)
+            )));
+        }
+    };
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(VmError::new(format!(
+            "`{builtin}` exige segundos >= 0, encontrado {secs}"
+        )));
+    }
+    if secs > 3600.0 {
+        return Err(VmError::new(format!(
+            "`{builtin}` excedeu o teto (3600 segundos)"
+        )));
+    }
+    Ok(secs)
+}
 
 /// Lista as extensoes disponiveis (para mensagens de erro).
 fn available_extensions() -> String {
@@ -189,29 +247,108 @@ fn available_extensions() -> String {
     names.join(", ")
 }
 
-/// Corpo da thread de tarefa (RFC 0019): recompila o programa (owned,
-/// padrao `http_serve`: `Arc<Program>` e owned+`Send`); executa a funcao de nivel superior e serializa
-/// o retorno em JSON. Compartilha o CODIGO (funcoes/classes/extensoes via
-/// definicoes de topo), nao o ESTADO (globais mutaveis nao atravessam);
-/// erros viram `Err(mensagem)` para o `join` re-lancar.
-fn run_task(program: Arc<Program>, argv: Vec<String>, name: String) -> TaskResult {
-    run_task_with_args(program, argv, name, "[]".to_string(), "{}".to_string())
-}
+/// Chave reservada do envelope de instancia na fronteira async.
+/// Mapas do usuario contendo esta chave (em qualquer nivel) sao rejeitados
+/// no spawn para nao confundir carga util com envelope.
+const INSTANCE_TAG: &str = "__rhp_instancia__";
 
-/// Valores que atravessam a fronteira da thread (item 1): so planos
-/// (`Null/Bool/Int/Float/Str/Array/Map` recursivos). Funcao, classe,
-/// instancia e gerador nao atravessam — `Instance` serializaria como mapa
-/// puro (perda silenciosa da classe), entao e rejeitada aqui com erro claro
-/// em vez de corromper.
+/// Valores que atravessam a fronteira da thread: planos (`Null/Bool/Int/
+/// Float/Str/Array/Map` recursivos) e instancias (com classe, via envelope).
+/// Funcao, classe e gerador nao atravessam. Mapas com a chave reservada do
+/// envelope sao rejeitados (evita ambiguidade na decodificacao).
 fn check_shareable(value: &Value) -> Result<(), String> {
     match value {
         Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => Ok(()),
         Value::Array(items) => items.iter().try_for_each(check_shareable),
-        Value::Map(entries) => entries.values().try_for_each(check_shareable),
+        Value::Map(entries) => {
+            if entries.contains_key(INSTANCE_TAG) {
+                return Err(format!(
+                    "mapa usa chave reservada `{INSTANCE_TAG}` (renomeie a chave)"
+                ));
+            }
+            entries.values().try_for_each(check_shareable)
+        }
+        Value::Instance { fields, .. } => fields.values().try_for_each(check_shareable),
         other => Err(format!(
-            "`async` nao transporta {} (use valores planos: null, bool, int, float, string, array, mapa)",
+            "`async` nao transporta {} (use valores planos ou instancias de classes do programa)",
             type_name(other)
         )),
+    }
+}
+
+/// Codifica valores para a fronteira: instancias viram envelope
+/// `{"__rhp_instancia__": {"classe": Nome, "campos": {...}}}` (recursivo);
+/// resto passa como esta (ja validado por `check_shareable`).
+fn encode_shareable(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(encode_shareable).collect()),
+        Value::Map(entries) => {
+            let mut out = HashMap::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.insert(k.clone(), encode_shareable(v));
+            }
+            Value::Map(out)
+        }
+        Value::Instance { class, fields } => {
+            let mut campos = HashMap::new();
+            for (k, v) in fields {
+                campos.insert(k.clone(), encode_shareable(v));
+            }
+            let mut inner = HashMap::new();
+            inner.insert("classe".to_string(), Value::Str(class.name.clone()));
+            inner.insert("campos".to_string(), Value::Map(campos));
+            let mut out = HashMap::new();
+            out.insert(INSTANCE_TAG.to_string(), Value::Map(inner));
+            Value::Map(out)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Decodifica o envelope de volta em instancia (item metodos-async).
+/// `lookup` resolve a classe no VM local (worker ou chamador).
+/// So o envelope EXATO (`{"__rhp_instancia__": {"classe": Str, "campos": Map}}`)
+/// vira instancia; resto (incluido mapas comuns) passa como esta.
+fn decode_shareable(
+    value: Value,
+    lookup: &dyn Fn(&str) -> Option<Rc<ClassDef>>,
+) -> Result<Value, String> {
+    match value {
+        Value::Array(items) => items
+            .into_iter()
+            .map(|v| decode_shareable(v, lookup))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Map(mut entries) => {
+            if entries.len() == 1 {
+                if let Some(tag) = entries.remove(INSTANCE_TAG) {
+                    if let Value::Map(inner) = tag {
+                        let name = match inner.get("classe") {
+                            Some(Value::Str(s)) => s.clone(),
+                            _ => return Err("envelope de instancia invalido".to_string()),
+                        };
+                        let fields = match inner.get("campos") {
+                            Some(Value::Map(m)) => m.clone(),
+                            _ => return Err("envelope de instancia invalido".to_string()),
+                        };
+                        let class = lookup(&name)
+                            .ok_or_else(|| format!("classe `{name}` indisponivel na tarefa"))?;
+                        let mut dec = HashMap::with_capacity(fields.len());
+                        for (k, v) in fields {
+                            dec.insert(k, decode_shareable(v, lookup)?);
+                        }
+                        return Ok(Value::Instance { class, fields: dec });
+                    }
+                    return Err("envelope de instancia invalido".to_string());
+                }
+            }
+            let mut out = HashMap::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.insert(k, decode_shareable(v, lookup)?);
+            }
+            Ok(Value::Map(out))
+        }
+        other => Ok(other),
     }
 }
 
@@ -267,17 +404,22 @@ fn defs_program(program: &Program) -> Program {
     }
 }
 
-/// Variante com argumentos e captura (Fase Next-Gen 3, `async fn`):
-/// `args_json` e um array JSON (cada elemento vira um `Value` posicional);
-/// `env_json` e um objeto JSON com o ambiente capturado (fronteira `Send`).
-/// Resolve a definicao pelo nome na tabela cheia (nomes de closure sao
-/// unicos, `{closure:N}`) e, por ultimo, nos globais das definicoes.
+/// Variante com argumentos, captura e cancelamento (Fase Next-Gen 3 +
+/// item RFC 0030): `args_json` e um array JSON (cada elemento vira um `Value`
+/// posicional); `env_json` e um objeto JSON com o ambiente capturado
+/// (fronteira `Send`); `cancel` e a flag cooperativa lida por
+/// `async_cancelled` dentro da tarefa.
+/// Recompila o programa (owned, padrao `http_serve`): executa as definicoes
+/// de topo (codigo compartilhado, nao o estado), resolve a definicao pelo
+/// nome (tabela cheia + globais) e executa, serializando o retorno em JSON.
+/// Erros viram `Err(mensagem)` para o `join` re-lancar.
 fn run_task_with_args(
     program: Arc<Program>,
     argv: Vec<String>,
     name: String,
     args_json: String,
     env_json: String,
+    cancel: Arc<AtomicBool>,
 ) -> TaskResult {
     // 1) Codigo compartilhado: compila e executa as definicoes de topo.
     let defs = defs_program(&program);
@@ -287,6 +429,7 @@ fn run_task_with_args(
     let mut vm = Vm::new();
     vm.set_argv(argv);
     vm.program = Some(Arc::clone(&program));
+    vm.cancel_flag = Some(cancel);
     {
         let mut sink = std::io::sink();
         vm.run(&defs_chunk, &mut sink)
@@ -305,16 +448,30 @@ fn run_task_with_args(
     if def.is_generator {
         return Err(format!("`async_spawn` nao suporta gerador (`{name}`)"));
     }
+    // Classes disponiveis no worker (para decodificar instancias).
+    let lookup = |class_name: &str| match vm.globals.get(class_name).cloned() {
+        Some(Value::Class(class)) => Some(class),
+        _ => None,
+    };
     let args_value =
         crate::json::parse_json(&args_json).map_err(|e| format!("argumentos invalidos: {e}"))?;
     let args = match args_value {
-        Value::Array(items) => items,
+        Value::Array(items) => items
+            .into_iter()
+            .map(|v| decode_shareable(v, &lookup))
+            .collect::<Result<Vec<_>, _>>()?,
         _ => return Err("argumentos devem ser array".to_string()),
     };
     let env_value =
         crate::json::parse_json(&env_json).map_err(|e| format!("ambiente invalido: {e}"))?;
     let captured = match env_value {
-        Value::Map(entries) => entries,
+        Value::Map(entries) => {
+            let mut dec = HashMap::with_capacity(entries.len());
+            for (k, v) in entries {
+                dec.insert(k, decode_shareable(v, &lookup)?);
+            }
+            dec
+        }
         _ => return Err("ambiente deve ser objeto".to_string()),
     };
     let func = FuncValue {
@@ -332,7 +489,9 @@ fn run_task_with_args(
         .map_err(|e| e.message.clone())?;
     let mut sink = std::io::sink();
     let value = vm.drive(&mut sink).map_err(|e| e.message.clone())?;
-    crate::json::stringify_json(&value).map_err(|e| e.message.clone())
+    // Retorno cruza codificado (instancias com classe); o join decodifica.
+    let encoded = encode_shareable(&value);
+    crate::json::stringify_json(&encoded).map_err(|e| e.message.clone())
 }
 
 /// Conexoes de banco da VM (B2: SQLite; B3: +PostgreSQL).
@@ -383,6 +542,7 @@ impl Vm {
             tcp: tcp::TcpHandles::default(),
             redis: redis::RedisHandles::default(),
             loaded_extensions: std::collections::HashSet::new(),
+            cancel_flag: None,
         }
     }
 
@@ -871,23 +1031,8 @@ impl Vm {
                 match value {
                     Value::Int(id) if self.tasks.running.contains_key(&id) => {
                         let task = self.tasks.running.remove(&id).expect("handle verificado");
-                        let result = task.handle.join().map_err(|_| {
-                            VmError::new(format!("`await`: tarefa `{}` abortou (panic)", task.name))
-                        })?;
-                        match result {
-                            Ok(json) => {
-                                let v = crate::json::parse_json(&json).map_err(|e| {
-                                    VmError::new(format!("`await`: retorno invalido: {e}"))
-                                })?;
-                                self.push_checked(idx, v)?;
-                            }
-                            Err(message) => {
-                                return Err(VmError::new(format!(
-                                    "tarefa `{}` falhou: {message}",
-                                    task.name
-                                )));
-                            }
-                        }
+                        let v = self.join_removed_task(idx, task, "await")?;
+                        self.push_checked(idx, v)?;
                         self.frames[idx].ip += 1;
                     }
                     other => {
@@ -1162,7 +1307,16 @@ impl Vm {
                     // `next(gen)` (RFC 0018): retoma o gerador (precisa dos
                     // frames; nunca passa pelo `call_builtin` sincrono).
                     self.gen_resume(args)?;
-                } else if matches!(builtin, Builtin::AsyncSpawn | Builtin::AsyncJoin) {
+                } else if matches!(
+                    builtin,
+                    Builtin::AsyncSpawn
+                        | Builtin::AsyncJoin
+                        | Builtin::AwaitTimeout
+                        | Builtin::AsyncCancel
+                        | Builtin::AsyncCancelled
+                        | Builtin::AwaitAll
+                        | Builtin::AwaitRace
+                ) {
                     // Tarefas (RFC 0019): precisam da VM (programa + tabela).
                     self.async_begin(idx, builtin, args)?;
                     self.frames[idx].ip += 1;
@@ -1809,6 +1963,18 @@ impl Vm {
                             )));
                         }
                     };
+                    // Campo com funcao async: gera tarefa (sem write-back).
+                    if func.def.is_async {
+                        if !named.is_empty() {
+                            return Err(VmError::new(
+                                "`async` nao aceita argumentos nomeados nem spread (use posicionais)"
+                                    .to_string(),
+                            ));
+                        }
+                        self.spawn_async_call(idx, func, pos)?;
+                        self.frames[idx].ip += 1;
+                        return Ok(());
+                    }
                     self.push_call_frame_mixed(func, pos, named)?;
                     self.frames[idx].ip += 1;
                     return Ok(());
@@ -1827,6 +1993,19 @@ impl Vm {
                         fields,
                     },
                 );
+                // Metodo async: gera tarefa sobre snapshot (sem write-back:
+                // mutacoes nao voltam; devolva valores com `return`).
+                if func.def.is_async {
+                    if !named.is_empty() {
+                        return Err(VmError::new(
+                            "metodo `async` nao aceita argumentos nomeados nem spread (use posicionais)"
+                                .to_string(),
+                        ));
+                    }
+                    self.spawn_async_call(idx, func, pos)?;
+                    self.frames[idx].ip += 1;
+                    return Ok(());
+                }
                 // Metodo gerador: lazy, sem write-back (nunca executa aqui).
                 let is_gen = func.def.is_generator;
                 self.push_call_frame_mixed(func, pos, named)?;
@@ -1911,9 +2090,16 @@ impl Vm {
             ));
         }
         if func.def.is_async {
-            return Err(VmError::new(
-                "metodo `async` do pai nao suportado via `super` (chame direto)".to_string(),
-            ));
+            if !named.is_empty() {
+                return Err(VmError::new(
+                    "metodo `async` do pai nao aceita argumentos nomeados nem spread (use posicionais)"
+                        .to_string(),
+                ));
+            }
+            // Snapshot como em `call_method` (sem write-back no `this` local).
+            self.spawn_async_call(idx, func, pos)?;
+            self.frames[idx].ip += 1;
+            return Ok(());
         }
         self.push_call_frame_mixed(func, pos, named)?;
         self.frames[idx].ip += 1;
@@ -2025,11 +2211,12 @@ impl Vm {
         false
     }
 
-    /// Gera tarefa para `async fn` (Fase Next-Gen 3 + item 1): valida,
-    /// serializa args e ambiente capturado em JSON e dispara thread com
-    /// programa recompilado (definicoes de topo reconstruidas no worker).
-    /// Devolve handle. `this` (metodos) segue rejeitado: a instancia
-    /// serializaria sem a classe.
+    /// Gera tarefa para `async fn` ou metodo `async` (item metodos-async):
+    /// valida, codifica args e captura (instancias com classe) em JSON e
+    /// dispara thread com programa recompilado. Devolve handle.
+    /// Semantica de snapshot: metodos async rodam sobre UMA COPIA (`this`
+    /// reconstruido no worker); mutacoes NAO voltam ao chamador (sem
+    /// write-back). Devolva valores com `return`.
     fn spawn_async_call(
         &mut self,
         idx: usize,
@@ -2042,43 +2229,74 @@ impl Vm {
                 "`async` nao suporta gerador (`{name}`)"
             )));
         }
-        if func.env.contains_key("this") {
-            return Err(VmError::new(format!(
-                "metodo `async` nao suportado (`{name}`; use funcao de nivel superior)"
-            )));
-        }
         let program = self
             .program
             .clone()
             .ok_or_else(|| VmError::new("`async` sem programa-fonte (interno)".to_string()))?;
         // Fronteira `Send`: args sao posicionais (nao-plano = erro claro,
-        // sem reordenar). A captura e por nome: transporta so valores
-        // planos; o resto fica indisponivel (se o corpo usar, falha la com
-        // `variavel nao definida`, como global ausente).
+        // sem reordenar). A captura e por nome: transporta valores planos e
+        // instancias (com classe); o resto fica indisponivel (se o corpo
+        // usar, falha la com `variavel nao definida`, como global ausente).
         for arg in &args {
             check_shareable(arg).map_err(VmError::new)?;
         }
         // Serializa args e captura como JSON (fronteira `Send`).
-        let args_json = crate::json::stringify_json(&Value::Array(args))
+        let encoded_args: Vec<Value> = args.iter().map(encode_shareable).collect();
+        let args_json = crate::json::stringify_json(&Value::Array(encoded_args))
             .map_err(|e| VmError::new(format!("`async` nao suporta argumento: {}", e.message)))?;
         let shared_env: HashMap<String, Value> = func
             .env
             .iter()
             .filter(|(_, v)| check_shareable(v).is_ok())
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), encode_shareable(v)))
             .collect();
         let env_json = crate::json::stringify_json(&Value::Map(shared_env))
             .map_err(|e| VmError::new(format!("`async fn` nao suporta captura: {}", e.message)))?;
         let argv = self.argv.clone();
         let thread_name = name.clone();
-        let handle = std::thread::spawn(move || {
-            run_task_with_args(program, argv, thread_name, args_json, env_json)
-        });
+        let (rx, cancel) = spawn_task_thread(program, argv, thread_name, args_json, env_json);
         let id = self.tasks.next;
         self.tasks.next += 1;
-        self.tasks.running.insert(id, TaskThread { name, handle });
+        self.tasks
+            .running
+            .insert(id, TaskThread { name, rx, cancel });
         self.push_checked(idx, Value::Int(id))?;
         Ok(())
+    }
+
+    /// Junta a tarefa ja removida do mapa (item RFC 0030): bloqueia ate o
+    /// resultado, propaga erro/panico da tarefa e decodifica o retorno.
+    /// Mensagens identicas as dos caminhos legados (`async_join`/`await`).
+    fn join_removed_task(
+        &self,
+        idx: usize,
+        task: TaskThread,
+        what: &str,
+    ) -> Result<Value, VmError> {
+        let result = task.rx.recv().map_err(|_| {
+            VmError::new(format!("`{what}`: tarefa `{}` abortou (panic)", task.name))
+        })?;
+        match result {
+            Ok(json) => self.decode_task_value(idx, &json, what),
+            Err(message) => Err(VmError::new(format!(
+                "tarefa `{}` falhou: {message}",
+                task.name
+            ))),
+        }
+    }
+
+    /// Decodifica o retorno JSON de tarefa (item metodos-async): instancias
+    /// voltam com a classe do programa local (a codificacao preservou nome +
+    /// campos). Erro claro se a classe sumiu.
+    fn decode_task_value(&self, idx: usize, json: &str, what: &str) -> Result<Value, VmError> {
+        let value = crate::json::parse_json(json)
+            .map_err(|e| VmError::new(format!("`{what}`: retorno invalido: {e}")))?;
+        let lookup = |name: &str| match self.lookup(idx, name) {
+            Some(Value::Class(class)) => Some(class),
+            _ => None,
+        };
+        decode_shareable(value, &lookup)
+            .map_err(|e| VmError::new(format!("`{what}`: retorno invalido: {e}")))
     }
 
     /// Retoma um gerador (`next`; RFC 0018, Etapa 5): empilha o frame
@@ -2177,10 +2395,18 @@ impl Vm {
                 })?;
                 let argv = self.argv.clone();
                 let thread_name = name.clone();
-                let handle = std::thread::spawn(move || run_task(program, argv, thread_name));
+                let (rx, cancel) = spawn_task_thread(
+                    program,
+                    argv,
+                    thread_name,
+                    "[]".to_string(),
+                    "{}".to_string(),
+                );
                 let id = self.tasks.next;
                 self.tasks.next += 1;
-                self.tasks.running.insert(id, TaskThread { name, handle });
+                self.tasks
+                    .running
+                    .insert(id, TaskThread { name, rx, cancel });
                 self.push_checked(idx, Value::Int(id))?;
                 Ok(())
             }
@@ -2200,24 +2426,199 @@ impl Vm {
                         "`async_join`: handle {id} invalido ou ja consumido"
                     ))
                 })?;
-                let result = task.handle.join().map_err(|_| {
+                let value = self.join_removed_task(idx, task, "async_join")?;
+                self.push_checked(idx, value)?;
+                Ok(())
+            }
+            Builtin::AwaitTimeout => {
+                let (id, secs) = match args.as_slice() {
+                    [Value::Int(id), s] => (*id, timeout_secs(s, "await_timeout")?),
+                    [other, _] => {
+                        return Err(VmError::new(format!(
+                            "`await_timeout` exige handle (int), encontrou {}",
+                            type_name(other)
+                        )));
+                    }
+                    _ => {
+                        return Err(VmError::new(
+                            "`await_timeout` exige 2 argumentos".to_string(),
+                        ))
+                    }
+                };
+                let task = self.tasks.running.remove(&id).ok_or_else(|| {
                     VmError::new(format!(
-                        "`async_join`: tarefa `{}` abortou (panic)",
-                        task.name
+                        "`await_timeout`: handle {id} invalido ou ja consumido"
                     ))
                 })?;
-                match result {
-                    Ok(json) => {
-                        let value = crate::json::parse_json(&json).map_err(|e| {
-                            VmError::new(format!("`async_join`: retorno invalido: {e}"))
-                        })?;
+                let task_name = task.name.clone();
+                match task.rx.recv_timeout(Duration::from_secs_f64(secs)) {
+                    Ok(Ok(json)) => {
+                        let value = self.decode_task_value(idx, &json, "await_timeout")?;
                         self.push_checked(idx, value)?;
                         Ok(())
                     }
-                    Err(message) => Err(VmError::new(format!(
-                        "tarefa `{}` falhou: {message}",
-                        task.name
+                    Ok(Err(message)) => Err(VmError::new(format!(
+                        "tarefa `{task_name}` falhou: {message}"
                     ))),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Devolve ao mapa: segue em voo, pode juntar depois.
+                        self.tasks.running.insert(id, task);
+                        Err(VmError::new(format!(
+                            "`await_timeout`: tempo esgotado apos {secs}s aguardando tarefa `{task_name}` (segue em voo; junte depois)"
+                        )))
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(VmError::new(
+                        format!("`await_timeout`: tarefa `{task_name}` abortou (panic)"),
+                    )),
+                }
+            }
+            Builtin::AsyncCancel => {
+                let id = match args.as_slice() {
+                    [Value::Int(id)] => *id,
+                    [other] => {
+                        return Err(VmError::new(format!(
+                            "`async_cancel` exige handle (int), encontrou {}",
+                            type_name(other)
+                        )));
+                    }
+                    _ => return Err(VmError::new("`async_cancel` exige 1 argumento".to_string())),
+                };
+                let task = self.tasks.running.get(&id).ok_or_else(|| {
+                    VmError::new(format!(
+                        "`async_cancel`: handle {id} invalido ou ja consumido"
+                    ))
+                })?;
+                task.cancel.store(true, AtomicOrdering::SeqCst);
+                self.push_checked(idx, Value::Null)?;
+                Ok(())
+            }
+            Builtin::AsyncCancelled => {
+                let flag = self
+                    .cancel_flag
+                    .as_ref()
+                    .is_some_and(|f| f.load(AtomicOrdering::SeqCst));
+                self.push_checked(idx, Value::Bool(flag))?;
+                Ok(())
+            }
+            Builtin::AwaitAll => {
+                let items = match args.as_slice() {
+                    [Value::Array(items)] => items.clone(),
+                    [other] => {
+                        return Err(VmError::new(format!(
+                            "`await_all` exige array de handles, encontrado {}",
+                            type_name(other)
+                        )));
+                    }
+                    _ => return Err(VmError::new("`await_all` exige 1 argumento".to_string())),
+                };
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    let id = match item {
+                        Value::Int(id) => id,
+                        other => {
+                            return Err(VmError::new(format!(
+                                "`await_all` exige array de handles (int), encontrou {}",
+                                type_name(&other)
+                            )));
+                        }
+                    };
+                    let task = self.tasks.running.remove(&id).ok_or_else(|| {
+                        VmError::new(format!("`await_all`: handle {id} invalido ou ja consumido"))
+                    })?;
+                    // Falha rapida: erro aborta, demais seguem no mapa.
+                    out.push(self.join_removed_task(idx, task, "await_all")?);
+                }
+                self.push_checked(idx, Value::Array(out))?;
+                Ok(())
+            }
+            Builtin::AwaitRace => {
+                let items = match args.as_slice() {
+                    [Value::Array(items)] if !items.is_empty() => items.clone(),
+                    [Value::Array(_)] => {
+                        return Err(VmError::new(
+                            "`await_race` exige ao menos 1 tarefa".to_string(),
+                        ))
+                    }
+                    [other] => {
+                        return Err(VmError::new(format!(
+                            "`await_race` exige array de handles, encontrado {}",
+                            type_name(other)
+                        )));
+                    }
+                    _ => return Err(VmError::new("`await_race` exige 1 argumento".to_string())),
+                };
+                // Valida tudo antes de sondar (sem consumo parcial).
+                let mut ids = Vec::with_capacity(items.len());
+                for item in &items {
+                    match item {
+                        Value::Int(id) if self.tasks.running.contains_key(id) => ids.push(*id),
+                        Value::Int(id) => {
+                            return Err(VmError::new(format!(
+                                "`await_race`: handle {id} invalido ou ja consumido"
+                            )));
+                        }
+                        other => {
+                            return Err(VmError::new(format!(
+                                "`await_race` exige array de handles (int), encontrou {}",
+                                type_name(other)
+                            )));
+                        }
+                    }
+                }
+                // Sondagem: primeiro pronto vence; demais seguem no mapa.
+                // Panic conta como conclusao (erro claro, como no `join`).
+                loop {
+                    enum Ready {
+                        Done(i64, String),
+                        Failed(i64, String),
+                        Panicked(i64),
+                    }
+                    let mut ready: Option<Ready> = None;
+                    for id in &ids {
+                        let Some(task) = self.tasks.running.get(id) else {
+                            return Err(VmError::new(
+                                "`await_race`: handle {id} sumiu durante a sondagem".to_string(),
+                            ));
+                        };
+                        match task.rx.try_recv() {
+                            Ok(Ok(json)) => {
+                                ready = Some(Ready::Done(*id, json));
+                                break;
+                            }
+                            Ok(Err(message)) => {
+                                ready = Some(Ready::Failed(*id, message));
+                                break;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                ready = Some(Ready::Panicked(*id));
+                                break;
+                            }
+                        }
+                    }
+                    match ready {
+                        Some(Ready::Done(id, json)) => {
+                            self.tasks.running.remove(&id).expect("validado");
+                            let value = self.decode_task_value(idx, &json, "await_race")?;
+                            self.push_checked(idx, value)?;
+                            return Ok(());
+                        }
+                        Some(Ready::Failed(id, message)) => {
+                            let task = self.tasks.running.remove(&id).expect("validado");
+                            return Err(VmError::new(format!(
+                                "tarefa `{}` falhou: {message}",
+                                task.name
+                            )));
+                        }
+                        Some(Ready::Panicked(id)) => {
+                            let task = self.tasks.running.remove(&id).expect("validado");
+                            return Err(VmError::new(format!(
+                                "`await_race`: tarefa `{}` abortou (panic)",
+                                task.name
+                            )));
+                        }
+                        None => std::thread::sleep(Duration::from_millis(1)),
+                    }
                 }
             }
             _ => Err(VmError::new(

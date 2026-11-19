@@ -1,4 +1,15 @@
-# ROADMAP.md — Planejamento e estado (missao Next Generation: CP1–CP7 + Fases 1–8)
+# ROADMAP.md — Planejamento e estado (Next Generation + limitacoes cuidadas)
+
+## Limitacoes cuidadas (2026-11-19, implementado e validado)
+
+- [x] Bounds de generics (RFC 0029 implementada): `type_args` preservados,
+  checagem em compilacao, apagamento mantido.
+- [x] Metodos `async` + transporte de `Instance` com classe (snapshot, sem
+  write-back; chave reservada `__rhp_instancia__`).
+- [x] RFC 0030 (nucleo): `await_timeout`, `async_cancel`/`async_cancelled`,
+  `await_all`, `await_race` (ids 75–79); pool segue adiado (documentado).
+- [x] Router do RHP Web com trie ordenada + teste diferencial + benchmark.
+- [x] Globais mutaveis: arquitetura permanente documentada (`docs/ASYNC.md`).
 
 ## Next Generation — 8 fases (2026-11-19, implementado e validado)
 

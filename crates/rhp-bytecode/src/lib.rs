@@ -5,8 +5,8 @@
 //! baseada em pilha e valida o chunk (recursivamente) antes de executar.
 
 use rhp_parser::{
-    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, MatchArm, Program, Stmt, StmtNode,
-    SwitchCase, TypeTag, UnaryOp,
+    AssignTarget, BinOp, CallArg, CallData, DestructureTarget, Expr, GenericParam, MatchArm,
+    Program, Stmt, StmtNode, SwitchCase, TypeTag, UnaryOp,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -344,6 +344,17 @@ pub enum Builtin {
     AsyncSpawn,
     /// `async_join(h)` — bloqueia e devolve o retorno (RFC 0019).
     AsyncJoin,
+    /// `await_timeout(h, s)` — junta com prazo em segundos; estouro = erro
+    /// capturavel, tarefa segue em voo (item RFC 0030).
+    AwaitTimeout,
+    /// `async_cancel(h)` — sinaliza cancelamento cooperativo (`Null`).
+    AsyncCancel,
+    /// `async_cancelled()` — `Bool`: a tarefa atual foi cancelada.
+    AsyncCancelled,
+    /// `await_all([h, ...])` — junta em ordem, devolve array (falha rapida).
+    AwaitAll,
+    /// `await_race([h, ...])` — devolve o primeiro pronto (demais seguem).
+    AwaitRace,
     /// `tcp_connect(host, porta)` — `Int` (handle; RFC 0020).
     TcpConnect,
     /// `tcp_send(h, dados)` — bytes escritos (`Int`; RFC 0020).
@@ -432,6 +443,11 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "exhausted" => Some(Builtin::Exhausted),
         "async_spawn" => Some(Builtin::AsyncSpawn),
         "async_join" => Some(Builtin::AsyncJoin),
+        "await_timeout" => Some(Builtin::AwaitTimeout),
+        "async_cancel" => Some(Builtin::AsyncCancel),
+        "async_cancelled" => Some(Builtin::AsyncCancelled),
+        "await_all" => Some(Builtin::AwaitAll),
+        "await_race" => Some(Builtin::AwaitRace),
         "tcp_connect" => Some(Builtin::TcpConnect),
         "tcp_send" => Some(Builtin::TcpSend),
         "tcp_recv" => Some(Builtin::TcpRecv),
@@ -446,7 +462,7 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
 #[must_use]
 pub const fn builtin_arity(builtin: Builtin) -> usize {
     match builtin {
-        Builtin::Argv | Builtin::Now | Builtin::Rand => 0,
+        Builtin::Argv | Builtin::Now | Builtin::Rand | Builtin::AsyncCancelled => 0,
         Builtin::Len
         | Builtin::Pop
         | Builtin::Keys
@@ -482,6 +498,9 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::Exhausted
         | Builtin::AsyncSpawn
         | Builtin::AsyncJoin
+        | Builtin::AsyncCancel
+        | Builtin::AwaitAll
+        | Builtin::AwaitRace
         | Builtin::TcpClose
         | Builtin::RedisClose
         | Builtin::Sha256 => 1,
@@ -512,7 +531,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::TcpSend
         | Builtin::TcpRecv
         | Builtin::RedisOpen
-        | Builtin::RedisExec => 2,
+        | Builtin::RedisExec
+        | Builtin::AwaitTimeout => 2,
         Builtin::DbExec
         | Builtin::DbQuery
         | Builtin::HttpServe
@@ -746,6 +766,11 @@ impl BuiltinId {
             72 => Ok(Builtin::RedisOpen),
             73 => Ok(Builtin::RedisExec),
             74 => Ok(Builtin::RedisClose),
+            75 => Ok(Builtin::AwaitTimeout),
+            76 => Ok(Builtin::AsyncCancel),
+            77 => Ok(Builtin::AsyncCancelled),
+            78 => Ok(Builtin::AwaitAll),
+            79 => Ok(Builtin::AwaitRace),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -829,6 +854,11 @@ impl From<Builtin> for BuiltinId {
             Builtin::RedisOpen => 72,
             Builtin::RedisExec => 73,
             Builtin::RedisClose => 74,
+            Builtin::AwaitTimeout => 75,
+            Builtin::AsyncCancel => 76,
+            Builtin::AsyncCancelled => 77,
+            Builtin::AwaitAll => 78,
+            Builtin::AwaitRace => 79,
         };
         Self(id)
     }
@@ -1287,6 +1317,13 @@ struct Compiler {
     /// e deterministicos (ordem de travessia), para resolucao precisa de
     /// tarefas async no worker (antes, todas chamavam-se `{closure}`).
     closure_seq: u32,
+    /// Funcoes de topo (nome qualificado => generics; item bounds): para
+    /// checar `f<T>(...)` no uso. So topo (`!in_function` ao definir).
+    functions: std::collections::HashMap<String, Vec<GenericParam>>,
+    /// Parametros de tipo visiveis aqui (item bounds): proprio + ancestrais.
+    /// Herdado pelos compiladores aninhados; uso como argumento dispensa a
+    /// checagem do bound (sera verificado na instanciacao concreta).
+    type_params: Vec<String>,
     /// Namespace atual (`namespace A\B;`; Fase Next-Gen 2): prefixo aplicado
     /// as definicoes seguintes no mesmo arquivo.
     current_namespace: Option<String>,
@@ -1317,11 +1354,12 @@ struct TraitMethodInfo {
     func_idx: u32,
 }
 
-/// Info de classe para heranca (Fase Next-Gen 1).
+/// Info de classe para heranca (Fase Next-Gen 1) + generics (item bounds).
 #[derive(Debug, Clone)]
 struct ClassInfo {
     parent: Option<String>,
     methods: std::collections::HashMap<String, SigInfoEx>,
+    generics: Vec<GenericParam>,
 }
 
 /// Assinatura estendida (com indice da funcao para heranca/traits).
@@ -1546,6 +1584,8 @@ impl Compiler {
             emitting_finally: 0,
             for_counter: 0,
             closure_seq: 0,
+            functions: std::collections::HashMap::new(),
+            type_params: Vec::new(),
             current_namespace: None,
             classes: std::collections::HashMap::new(),
             interfaces: std::collections::HashMap::new(),
@@ -1667,6 +1707,10 @@ impl Compiler {
     /// aninhado, registra o `FuncDef` na tabela e devolve o indice.
     /// Usado por `Stmt::FnDef` e `Expr::Closure` (RFC 0003); defaults e
     /// `...rest` pela RFC 0006 (defaults dobrados para `Value` aqui).
+    /// `own_types` sao os parametros de tipo declarados aqui (o resto do
+    /// escopo vem herdado); 8 args por convergencia de flags, como em
+    /// `call_builtin`/`resolve_dep` (ver `#[allow]` abaixo).
+    #[allow(clippy::too_many_arguments)]
     fn compile_func_body(
         &mut self,
         name: &str,
@@ -1675,6 +1719,7 @@ impl Compiler {
         return_ann: Option<TypeTag>,
         body: &[StmtNode],
         is_async: bool,
+        own_types: &[String],
     ) -> Result<u32, CompileError> {
         let mut seen = std::collections::HashSet::new();
         let mut names = Vec::with_capacity(params.len());
@@ -1705,6 +1750,13 @@ impl Compiler {
         fn_compiler.interfaces = self.interfaces.clone();
         fn_compiler.traits = self.traits.clone();
         fn_compiler.closure_seq = self.closure_seq;
+        // Escopo de tipos: ancestrais + proprios da definicao (item bounds).
+        fn_compiler.type_params = self
+            .type_params
+            .iter()
+            .chain(own_types.iter())
+            .cloned()
+            .collect();
         fn_compiler.compile_stmts(body)?;
         self.closure_seq = fn_compiler.closure_seq;
         let null_idx = fn_compiler.add_constant(Value::Null)?;
@@ -2124,6 +2176,105 @@ impl Compiler {
         name.to_string()
     }
 
+    /// Bound deve nomear classe ou interface conhecida (definida antes).
+    /// Falha rapida na definicao generica (item bounds, RFC 0029).
+    fn check_bound_known(&self, bound: &str, owner: &str) -> Result<(), CompileError> {
+        if self.classes.contains_key(bound) || self.interfaces.contains_key(bound) {
+            return Ok(());
+        }
+        Err(CompileError::new(format!(
+            "bound `{bound}` desconhecido em `{owner}` (use classe ou interface definida antes)"
+        )))
+    }
+
+    /// `true` se `child` e `base` ou subclasse (cadeia `parent`).
+    /// Limite anti-ciclo para bytecode artesanal (hierarquia valida nao tem).
+    fn is_subclass_of(&self, child: &str, base: &str) -> bool {
+        let mut current = Some(child.to_string());
+        for _ in 0..256 {
+            match current {
+                Some(name) => {
+                    if name == base {
+                        return true;
+                    }
+                    current = self.classes.get(&name).and_then(|i| i.parent.clone());
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// `true` se a classe (com herdados) implementa a interface com aridade.
+    /// Mesma regra do `implements` (reuso na checagem de bounds).
+    fn class_implements(&self, class: &str, iface: &str) -> bool {
+        let Some(sigs) = self.interfaces.get(iface) else {
+            return false;
+        };
+        let Some(info) = self.classes.get(class) else {
+            return false;
+        };
+        sigs.iter().all(|sig| match info.methods.get(&sig.name) {
+            Some(m) => m.params == sig.params && m.variadic == sig.variadic,
+            None => false,
+        })
+    }
+
+    /// Checa argumentos de tipo no uso (`new Caixa<Sub>`, `f<T>(...)`).
+    /// Apagamento mantido: so valida, nao emite nada (item bounds).
+    /// Sem argumentos de tipo = chamada apagada (legado, sem checagem).
+    fn check_type_args(
+        &mut self,
+        target: &str,
+        declared: &[GenericParam],
+        args: &[String],
+        kind: &str,
+    ) -> Result<(), CompileError> {
+        if args.is_empty() {
+            return Ok(());
+        }
+        if declared.is_empty() {
+            return Err(CompileError::new(format!(
+                "`{target}` nao e {kind} generica mas recebeu {} argumento(s) de tipo",
+                args.len(),
+            )));
+        }
+        if args.len() != declared.len() {
+            return Err(CompileError::new(format!(
+                "`{target}` espera {} argumento(s) de tipo, recebeu {}",
+                declared.len(),
+                args.len(),
+            )));
+        }
+        for (param, arg) in declared.iter().zip(args.iter()) {
+            // Parametro de tipo visivel = adiado para a instanciacao concreta.
+            if self.type_params.iter().any(|t| t == arg) {
+                continue;
+            }
+            let Some(bound) = param.bound.as_ref() else {
+                continue; // sem bound: qualquer tipo serve (apagado).
+            };
+            let qarg = self.resolve_name(arg);
+            let known_class = self.classes.contains_key(&qarg);
+            let satisfied = if self.classes.contains_key(bound) {
+                // Bound de classe: mesmo tipo ou subclasse.
+                known_class && self.is_subclass_of(&qarg, bound)
+            } else if self.interfaces.contains_key(bound) {
+                // Bound de interface: classe que a implementa.
+                known_class && self.class_implements(&qarg, bound)
+            } else {
+                false // bound sumiu da tabela (nao deveria ocorrer).
+            };
+            if !satisfied {
+                return Err(CompileError::new(format!(
+                    "`{arg}` nao satisfaz `{}: {bound}` em `{target}`",
+                    param.name,
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `class Nome<T> extends Pai implements I... { use T...; fn ... }`.
     /// Precedencia: propria > trait > pai. Valida interfaces e conflitos.
     fn compile_class(
@@ -2132,12 +2283,27 @@ impl Compiler {
         parent: &Option<String>,
         interfaces: &[String],
         uses: &[String],
-        generic_params: &[String],
+        generic_params: &[GenericParam],
         methods: &[rhp_parser::ClassMethod],
     ) -> Result<(), CompileError> {
         let qname = self.qualify(name);
-        // Generics: apagamento (Fase Next-Gen 5); duplicata ja checada no parse.
-        let _ = generic_params.len();
+        // Bounds: cada um deve nomear classe ou interface conhecida.
+        // Armazena qualificados (namespace da definicao).
+        let mut stored: Vec<GenericParam> = Vec::with_capacity(generic_params.len());
+        for gp in generic_params.iter() {
+            let bound = match gp.bound.as_ref() {
+                Some(b) => {
+                    let qb = self.qualify(b);
+                    self.check_bound_known(&qb, &qname)?;
+                    Some(qb)
+                }
+                None => None,
+            };
+            stored.push(GenericParam {
+                name: gp.name.clone(),
+                bound,
+            });
+        }
         // Pai: deve existir (definido antes) e nao formar ciclo.
         let qparent: Option<String> = match parent.as_ref() {
             Some(p) => {
@@ -2171,6 +2337,7 @@ impl Compiler {
         // Metodos proprios: compila corpos, detecta duplicata (parse ja fez).
         let mut own: std::collections::HashMap<String, (u32, usize, bool)> =
             std::collections::HashMap::new();
+        let class_types: Vec<String> = stored.iter().map(|g| g.name.clone()).collect();
         for method in methods {
             let func_idx = self.compile_func_body(
                 &format!("{qname}::{}", method.name),
@@ -2178,7 +2345,8 @@ impl Compiler {
                 method.variadic.as_deref(),
                 method.return_ann,
                 &method.body,
-                false,
+                method.is_async,
+                &class_types,
             )?;
             if own
                 .insert(
@@ -2341,6 +2509,7 @@ impl Compiler {
             ClassInfo {
                 parent: qparent.clone(),
                 methods: flat,
+                generics: stored,
             },
         );
         // Emite construcao: com pai usa `BuildClassEx`, senao `BuildClass`.
@@ -2360,7 +2529,7 @@ impl Compiler {
     fn compile_interface(
         &mut self,
         name: &str,
-        generic_params: &[String],
+        generic_params: &[GenericParam],
         methods: &[rhp_parser::InterfaceMethod],
     ) -> Result<(), CompileError> {
         let qname = self.qualify(name);
@@ -2372,7 +2541,12 @@ impl Compiler {
                 "interface `{qname}` ja declarada"
             )));
         }
-        let _ = generic_params;
+        for gp in generic_params.iter() {
+            if let Some(bound) = gp.bound.as_ref() {
+                let qb = self.qualify(bound);
+                self.check_bound_known(&qb, &qname)?;
+            }
+        }
         let mut sigs = Vec::with_capacity(methods.len());
         for m in methods {
             sigs.push(SigInfo {
@@ -2407,7 +2581,8 @@ impl Compiler {
                 m.variadic.as_deref(),
                 m.return_ann,
                 &m.body,
-                false,
+                m.is_async,
+                &[],
             )?;
             infos.push(TraitMethodInfo {
                 name: m.name.clone(),
@@ -2980,11 +3155,31 @@ impl Compiler {
                 is_async,
                 generic_params,
             } => {
-                if !generic_params.is_empty() {
-                    // Apagamento: valida duplicatas (parser ja valida) e ignora.
-                    let _ = generic_params;
+                // Bounds: cada um deve nomear classe ou interface conhecida
+                // (definida antes); senao erro claro ja na definicao.
+                // Armazena qualificados (namespace da definicao).
+                let mut stored: Vec<GenericParam> = Vec::with_capacity(generic_params.len());
+                for gp in generic_params.iter() {
+                    let bound = match gp.bound.as_ref() {
+                        Some(b) => {
+                            let qb = self.qualify(b);
+                            self.check_bound_known(&qb, name)?;
+                            Some(qb)
+                        }
+                        None => None,
+                    };
+                    stored.push(GenericParam {
+                        name: gp.name.clone(),
+                        bound,
+                    });
+                }
+                // Registra generics da funcao de topo (para checar o uso).
+                if !self.in_function {
+                    self.functions.insert(self.qualify(name), stored);
                 }
                 let qname = self.qualify(name);
+                let own_types: Vec<String> =
+                    generic_params.iter().map(|g| g.name.clone()).collect();
                 let func_idx = self.compile_func_body(
                     &qname,
                     params,
@@ -2992,6 +3187,7 @@ impl Compiler {
                     *return_ann,
                     body,
                     *is_async,
+                    &own_types,
                 )?;
                 self.intern_name(&qname)?;
                 self.emit(Op::DefineFunc(func_idx));
@@ -3163,8 +3359,17 @@ impl Compiler {
                 self.emit(Op::Constant(field_idx));
                 self.emit(Op::Index);
             }
-            Expr::New { class, args } => {
-                self.compile_new(class, args)?;
+            Expr::New(data) => {
+                // Checagem de generics (item bounds; apagada no runtime).
+                // So classes literais `new Nome<...>` sao checadas; outras
+                // formas de `class` caem no erro de runtime vigente.
+                if let Expr::Var(name) = data.class.as_ref() {
+                    let rname = self.resolve_name(name);
+                    if let Some(info) = self.classes.get(&rname).cloned() {
+                        self.check_type_args(&rname, &info.generics, &data.type_args, "classe")?;
+                    }
+                }
+                self.compile_new(&data.class, &data.args)?;
             }
             Expr::Unary { op, expr } => {
                 self.compile_expr(expr)?;
@@ -3231,9 +3436,17 @@ impl Compiler {
                     }
                 };
             }
-            Expr::Call { name, args } => {
-                let rname = self.resolve_name(name);
+            Expr::Call(data) => {
+                let name = data.name.clone();
+                let type_args = data.type_args.clone();
+                let args = data.args.clone();
+                let rname = self.resolve_name(&name);
                 if let Some(builtin) = builtin_by_name(&rname) {
+                    if !type_args.is_empty() {
+                        return Err(CompileError::new(format!(
+                            "builtin `{rname}` nao aceita argumentos de tipo"
+                        )));
+                    }
                     if args.iter().any(|a| !matches!(a, CallArg::Pos(_))) {
                         return Err(CompileError::new(format!(
                             "builtin `{rname}` nao aceita argumentos nomeados nem spread"
@@ -3246,23 +3459,29 @@ impl Compiler {
                             args.len()
                         )));
                     }
-                    for arg in args {
+                    for arg in &args {
                         self.compile_expr(arg.value())?;
                     }
                     self.emit(Op::CallBuiltin(BuiltinId::from(builtin)));
-                } else if args.iter().all(|a| matches!(a, CallArg::Pos(_))) {
-                    let name_idx = self.intern_name(&rname)?;
-                    self.emit(Op::LoadName(name_idx));
-                    for arg in args {
-                        self.compile_expr(arg.value())?;
-                    }
-                    if args.len() > u32::MAX as usize {
-                        return Err(CompileError::new("numero de argumentos excedido"));
-                    }
-                    self.emit(Op::Call(args.len() as u32));
                 } else {
-                    let rv = Expr::Var(rname);
-                    self.compile_call_mixed(&rv, args)?;
+                    // Checagem de generics (item bounds; apagada no runtime).
+                    if let Some(declared) = self.functions.get(&rname).cloned() {
+                        self.check_type_args(&rname, &declared, &type_args, "funcao")?;
+                    }
+                    if args.iter().all(|a| matches!(a, CallArg::Pos(_))) {
+                        let name_idx = self.intern_name(&rname)?;
+                        self.emit(Op::LoadName(name_idx));
+                        for arg in &args {
+                            self.compile_expr(arg.value())?;
+                        }
+                        if args.len() > u32::MAX as usize {
+                            return Err(CompileError::new("numero de argumentos excedido"));
+                        }
+                        self.emit(Op::Call(args.len() as u32));
+                    } else {
+                        let rv = Expr::Var(rname);
+                        self.compile_call_mixed(&rv, &args)?;
+                    }
                 }
             }
             Expr::CallValue { callee, args } => {
@@ -3270,10 +3489,11 @@ impl Compiler {
                 // de builtins e erro de aridade em compilacao).
                 if let Expr::Var(name) = callee.as_ref() {
                     let rname = self.resolve_name(name);
-                    self.compile_expr(&Expr::Call {
+                    self.compile_expr(&Expr::Call(Box::new(CallData {
                         name: rname,
+                        type_args: Vec::new(),
                         args: args.clone(),
-                    })?;
+                    })))?;
                 } else if let Expr::Member { obj, field } = callee.as_ref() {
                     // `super.metodo(args)`: chamada ao pai com `this` atual.
                     if matches!(obj.as_ref(), Expr::Super) {
@@ -3322,6 +3542,7 @@ impl Compiler {
                     data.return_ann,
                     &data.body,
                     data.is_async,
+                    &[],
                 )?;
                 self.emit(Op::MakeFunc(func_idx));
             }
@@ -3646,6 +3867,78 @@ mod tests {
     }
 
     #[test]
+    fn checks_generic_bounds_at_compile_time() {
+        // Bound satisfeito (subclasse e classe exata passam).
+        compile_src(
+            "class E { fn novo() { this[\"i\"] = 0; } } class U extends E { fn novo() { this[\"i\"] = 1; } } class R<T: E> { fn novo() { this[\"x\"] = 0; } } let a = new R<U>(); let b = new R<E>();",
+        );
+        // Violacao: tipo fora da hierarquia.
+        let program = parse_source(
+            "class E { fn novo() { this[\"i\"] = 0; } } class O { fn novo() { this[\"x\"] = 0; } } class R<T: E> { fn novo() { this[\"x\"] = 0; } } let a = new R<O>();",
+        )
+        .expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(
+            err.message.contains("nao satisfaz"),
+            "obteve: {}",
+            err.message
+        );
+        // Bound de interface: implementa passa, nao-implementa falha.
+        compile_src(
+            "interface S { fn salvar(); } class M implements S { fn novo() { this[\"x\"] = 0; } fn salvar() { } } fn g<T: S>(v) { return v; } echo g<M>(1);",
+        );
+        let program = parse_source(
+            "interface S { fn salvar(); } class N { fn novo() { this[\"x\"] = 0; } } fn g<T: S>(v) { return v; } echo g<N>(1);",
+        )
+        .expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(
+            err.message.contains("nao satisfaz"),
+            "obteve: {}",
+            err.message
+        );
+        // Bound desconhecido na definicao = erro claro.
+        let program =
+            parse_source("fn f<T: NaoExiste>(x) { return x; }").expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(
+            err.message.contains("desconhecido"),
+            "obteve: {}",
+            err.message
+        );
+        // Aridade: 2 declarados, 1 usado e vice-versa.
+        let program =
+            parse_source("class C<T, U> { fn novo() { this[\"x\"] = 0; } } let c = new C<int>();")
+                .expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(err.message.contains("espera 2"), "obteve: {}", err.message);
+        // Nao-generica com argumentos de tipo = erro.
+        let program =
+            parse_source("class S { fn novo() { this[\"x\"] = 0; } } let c = new S<int>();")
+                .expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(
+            err.message.contains("nao e classe generica"),
+            "obteve: {}",
+            err.message
+        );
+        // Builtin com argumentos de tipo = erro.
+        let program = parse_source("echo len<int>(\"abc\");").expect("parse deve passar");
+        let err = compile(&program).expect_err("deve falhar");
+        assert!(
+            err.message.contains("nao aceita argumentos de tipo"),
+            "obteve: {}",
+            err.message
+        );
+        // Sem argumentos de tipo = apagado (legado, sem checagem).
+        compile_src("class C<T> { fn novo(v) { this[\"v\"] = v; } } let c = new C(1); echo 1;");
+        // Parametro de tipo visivel adia a checagem para a instanciacao.
+        compile_src(
+            "class E { fn novo() { this[\"i\"] = 0; } } class C<T: E> { fn novo(v) { this[\"v\"] = v; } } fn f<T>(x) { let c = new C<T>(x); return c; }",
+        );
+    }
+
+    #[test]
     fn compiles_if_with_jumps_in_range() {
         let chunk = compile_src("if true { echo 1; } else { echo 2; }");
         chunk.validate().expect("saltos devem ser validos");
@@ -3965,6 +4258,11 @@ mod tests {
             Builtin::RedisOpen,
             Builtin::RedisExec,
             Builtin::RedisClose,
+            Builtin::AwaitTimeout,
+            Builtin::AsyncCancel,
+            Builtin::AsyncCancelled,
+            Builtin::AwaitAll,
+            Builtin::AwaitRace,
         ];
         for (expected_id, builtin) in all.iter().enumerate() {
             let id = BuiltinId::from(*builtin);

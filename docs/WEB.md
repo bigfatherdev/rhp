@@ -117,9 +117,23 @@ meu-projeto/
 └── tests/
 ```
 
+## Performance do roteador (trie ordenada)
+
+O despacho usa uma trie (`__web_trie`, construida em `web_registrar`) em vez
+de testar cada padrao em sequencia: um `split` do caminho por request,
+descida por prefixo estatico (mapa) + ramo `:param`, e escolha do menor
+indice global entre os candidatos — **exatamente** a mesma semantica do
+linear (primeiro match vence; `Allow` identico, provado pelo teste
+diferencial `framework/web_trie_test.rhp`, que inclui armadilhas de ordem).
+
+Medicao (build de desenvolvimento, mesma maquina/carga: 100 rotas
+estaticas, match na ultima, 100 dispatches): linear ~7s, trie ~1s (~7x;
+a vantagem cresce com o numero de rotas, pois o linear repete `split` +
+comparacao por rota). Para apps tipicos (dezenas de rotas) ambos ficam
+bem abaixo de 1ms por request em build otimizado.
+
 ## Limitacoes v1
 
-- Roteamento O(R) linear (suficiente para dezenas/centenas de rotas).
 - Topo do programa executa por request no worker (idempotente): nao coloque
   efeitos nao-idempotentes no topo (use handlers).
 - `async` em handlers: handlers sao `fn` sincronas; para I/O concorrente,

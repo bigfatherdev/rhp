@@ -1889,18 +1889,53 @@ fn nextgen_async_enxerga_funcoes_e_classes() {
 }
 
 #[test]
-fn nextgen_async_rejeita_instancia() {
-    // Instancia nao atravessa (antes corrompia em mapa silencioso).
+fn nextgen_async_instancia_com_classe() {
+    // Instancia atravessa COM a classe (item metodos-async): sem corromper.
     let output = run_temp_source(
         "ng_async_inst.rhp",
-        "class Ponto {\n  fn novo(x) { this[\"x\"] = x; }\n}\nasync fn usa(p) { return 1; }\nlet p = new Ponto(1);\necho await usa(p);\n",
+        "class Ponto {\n  fn novo(x) { this[\"x\"] = x; }\n  fn get() { return this[\"x\"]; }\n}\nasync fn dobra(p) { return p.get() * 2; }\nlet p = new Ponto(21);\necho await dobra(p);\necho p.get();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"42\n21\n");
+}
+
+#[test]
+fn nextgen_async_metodo_snapshot() {
+    // Metodo async roda sobre snapshot: leitura ok, sem write-back.
+    let output = run_temp_source(
+        "ng_async_metodo.rhp",
+        "class Contador {\n  fn novo() { this[\"n\"] = 10; }\n  async fn soma(x) { return this[\"n\"] + x; }\n  fn get() { return this[\"n\"]; }\n}\nlet c = new Contador();\nlet f = c.soma;\necho await c.soma(5);\necho await f(1);\necho c.get();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"15\n11\n10\n");
+}
+
+#[test]
+fn nextgen_async_rejeita_nao_plano_e_reservado() {
+    // Funcao como argumento segue rejeitada (nao serializavel).
+    let output = run_temp_source(
+        "ng_async_func.rhp",
+        "async fn usa(f) { return 1; }\nfn g(x) { return x; }\necho await usa(g);\n",
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("nao transporta instancia"),
-        "obteve: {stderr}"
+    assert!(stderr.contains("nao transporta funcao"), "obteve: {stderr}");
+    // Chave reservada do envelope nao passa (evita ambiguidade).
+    let output = run_temp_source(
+        "ng_async_tag.rhp",
+        "async fn f(x) { return x; }\nlet m = {__rhp_instancia__: 1};\necho await f(m);\n",
     );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("chave reservada"), "obteve: {stderr}");
 }
 
 #[test]
@@ -1962,4 +1997,179 @@ fn nextgen_framework_via_pkg() {
     );
     assert_eq!(output.stdout, b"{\"id\":\"7\"}\n");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nextgen_generic_bounds() {
+    // Bound de classe satisfeito executa; violado falha em compilacao.
+    let output = run_temp_source(
+        "ng_bound_ok.rhp",
+        "class Entidade {\n  fn novo() { this[\"id\"] = 1; }\n  fn id() { return this[\"id\"]; }\n}\nclass Usuario extends Entidade {\n  fn novo() { this[\"id\"] = 2; }\n}\nclass Repo<T: Entidade> {\n  fn novo() { this[\"x\"] = 0; }\n  fn descrever(v: T) { return v.id(); }\n}\nlet r = new Repo<Usuario>();\necho \"ok\";\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ok\n");
+    let output = run_temp_source(
+        "ng_bound_bad.rhp",
+        "class Entidade {\n  fn novo() { this[\"id\"] = 1; }\n}\nclass Outra {\n  fn novo() { this[\"x\"] = 0; }\n}\nclass Repo<T: Entidade> {\n  fn novo() { this[\"x\"] = 0; }\n}\nlet r = new Repo<Outra>();\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nao satisfaz `T: Entidade`"),
+        "obteve: {stderr}"
+    );
+    // Bound de interface via funcao generica.
+    let output = run_temp_source(
+        "ng_bound_iface.rhp",
+        "interface Salva { fn salvar(); }\nclass Mem implements Salva {\n  fn novo() { this[\"x\"] = 0; }\n  fn salvar() { echo \"salvo\"; }\n}\nfn guarda<T: Salva>(v) { v.salvar(); }\nguarda<Mem>(new Mem());\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"salvo\n");
+    // Parametro de tipo visivel adia a checagem (instanciacao concreta roda).
+    let output = run_temp_source(
+        "ng_bound_defer.rhp",
+        "class Caixa<T> {\n  fn novo(v) { this[\"v\"] = v; }\n  fn obter() { return this[\"v\"]; }\n}\nfn embrulha<T>(x) {\n  let c = new Caixa<T>(x);\n  return c.obter();\n}\necho embrulha(99);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"99\n");
+}
+
+#[test]
+fn nextgen_async_metodo_trait_e_super() {
+    // Trait com metodo async + super async (snapshot, sem write-back).
+    let output = run_temp_source(
+        "ng_async_trait_super.rhp",
+        "trait Saudacao {\n  async fn ola(nome) { return \"ola \" + nome; }\n}\nclass Pessoa {\n  use Saudacao;\n  fn novo() { this[\"x\"] = 0; }\n}\nlet p = new Pessoa();\necho await p.ola(\"Rex\");\nclass Base {\n  fn novo() { this[\"x\"] = 1; }\n  async fn quem() { return \"base\"; }\n}\nclass Filha extends Base {\n  fn novo() { this[\"x\"] = 2; }\n  async fn quem2() { return await super.quem() + \"!\"; }\n}\nlet d = new Filha();\necho await d.quem2();\necho d[\"x\"];\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ola Rex\nbase!\n2\n");
+}
+
+#[test]
+fn nextgen_await_timeout() {
+    // Timeout dispara e a tarefa segue juntavel depois.
+    let output = run_temp_source(
+        "ng_timeout.rhp",
+        "async fn lenta() { sleep(1); return \"devagar\"; }\nasync fn rapida() { return \"ligeira\"; }\nlet h = lenta();\ntry {\n  echo await_timeout(h, 0.2);\n} catch e {\n  echo \"timeout ok\";\n}\necho await h;\necho await_timeout(rapida(), 5);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"timeout ok\ndevagar\nligeira\n");
+    // Timeout 0 em tarefa ja concluida devolve na hora (sem erro).
+    let output = run_temp_source(
+        "ng_timeout_zero.rhp",
+        "async fn rapida() { return 42; }\nlet h = rapida();\nsleep(1);\necho await_timeout(h, 0);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"42\n");
+    // Handle invalido e segundos invalidos: erro claro.
+    let output = run_temp_source("ng_timeout_bad.rhp", "echo await_timeout(999, 1);\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalido ou ja consumido"),
+        "obteve: {stderr}"
+    );
+    let output = run_temp_source(
+        "ng_timeout_neg.rhp",
+        "async fn f() { return 1; }\nlet h = f();\necho await_timeout(h, -1);\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("segundos >= 0"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_async_cancel() {
+    // Cancelamento cooperativo: a tarefa sonda e desiste.
+    let output = run_temp_source(
+        "ng_cancel.rhp",
+        "async fn trabalho() {\n  let i = 0;\n  while i < 100000000 {\n    if async_cancelled() { return \"cancelado\"; }\n    i = i + 1;\n  }\n  return \"ok\";\n}\nlet h = trabalho();\nasync_cancel(h);\necho await h;\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"cancelado\n");
+    // Fora de tarefa, nunca cancelado; handle invalido = erro.
+    let output = run_temp_source(
+        "ng_cancel_main.rhp",
+        "echo async_cancelled();\nasync_cancel(999);\n",
+    );
+    assert!(!output.status.success());
+    let out = run_temp_source("ng_cancelled_main.rhp", "echo async_cancelled();\n");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"false\n");
+}
+
+#[test]
+fn nextgen_await_all_race() {
+    // all: junta em ordem; race: primeiro pronto vence.
+    let output = run_temp_source(
+        "ng_all_race.rhp",
+        "async fn a() { sleep(0.3); return \"A\"; }\nasync fn b() { return \"B\"; }\nasync fn c() { sleep(0.1); return \"C\"; }\necho await_all([a(), b(), c()]);\necho await_race([a(), b(), c()]);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"[A, B, C]\nB\n");
+    // all com falha: propaga (tarefa que falhou e consumida, resto segue).
+    let output = run_temp_source(
+        "ng_all_fail.rhp",
+        "async fn boom() { throw \"x\"; }\ntry {\n  echo await_all([boom()]);\n} catch e {\n  echo \"all falhou ok\";\n}\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"all falhou ok\n");
+    // race vazio e nao-array: erro claro.
+    let output = run_temp_source("ng_race_empty.rhp", "echo await_race([]);\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ao menos 1 tarefa"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_framework_trie_test_suite() {
+    // `rhp test framework/`: diferencial trie-vs-linear + comportamento.
+    let out = Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .args([
+            "test",
+            &workspace_root().join("framework").to_string_lossy(),
+        ])
+        .output()
+        .expect("rhp test framework");
+    assert!(
+        out.status.success(),
+        "web_trie_test deveria passar: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

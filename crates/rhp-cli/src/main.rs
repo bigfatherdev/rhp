@@ -1579,7 +1579,7 @@ impl Renamer<'_> {
                     return_ann: *return_ann,
                     body,
                     is_async: *is_async,
-                    generic_params: generic_params.clone(),
+                    generic_params: self.generic_params(generic_params),
                 }
             }
             Stmt::ClassDef {
@@ -1622,6 +1622,7 @@ impl Renamer<'_> {
                             variadic: m.variadic.clone(),
                             return_ann: m.return_ann,
                             body,
+                            is_async: m.is_async,
                         }
                     })
                     .collect();
@@ -1630,7 +1631,7 @@ impl Renamer<'_> {
                     parent,
                     interfaces,
                     uses,
-                    generic_params: generic_params.clone(),
+                    generic_params: self.generic_params(generic_params),
                     methods,
                 }
             }
@@ -1663,7 +1664,7 @@ impl Renamer<'_> {
                     .collect();
                 Stmt::InterfaceDef {
                     name: renamed,
-                    generic_params: generic_params.clone(),
+                    generic_params: self.generic_params(generic_params),
                     methods,
                 }
             }
@@ -1696,6 +1697,7 @@ impl Renamer<'_> {
                             variadic: m.variadic.clone(),
                             return_ann: m.return_ann,
                             body,
+                            is_async: m.is_async,
                         }
                     })
                     .collect();
@@ -1787,6 +1789,18 @@ impl Renamer<'_> {
         }
     }
 
+    /// Renomeia bounds de generics (`<T: Base>`): o nome do parametro fica,
+    /// o bound e referencia (item bounds, RFC 0029).
+    fn generic_params(&self, params: &[rhp_parser::GenericParam]) -> Vec<rhp_parser::GenericParam> {
+        params
+            .iter()
+            .map(|g| rhp_parser::GenericParam {
+                name: g.name.clone(),
+                bound: g.bound.as_ref().map(|b| self.reference(b)),
+            })
+            .collect()
+    }
+
     fn expr(&mut self, expr: &Expr) -> Expr {
         match expr {
             Expr::StringLiteral(_) | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {
@@ -1822,10 +1836,11 @@ impl Renamer<'_> {
                 left: Box::new(self.expr(left)),
                 right: Box::new(self.expr(right)),
             },
-            Expr::Call { name, args } => Expr::Call {
-                name: self.reference(name),
-                args: args.iter().map(|a| self.call_arg(a)).collect(),
-            },
+            Expr::Call(data) => Expr::Call(Box::new(rhp_parser::CallData {
+                name: self.reference(&data.name),
+                type_args: data.type_args.iter().map(|t| self.reference(t)).collect(),
+                args: data.args.iter().map(|a| self.call_arg(a)).collect(),
+            })),
             Expr::CallValue { callee, args } => Expr::CallValue {
                 callee: Box::new(self.expr(callee)),
                 args: args.iter().map(|a| self.call_arg(a)).collect(),
@@ -1834,10 +1849,11 @@ impl Renamer<'_> {
                 obj: Box::new(self.expr(obj)),
                 field: field.clone(),
             },
-            Expr::New { class, args } => Expr::New {
-                class: Box::new(self.expr(class)),
-                args: args.iter().map(|a| self.call_arg(a)).collect(),
-            },
+            Expr::New(data) => Expr::New(Box::new(rhp_parser::NewData {
+                class: Box::new(self.expr(&data.class)),
+                type_args: data.type_args.iter().map(|t| self.reference(t)).collect(),
+                args: data.args.iter().map(|a| self.call_arg(a)).collect(),
+            })),
             Expr::Match { subject, arms } => Expr::Match {
                 subject: Box::new(self.expr(subject)),
                 arms: arms
@@ -1992,9 +2008,9 @@ fn check_expr_imports(expr: &rhp_parser::Expr) -> Result<(), LoadError> {
         E::Await { expr } => check_expr_imports(expr),
         E::Super => Ok(()),
         E::Member { obj, .. } => check_expr_imports(obj),
-        E::New { class, args } => {
-            check_expr_imports(class)?;
-            for arg in args {
+        E::New(data) => {
+            check_expr_imports(&data.class)?;
+            for arg in &data.args {
                 check_expr_imports(arg.value())?;
             }
             Ok(())
@@ -2022,8 +2038,8 @@ fn check_expr_imports(expr: &rhp_parser::Expr) -> Result<(), LoadError> {
             }
             Ok(())
         }
-        E::Call { args, .. } => {
-            for arg in args {
+        E::Call(data) => {
+            for arg in &data.args {
                 check_expr_imports(arg.value())?;
             }
             Ok(())
@@ -2507,10 +2523,10 @@ mod tests {
         let renamed = rename_module(&stmts, &top, "__rhp_mod0__");
         match &renamed[1].stmt {
             Stmt::Echo { expr } => match expr {
-                rhp_parser::Expr::Call { args, .. } => {
-                    assert!(matches!(&args[0],
+                rhp_parser::Expr::Call(data) => {
+                    assert!(matches!(&data.args[0],
                         rhp_parser::CallArg::Pos(rhp_parser::Expr::Var(n)) if n == "__rhp_mod0__x"));
-                    assert!(matches!(&args[1],
+                    assert!(matches!(&data.args[1],
                         rhp_parser::CallArg::Named(n, rhp_parser::Expr::Var(v))
                         if n == "y" && v == "__rhp_mod0__x"));
                 }

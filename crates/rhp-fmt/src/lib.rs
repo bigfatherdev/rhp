@@ -6,7 +6,8 @@
 //! `format(parse(format(p))) == format(p)`.
 
 use rhp_parser::{
-    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, Param, Program, Stmt, StmtNode, UnaryOp,
+    AssignTarget, BinOp, CallArg, DestructureTarget, Expr, GenericParam, Param, Program, Stmt,
+    StmtNode, UnaryOp,
 };
 use std::fmt::Write as _;
 
@@ -272,11 +273,7 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
                 .map(|t| format!(": {}", t.name()))
                 .unwrap_or_default();
             let async_pfx = if *is_async { "async " } else { "" };
-            let generics = if generic_params.is_empty() {
-                String::new()
-            } else {
-                format!("<{}>", generic_params.join(", "))
-            };
+            let generics = fmt_generic_params(generic_params);
             let _ = writeln!(
                 out,
                 "{async_pfx}fn {name}{generics}({}){ret} {{",
@@ -295,11 +292,7 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             methods,
         } => {
             indent(level, out);
-            let generics = if generic_params.is_empty() {
-                String::new()
-            } else {
-                format!("<{}>", generic_params.join(", "))
-            };
+            let generics = fmt_generic_params(generic_params);
             let mut head = format!("class {name}{generics}");
             if let Some(p) = parent {
                 head.push_str(&format!(" extends {p}"));
@@ -318,9 +311,10 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
                     .return_ann
                     .map(|t| format!(": {}", t.name()))
                     .unwrap_or_default();
+                let async_pfx = if method.is_async { "async " } else { "" };
                 let _ = writeln!(
                     out,
-                    "fn {}({}){ret} {{",
+                    "{async_pfx}fn {}({}){ret} {{",
                     method.name,
                     fmt_params(&method.params, method.variadic.as_deref())
                 );
@@ -341,11 +335,7 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             methods,
         } => {
             indent(level, out);
-            let generics = if generic_params.is_empty() {
-                String::new()
-            } else {
-                format!("<{}>", generic_params.join(", "))
-            };
+            let generics = fmt_generic_params(generic_params);
             let _ = writeln!(out, "interface {name}{generics} {{");
             for m in methods {
                 indent(level + 1, out);
@@ -372,9 +362,10 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
                     .return_ann
                     .map(|t| format!(": {}", t.name()))
                     .unwrap_or_default();
+                let async_pfx = if method.is_async { "async " } else { "" };
                 let _ = writeln!(
                     out,
-                    "fn {}({}){ret} {{",
+                    "{async_pfx}fn {}({}){ret} {{",
                     method.name,
                     fmt_params(&method.params, method.variadic.as_deref())
                 );
@@ -469,6 +460,21 @@ fn fmt_block(stmts: &[StmtNode], level: usize, out: &mut String) {
     for (i, node) in stmts.iter().enumerate() {
         fmt_node(node, level, i > 0, out);
     }
+}
+
+/// Parametros de tipo canonicos: `<T, U: Bound>` (item bounds, RFC 0029).
+fn fmt_generic_params(params: &[GenericParam]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = params
+        .iter()
+        .map(|g| match &g.bound {
+            Some(b) => format!("{}: {b}", g.name),
+            None => g.name.clone(),
+        })
+        .collect();
+    format!("<{}>", parts.join(", "))
 }
 
 /// Lista de parametros canonica: `a, b = <expr>, ...rest` (RFC 0006).
@@ -646,16 +652,26 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
                 inner
             }
         }
-        Expr::Call { name, args } => {
-            let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
-            format!("{name}({})", inner.join(", "))
+        Expr::Call(data) => {
+            let targs = if data.type_args.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", data.type_args.join(", "))
+            };
+            let inner: Vec<String> = data.args.iter().map(fmt_call_arg).collect();
+            format!("{}{targs}({})", data.name, inner.join(", "))
         }
         Expr::Member { obj, field } => {
             format!("{}.{field}", fmt_atom(obj))
         }
-        Expr::New { class, args } => {
-            let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
-            format!("new {}({})", fmt_atom(class), inner.join(", "))
+        Expr::New(data) => {
+            let targs = if data.type_args.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", data.type_args.join(", "))
+            };
+            let inner: Vec<String> = data.args.iter().map(fmt_call_arg).collect();
+            format!("new {}{targs}({})", fmt_atom(&data.class), inner.join(", "))
         }
         Expr::CallValue { callee, args } => {
             let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
@@ -728,12 +744,12 @@ fn fmt_map_key(key: &str) -> String {
 fn fmt_atom(expr: &Expr) -> String {
     match expr {
         Expr::Var(_)
-        | Expr::Call { .. }
+        | Expr::Call(_)
         | Expr::CallValue { .. }
         | Expr::Closure(_)
         | Expr::Index { .. }
         | Expr::Member { .. }
-        | Expr::New { .. }
+        | Expr::New(_)
         | Expr::Super
         | Expr::Await { .. }
         | Expr::Array(_)
@@ -1016,6 +1032,30 @@ mod tests {
         assert_eq!(fmt("echo c.n;"), "echo c.n;\n");
         assert_eq!(fmt("let c=new Contador();"), "let c = new Contador();\n");
         check_idempotent("let c = new Contador();\necho c.inc(1, x: 2);\n");
+    }
+
+    #[test]
+    fn preserves_generics_and_bounds() {
+        // Item bounds (RFC 0029): `<T>`, `<T: Base>`, usos `<int>`.
+        check_idempotent("class Caixa<T> {\n  fn novo(v) {\n    this[\"v\"] = v;\n  }\n}\n");
+        check_idempotent(
+            "interface Repo<T> {\n  fn salvar(v: T);\n}\nclass Memorias<T: Repo> {\n  fn novo() {\n    this[\"x\"] = 0;\n  }\n}\n",
+        );
+        assert_eq!(fmt("echo f<int>(1);"), "echo f<int>(1);\n");
+        assert_eq!(
+            fmt("let c=new Caixa<Usuario>(1);"),
+            "let c = new Caixa<Usuario>(1);\n"
+        );
+        check_idempotent("echo f<int>(1);\nlet c = new Caixa<Usuario>(1);\n");
+    }
+
+    #[test]
+    fn formats_async_methods() {
+        check_idempotent("class A {\n  async fn busca(id) {\n    return id;\n  }\n}\n");
+        assert_eq!(
+            fmt("class A{async fn m(){return 1;}}"),
+            "class A {\n  async fn m() {\n    return 1;\n  }\n}\n"
+        );
     }
 
     #[test]

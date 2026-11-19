@@ -12,7 +12,7 @@
 
 use rhp_bytecode::{compile, Value};
 use rhp_parser::Program as AstProgram;
-use rhp_parser::{CallArg, Expr, Program, Stmt, StmtNode};
+use rhp_parser::{CallArg, CallData, Expr, Program, Stmt, StmtNode};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -348,10 +348,11 @@ fn synthetic_program(
         trailing: None,
         blank_before: false,
         stmt: Stmt::ExprStmt {
-            expr: Expr::Call {
+            expr: Expr::Call(Box::new(CallData {
                 name: handler.to_string(),
+                type_args: Vec::new(),
                 args: vec![CallArg::Pos(expr_from_value(request)?)],
-            },
+            })),
         },
     });
     Ok(Program {
@@ -376,7 +377,7 @@ fn is_serve_stmt(stmt: &Stmt) -> bool {
 /// Procura `http_serve(...)` na expressao (direta ou aninhada em chamada).
 fn expr_calls_serve(expr: &Expr) -> bool {
     match expr {
-        Expr::Call { name, .. } => name == "http_serve",
+        Expr::Call(data) => data.name == "http_serve",
         Expr::CallValue { callee, args } => {
             expr_calls_serve(callee) || args.iter().any(|a| expr_calls_serve(a.value()))
         }
@@ -393,8 +394,8 @@ fn expr_calls_serve(expr: &Expr) -> bool {
         Expr::Map(entries) => entries.iter().any(|(_, v)| expr_calls_serve(v)),
         Expr::Index { base, index } => expr_calls_serve(base) || expr_calls_serve(index),
         Expr::Member { obj, .. } => expr_calls_serve(obj),
-        Expr::New { class, args } => {
-            expr_calls_serve(class) || args.iter().any(|a| expr_calls_serve(a.value()))
+        Expr::New(data) => {
+            expr_calls_serve(&data.class) || data.args.iter().any(|a| expr_calls_serve(a.value()))
         }
         Expr::Match { subject, arms } => {
             expr_calls_serve(subject)

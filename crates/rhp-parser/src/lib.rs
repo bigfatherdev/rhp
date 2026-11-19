@@ -217,7 +217,7 @@ pub enum Stmt {
         is_async: bool,
         /// Parametros de tipo (`fn f<T>`; Fase Next-Gen 5, apagamento).
         #[allow(dead_code)]
-        generic_params: Vec<String>,
+        generic_params: Vec<GenericParam>,
     },
     Return {
         expr: Option<Expr>,
@@ -255,7 +255,7 @@ pub enum Stmt {
         /// Traits compostas (`use T1, T2;` dentro do corpo).
         uses: Vec<String>,
         /// Parametros de tipo (`class Caixa<T>`; apagamento).
-        generic_params: Vec<String>,
+        generic_params: Vec<GenericParam>,
         methods: Vec<ClassMethod>,
     },
     /// `interface Nome { fn m(params); ... }` (Fase Next-Gen 1): contrato.
@@ -263,7 +263,7 @@ pub enum Stmt {
     InterfaceDef {
         name: String,
         /// Parametros de tipo (`interface Repo<T>`; apagamento).
-        generic_params: Vec<String>,
+        generic_params: Vec<GenericParam>,
         methods: Vec<InterfaceMethod>,
     },
     /// `trait Nome { fn m() { ... } }` (Fase Next-Gen 1): reutilizacao.
@@ -300,6 +300,9 @@ pub struct ClassMethod {
     pub variadic: Option<String>,
     pub return_ann: Option<TypeTag>,
     pub body: Vec<StmtNode>,
+    /// `async fn` como metodo (item metodos-async): a chamada gera tarefa
+    /// (snapshot do `this`, sem write-back). Traits aceitam igual.
+    pub is_async: bool,
 }
 
 /// Assinatura de metodo de interface (sem corpo; Fase Next-Gen 1).
@@ -458,14 +461,12 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    Call {
-        name: String,
-        args: Vec<CallArg>,
-    },
+    Call(Box<CallData>),
     /// Chamada de callee arbitrario: `f()(1)`, `(fn(x) { x })(2)`,
     /// `arr[0](x)`. `f(x)` direto continua `Call` (precedencia de builtins
-    /// preservada byte a byte). `Box` no callee para nao inflar `sizeof(Expr)`
-    /// (o guarda de profundidade assume frames enxutos; ver MAX_PARSE_DEPTH).
+    /// preservada byte a byte). `Box` no callee e no payload para nao
+    /// inflar `sizeof(Expr)` (o guarda de profundidade assume frames
+    /// enxutos; ver MAX_PARSE_DEPTH).
     CallValue {
         callee: Box<Expr>,
         args: Vec<CallArg>,
@@ -489,12 +490,9 @@ pub enum Expr {
     },
     /// Instanciacao: `new Nome(args)` (RFC 0017). `args` aceita as formas
     /// de chamada (posicional, nomeado, spread); a classe vem de `Ident`.
-    /// Fase Next-Gen 5: `new Caixa<T>` tem os argumentos de tipo apagados
-    /// no parse (validados sintaticamente, sem efeito semantico).
-    New {
-        class: Box<Expr>,
-        args: Vec<CallArg>,
-    },
+    /// Fase Next-Gen 5 / item bounds: `new Caixa<Sub>` guarda os argumentos
+    /// de tipo (checagem de aridade/bounds em compilacao; apagados no runtime).
+    New(Box<NewData>),
     /// `super` (Fase Next-Gen 1): classe pai no metodo (`super.falar()`).
     Super,
     /// `await expr` (Fase Next-Gen 3): suspende ate a tarefa/futuro concluir.
@@ -508,6 +506,35 @@ pub enum Expr {
 pub struct MatchArm {
     pub cond: Option<Expr>,
     pub value: Expr,
+}
+
+/// Chamada direta `nome<Args...>(...)`: payload encaixotado para manter
+/// `sizeof(Expr)` enxuto (ver `MAX_PARSE_DEPTH`). `type_args` e validado
+/// sintaticamente no parse e checado (aridade/bounds, RFC 0029) na
+/// compilacao; apagado no bytecode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallData {
+    pub name: String,
+    pub type_args: Vec<String>,
+    pub args: Vec<CallArg>,
+}
+
+/// Instanciacao `new Nome<Args...>(...)`: idem (checagem em compilacao,
+/// apagamento no runtime).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewData {
+    pub class: Box<Expr>,
+    pub type_args: Vec<String>,
+    pub args: Vec<CallArg>,
+}
+
+/// Parametro de tipo (`T` ou `T: Bound`; item bounds, RFC 0029).
+/// `bound` e o nome qualificado da classe/interface exigida (`None` = sem
+/// restricao). Validado na definicao (deve existir); verificado no uso.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenericParam {
+    pub name: String,
+    pub bound: Option<String>,
 }
 
 /// Corpo de closure, sempre heap-alocado (ver `Expr::Closure`).
@@ -1038,11 +1065,11 @@ fn is_generic_name(name: &str) -> bool {
     matches!(name.chars().next(), Some(c) if c.is_uppercase())
 }
 
-/// Parametros de tipo `<T, U>` apos nome de fn/classe (Fase Next-Gen 5).
+/// Parametros de tipo `<T, U: Bound>` apos nome de fn/classe (item bounds).
 /// Retorna lista vazia se nao houver `<`. Nao consome `<` de comparacao:
 /// so trata como generics se apos `<` vier `Ident` e eventualmente `,`/`>`.
 #[inline(never)]
-fn parse_generic_params_opt(cursor: &mut Cursor<'_>) -> Result<Vec<String>, ParseError> {
+fn parse_generic_params_opt(cursor: &mut Cursor<'_>) -> Result<Vec<GenericParam>, ParseError> {
     if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Lt)) {
         return Ok(Vec::new());
     }
@@ -1062,7 +1089,15 @@ fn parse_generic_params_opt(cursor: &mut Cursor<'_>) -> Result<Vec<String>, Pars
             // Permite minusculas tambem (ex.: `<t>`)? Exige maiuscula por convencao,
             // mas aceita qualquer ident para nao quebrar: valida duplicata abaixo.
         }
-        if params.contains(&name) {
+        // Bound opcional: `T: ClasseOuInterface` (item bounds, RFC 0029).
+        // `:` aqui nao e ternario (contexto de lista de tipos).
+        let bound = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) {
+            cursor.next(); // `:`
+            Some(parse_qualified_name(cursor)?)
+        } else {
+            None
+        };
+        if params.iter().any(|p: &GenericParam| p.name == name) {
             let (line, col) = cursor.end_pos();
             return Err(ParseError::new(
                 format!("parametro de tipo duplicado `{name}`"),
@@ -1070,7 +1105,7 @@ fn parse_generic_params_opt(cursor: &mut Cursor<'_>) -> Result<Vec<String>, Pars
                 col,
             ));
         }
-        params.push(name);
+        params.push(GenericParam { name, bound });
         match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::Comma) => {
                 cursor.next();
@@ -1953,6 +1988,37 @@ fn parse_interface_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     })
 }
 
+/// Corpo de metodo `fn` ou `async fn` em classe/trait (o `fn` ja consumido;
+/// para `async fn`, o chamador consome `async` + `fn` antes).
+/// `lugar` descreve o dono para erros (ex.: "na classe `Foo`").
+fn parse_method_def(
+    cursor: &mut Cursor<'_>,
+    seen: &mut std::collections::HashSet<String>,
+    lugar: &str,
+    is_async: bool,
+) -> Result<ClassMethod, ParseError> {
+    let mname = expect_ident(cursor)?;
+    if !seen.insert(mname.clone()) {
+        let (line, col) = cursor.end_pos();
+        return Err(ParseError::new(
+            format!("metodo duplicado `{mname}` {lugar}"),
+            line,
+            col,
+        ));
+    }
+    let (params, variadic) = parse_params_list(cursor, "apos nome do metodo")?;
+    let return_ann = parse_type_ann(cursor)?;
+    let body = parse_block(cursor)?;
+    Ok(ClassMethod {
+        name: mname,
+        params,
+        variadic,
+        return_ann,
+        body,
+        is_async,
+    })
+}
+
 /// `trait Nome { fn m() { } ... }` (Fase Next-Gen 1).
 fn parse_trait_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
@@ -1980,30 +2046,24 @@ fn parse_trait_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
             }
             Some(TokenKind::Fn) => {
                 cursor.next();
-                let mname = expect_ident(cursor)?;
-                if !seen.insert(mname.clone()) {
-                    let (line, col) = cursor.end_pos();
-                    return Err(ParseError::new(
-                        format!("metodo duplicado `{mname}` no trait `{name}`"),
-                        line,
-                        col,
-                    ));
-                }
-                let (params, variadic) = parse_params_list(cursor, "apos nome do metodo")?;
-                let return_ann = parse_type_ann(cursor)?;
-                let body = parse_block(cursor)?;
-                methods.push(ClassMethod {
-                    name: mname,
-                    params,
-                    variadic,
-                    return_ann,
-                    body,
-                });
+                let lugar = format!("no trait `{name}`");
+                methods.push(parse_method_def(cursor, &mut seen, &lugar, false)?);
+            }
+            Some(TokenKind::Async)
+                if matches!(cursor.peek_at(1).map(|t| &t.kind), Some(TokenKind::Fn)) =>
+            {
+                cursor.next(); // `async`
+                cursor.next(); // `fn`
+                let lugar = format!("no trait `{name}`");
+                methods.push(parse_method_def(cursor, &mut seen, &lugar, true)?);
             }
             Some(other) => {
                 let (line, col) = cursor.end_pos();
                 return Err(ParseError::new(
-                    format!("no corpo do trait so `fn` (encontrado {})", describe(other)),
+                    format!(
+                        "no corpo do trait so `fn` ou `async fn` (encontrado {})",
+                        describe(other)
+                    ),
                     line,
                     col,
                 ));
@@ -2084,31 +2144,22 @@ fn parse_class_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
             }
             Some(TokenKind::Fn) => {
                 cursor.next();
-                let mname = expect_ident(cursor)?;
-                if !seen.insert(mname.clone()) {
-                    let (line, col) = cursor.end_pos();
-                    return Err(ParseError::new(
-                        format!("metodo duplicado `{mname}` na classe `{name}`"),
-                        line,
-                        col,
-                    ));
-                }
-                let (params, variadic) = parse_params_list(cursor, "apos nome do metodo")?;
-                let return_ann = parse_type_ann(cursor)?;
-                let body = parse_block(cursor)?;
-                methods.push(ClassMethod {
-                    name: mname,
-                    params,
-                    variadic,
-                    return_ann,
-                    body,
-                });
+                let lugar = format!("na classe `{name}`");
+                methods.push(parse_method_def(cursor, &mut seen, &lugar, false)?);
+            }
+            Some(TokenKind::Async)
+                if matches!(cursor.peek_at(1).map(|t| &t.kind), Some(TokenKind::Fn)) =>
+            {
+                cursor.next(); // `async`
+                cursor.next(); // `fn`
+                let lugar = format!("na classe `{name}`");
+                methods.push(parse_method_def(cursor, &mut seen, &lugar, true)?);
             }
             Some(other) => {
                 let (line, col) = cursor.end_pos();
                 return Err(ParseError::new(
                     format!(
-                        "no corpo da classe so `fn` ou `use` (encontrado {})",
+                        "no corpo da classe so `fn`, `async fn` ou `use` (encontrado {})",
                         describe(other)
                     ),
                     line,
@@ -2901,7 +2952,11 @@ fn parse_call_suffix(cursor: &mut Cursor<'_>, callee: Expr) -> Result<Expr, Pars
     let args = parse_call_args(cursor)?;
     Ok(match callee {
         // `f(x)` direto preserva o caminho classico (builtins).
-        Expr::Var(name) => Expr::Call { name, args },
+        Expr::Var(name) => Expr::Call(Box::new(CallData {
+            name,
+            type_args: Vec::new(),
+            args,
+        })),
         callee => Expr::CallValue {
             callee: Box::new(callee),
             args,
@@ -2918,11 +2973,15 @@ fn parse_ident_or_call(cursor: &mut Cursor<'_>, first: String) -> Result<Expr, P
         name.push('\\');
         name.push_str(&expect_ident(cursor)?);
     }
-    // Argumentos de tipo `f<T>(...)`: validados e apagados (Fase Next-Gen 5).
-    let _ = parse_type_args_opt(cursor)?;
+    // Argumentos de tipo `f<T>(...)`: guardados para checagem (item bounds).
+    let type_args = parse_type_args_opt(cursor)?;
     if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
         let args = parse_call_args(cursor)?;
-        Ok(Expr::Call { name, args })
+        Ok(Expr::Call(Box::new(CallData {
+            name,
+            type_args,
+            args,
+        })))
     } else {
         Ok(Expr::Var(name))
     }
@@ -2983,8 +3042,8 @@ fn parse_new_expr(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
                 name.push('\\');
                 name.push_str(&expect_ident(cursor)?);
             }
-            // Apagamento: valida e descarta `<...>`.
-            let _ = parse_type_args_opt(cursor)?;
+            // Argumentos de tipo `new Caixa<T>(...)`: guardados (item bounds).
+            let type_args = parse_type_args_opt(cursor)?;
             if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
                 return Err(ParseError::new(
                     "esperado `(` apos nome da classe".to_string(),
@@ -2993,10 +3052,11 @@ fn parse_new_expr(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
                 ));
             }
             let args = parse_call_args(cursor)?;
-            Ok(Expr::New {
+            Ok(Expr::New(Box::new(NewData {
                 class: Box::new(Expr::Var(name)),
+                type_args,
                 args,
-            })
+            })))
         }
         other => Err(ParseError::new(
             format!(
@@ -3535,14 +3595,15 @@ mod tests {
         assert_eq!(
             program.statements,
             vec![Stmt::Echo {
-                expr: Expr::Call {
+                expr: Expr::Call(Box::new(CallData {
                     name: "f".to_string(),
+                    type_args: vec![],
                     args: vec![
                         CallArg::Pos(Expr::Int(1)),
                         CallArg::Named("x".to_string(), Expr::Int(2)),
                         CallArg::Spread(Expr::Var("r".to_string())),
                     ],
-                }
+                }))
             }]
         );
         // Ternario com `:` nao vira nomeado; `:` apos nao-Var e erro.
@@ -3560,6 +3621,80 @@ mod tests {
         );
         let err = lex_and_parse("echo f(x: 1, x: 2);").expect_err("deve falhar");
         assert!(err.to_string().contains("duplicado"), "obteve: {err}");
+    }
+
+    #[test]
+    fn parses_generic_bounds_and_type_args() {
+        // Bounds: `T`, `U: Base`, qualificado `V: App\Base`.
+        let program = lex_and_parse("fn f<T, U: Base, V: App\\Modelo>() { return 1; }")
+            .expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::FnDef { generic_params, .. } => {
+                assert_eq!(generic_params.len(), 3);
+                assert_eq!(generic_params[0].name, "T");
+                assert_eq!(generic_params[0].bound, None);
+                assert_eq!(generic_params[1].name, "U");
+                assert_eq!(generic_params[1].bound.as_deref(), Some("Base"));
+                assert_eq!(generic_params[2].name, "V");
+                assert_eq!(generic_params[2].bound.as_deref(), Some("App\\Modelo"));
+            }
+            other => panic!("esperado FnDef, obteve {other:?}"),
+        }
+        // Type args preservados em chamada e `new`.
+        let program = lex_and_parse("echo f<int, string>(1);").expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::Echo {
+                expr: Expr::Call(data),
+            } => {
+                assert_eq!(data.name, "f");
+                assert_eq!(data.type_args, vec!["int", "string"]);
+            }
+            other => panic!("esperado Call, obteve {other:?}"),
+        }
+        let program = lex_and_parse("let c = new Caixa<Usuario>(1);").expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::Let {
+                init: Some(Expr::New(data)),
+                ..
+            } => {
+                assert_eq!(data.type_args, vec!["Usuario"]);
+            }
+            other => panic!("esperado New, obteve {other:?}"),
+        }
+        // Duplicata de parametro de tipo = erro.
+        let err = lex_and_parse("fn f<T, T>() { }").expect_err("deve falhar");
+        assert!(err.to_string().contains("duplicado"), "obteve: {err}");
+        // `<` binario continua comparacao (nao vira generics).
+        lex_and_parse("echo a < b;").expect("comparacao deve passar");
+        lex_and_parse("for let i = 0; i < n; i = i + 1 { echo i; }")
+            .expect("for com `<` deve passar");
+    }
+
+    #[test]
+    fn parses_async_methods() {
+        // Metodos `async fn` em classe e trait (item metodos-async).
+        let program = lex_and_parse(
+            "class A { fn novo() { this[\"x\"] = 0; } async fn busca(id) { return id; } }",
+        )
+        .expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::ClassDef { methods, .. } => {
+                assert_eq!(methods.len(), 2);
+                assert!(!methods[0].is_async);
+                assert!(methods[1].is_async);
+                assert_eq!(methods[1].name, "busca");
+            }
+            other => panic!("esperado ClassDef, obteve {other:?}"),
+        }
+        let program =
+            lex_and_parse("trait T { async fn m() { return 1; } }").expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::TraitDef { methods, .. } => {
+                assert_eq!(methods.len(), 1);
+                assert!(methods[0].is_async);
+            }
+            other => panic!("esperado TraitDef, obteve {other:?}"),
+        }
     }
 
     #[test]
@@ -3768,7 +3903,7 @@ mod tests {
         assert!(matches!(
             program.statements[0].stmt,
             Stmt::Echo {
-                expr: Expr::Call { .. }
+                expr: Expr::Call(_)
             }
         ));
         // Chamada encadeada e por indice: `CallValue`.

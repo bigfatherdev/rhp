@@ -2,6 +2,40 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
+## [0.5.0] — 2026-11-19 (Limitações cuidadas: bounds, metodos async, RFC 0030, trie do router)
+
+### Added
+
+- Bounds de generics (RFC 0029): `<T: Classe|Interface>` com checagem em
+  compilacao no uso (`new`/`call` com type args); aridade e nao-generica
+  com args validadas; apagamento mantido (zero custo em runtime).
+  Registros: `changes/2026-11-19-feat-generics-bounds.md`.
+- Metodos `async` com snapshot: `async fn` em classe/trait; `obj.m()`,
+  destacada e `super.m()` geram tarefa sobre copia do `this` (sem
+  write-back). Instancias cruzam a fronteira com a classe (envelope
+  `__rhp_instancia__`); mapas com a chave reservada sao rejeitados.
+  Registro: `changes/2026-11-19-feat-async-metodos.md`.
+- Combinadores e controle async (RFC 0030, nucleo): `await_timeout(h, s)`,
+  `async_cancel(h)`, `async_cancelled()`, `await_all([...])`,
+  `await_race([...])` (builtins 75–79). Tarefas comunicam por canal +
+  flag atomica; thread destacada. Pool segue adiado (documentado).
+  Registro: `changes/2026-11-19-feat-async-combinadores.md`.
+- Router do RHP Web com trie ordenada (primeiro match global vence;
+  `Allow` identico, provado por teste diferencial): ~7x no pior caso
+  medido (100 rotas, build dev). Registro:
+  `changes/2026-11-19-perf-web-trie.md`.
+- Guia `docs/ASYNC.md` (modelo, fronteira, padroes); referencia com 79
+  builtins. Registro: `changes/2026-11-19-docs-async-arquitetura.md`.
+
+### Changed
+
+- `Expr::{Call,New}` encaixotados (`CallData`/`NewData` com `type_args`);
+  `sizeof(Expr)` reduzido (guarda de profundidade preservado).
+- Worker async executa definicoes de topo (ja em 0.4.0); joins agora via
+  canal (mesmas mensagens de erro); retorno instancia decodifica (antes
+  degradava em mapa no `join`).
+- Conflito de nomes de closure resolvido (`{closure:N}` deterministicos).
+
 ## [0.4.0] — 2026-11-19 (Next Generation: heranca, namespaces, async, tipadas, generics, extensoes, web + itens 1–4)
 
 ### Added

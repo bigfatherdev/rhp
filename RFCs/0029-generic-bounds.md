@@ -1,9 +1,9 @@
 # RFC 0029 (proposta) — Restricoes de generics (`bounds`)
 
 - ID: RFC 0029
-- Status: proposta (nao implementada)
+- Status: aceita e implementada
 - Data: 2026-11-19
-- Versao: —
+- Versao: unreleased (0.5.0 planejada)
 - Depende de: RFC 0025 (generics por apagamento)
 
 ## 1. Problema
@@ -35,11 +35,16 @@ let r = new Repo<Usuario>();
 ```
 
 - Sintaxe: `T: Tipo` em `<...>` de `class`/`fn`/`interface` (um bound por
-  parametro em v1).
-- Checagem em compilacao QUANDO o argumento de tipo e conhecido
-  (`new Repo<Usuario>` vs bound `Entidade`: precisa da hierarquia/contrato
-  — tabelas ja existem no compilador). Sem argumento de tipo (`new Repo()`)
-  = sem checagem (legado apagado).
+  parametro em v1). Type args preservados no AST (`CallData`/`NewData`);
+  `Expr::{Call,New}` encaixotados (reduz `sizeof(Expr)`, preserva o guarda
+  de profundidade).
+- Checagem em compilacao QUANDO ha argumentos de tipo (`new Repo<Usuario>`
+  vs bound `Entidade`: hierarquia/contrato das tabelas do compilador).
+  Sem argumentos de tipo (`new Repo()`, `f(x)`) = apagado, sem checagem
+  (legado). Aridade e nao-generica-com-args tambem validadas.
+- Parametro de tipo visivel no escopo adia a checagem (`new Caixa<T>` dentro
+  de `fn f<T>` passa; sera verificado na instanciacao concreta).
+  Desconhecido fora de escopo = erro (inclui primitivos como `int`).
 - Erro: `` `Usuario` nao satisfaz `T: Entidade` em `Repo<...>` ``.
 
 ## 4. Alternativas consideradas
@@ -70,12 +75,17 @@ parametro; checagem em `New`/`Call` com type args) -> fmt/lsp -> testes.
 ## 9. Plano de testes
 
 Bound satisfeito passa; violado falha com mensagem; sem type args passa;
-bound para interface exige o metodo com aridade.
+bound para interface exige o metodo com aridade; aridade e nao-generica com
+args falham; parametro visivel adia; builtin com type args falha.
+Implementado: teste de unidade `checks_generic_bounds_at_compile_time`,
+integracao `nextgen_generic_bounds`, idempotencia do fmt com bounds.
 
 ## 10. Migracao e rollout
 
-Opcional; bounds podem ser adicionados depois sem quebrar usos existentes
-(que passam a ser checados — documentar como `Changed` menor).
+Opcional; bounds podem ser adicionados depois. Novo erro para: aridade
+divergente, nao-generica com args, builtin com args, bound violado ou
+desconhecido, tipo desconhecido no uso (documentar como `Changed` menor —
+so atinge codigo sem sentido ou com nomes errados).
 
 ## 11. Criterios de aceitacao
 
