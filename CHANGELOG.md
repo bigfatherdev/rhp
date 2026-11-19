@@ -24,7 +24,7 @@ Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
   `Allow` identico, provado por teste diferencial): ~7x no pior caso
   medido (100 rotas, build dev). Registro:
   `changes/2026-11-19-perf-web-trie.md`.
-- Guia `docs/ASYNC.md` (modelo, fronteira, padroes); referencia com 79
+- Guia `docs/ASYNC.md` (modelo, fronteira, padroes); referencia com 80
   builtins. Registro: `changes/2026-11-19-docs-async-arquitetura.md`.
 
 ### Changed

@@ -17,7 +17,7 @@
 - [Geradores](#8-geradores-rfc-0018)
 - [Concorrência](#9-concorrencia-rfc-0019)
 - [Módulos e pacotes](#10-modulos-e-pacotes)
-- [Biblioteca-padrão (79 builtins)](#11-biblioteca-padrao-79-builtins)
+- [Biblioteca-padrão (80 builtins)](#11-biblioteca-padrao-80-builtins)
 - [Erros e códigos](#12-erros-e-codigos)
 - [CLI](#13-cli)
 - [Exemplo completo](#14-exemplo-completo)
@@ -133,7 +133,35 @@ argumento apos defaults, retorno): mismatch = erro
 zero checagem (nenhuma instrucao nova). `static`/destructuring sem
 anotacao.
 
-## 7. Classes e objetos (RFC 0017)
+### Generics com bounds (RFCs 0025/0029)
+
+```rhp
+class Caixa<T> {
+  fn novo(v) { this["v"] = v; }
+  fn obter() { return this["v"]; }
+}
+let c = new Caixa<int>(100);   // ok (apagado; sem custo em runtime)
+fn primeiro<T>(items) { return items[0]; }
+
+class Entidade { fn novo() { this["id"] = 0; } fn id() { return this["id"]; } }
+class Usuario extends Entidade { fn novo() { this["id"] = 1; } }
+class Repo<T: Entidade> {      // bound: classe ou interface conhecida
+  fn novo() { this["x"] = 0; }
+}
+let r = new Repo<Usuario>();   // ok (subclasse satisfaz)
+```
+
+- Parametros `<T, U: Bound>` em `fn`/`class`/`interface`; uso
+  `f<T>(...)` / `new C<T>(...)` guarda os argumentos de tipo.
+- Checagem em **compilacao** (apagamento mantido): aridade; nao-generica
+  com args = erro; builtin com args = erro; bound violado
+  (`` `Outra` nao satisfaz `T: Entidade` ``), bound desconhecido e tipo
+  desconhecido (inclui primitivas como `int` contra bound) = erro.
+- Sem argumentos de tipo = apagado, sem checagem (`new Caixa(v)`, `f(x)`).
+  Parametro de tipo visivel adia a checagem (`new Caixa<T>` dentro de
+  `fn f<T>`; erro so na instanciacao concreta).
+
+## 7. Classes e objetos (RFCs 0017/0021)
 
 ```rhp
 class Contador {
@@ -158,13 +186,73 @@ c.n = 10;               // atribuicao em campo
   (`let f = obj.m; f()`) nao persiste. Metodo inexistente = erro.
 - `new` com aridade errada = erro normal de chamada; `new` em nao-classe
   = erro; `this` fora de metodo = `nao definida`.
-- `new` com aridade errada = erro normal de chamada; `new` em nao-classe
-  = erro; `this` fora de metodo = `nao definida`.
-- Instancias sao por valor (copia; sem aliasing). Sem heranca,
-  sem `private`, sem estaticos (nao-objetivos declarados).
+- Instancias sao por valor (copia; sem aliasing). Sem `private` nem
+  estaticos (nao-objetivos declarados).
 - `echo` mostra `{n: 2}`; classe mostra `<classe Contador>`.
 - `==`: instancias comparam por estrutura (mesma classe + mesmos campos);
   classes comparam por nome; geradores, por identidade.
+
+### Heranca, interfaces e traits (RFC 0021)
+
+```rhp
+class Animal {
+  fn novo(n) { this["nome"] = n; }
+  fn falar() { return "Som"; }
+}
+class Cachorro extends Animal {   // heranca simples (pai definido antes)
+  fn falar() { return "Au au"; } // sobrescrita
+}
+let c = new Cachorro("Rex");
+echo c.falar();                  // "Au au"
+
+interface Logger { fn log(mensagem); }
+class ConsoleLogger implements Logger {  // contrato verificado em compilacao
+  fn novo() { this["x"] = 0; }
+  fn log(m) { echo m; }
+}
+
+trait Saudacao {
+  fn ola(nome) { return "ola " + nome; }
+}
+class Pessoa {
+  use Saudacao;                  // composicao
+  fn novo() { this["x"] = 0; }
+}
+
+class Filha extends Base {
+  fn quem() { return super.quem() + "!"; }  // metodo do pai, mesmo `this`
+}
+```
+
+- `extends`: unico; pai desconhecido, auto-heranca e ciclo = erro de
+  compilacao. Metodos achatados (propria > trait > pai).
+- `implements I, J`: todo metodo exigido deve existir com mesma aridade
+  (ou e erro `nao implementa`).
+- `use T1, T2;` no corpo: conflito trait-trait sem override na classe
+  = erro (`conflito de trait`).
+- `super.metodo(args)`: so em chamada de metodo; pai ausente ou sem o
+  metodo = erro em runtime; write-back no `this` do chamador.
+
+### Metodos `async` (snapshot, sem write-back)
+
+```rhp
+class Api {
+  fn novo() { this["x"] = 0; }
+  async fn buscar(id) { sleep(0.1); return "dado " + str(id); }
+}
+let api = new Api();
+let h = api.buscar(1);   // gera tarefa na hora (nao bloqueia)
+echo await h;            // "dado 1"
+```
+
+- `async fn` vale em classe e trait, para metodo, chamada destacada
+  (`let f = obj.m`) e `super.m()`: a chamada **gera tarefa** e devolve
+  handle (compativel com `await`/`async_join`).
+- Semantica de **snapshot**: `this` viaja como copia (com a classe);
+  mutacoes **nao voltam** ao chamador — devolva valores com `return`.
+- Restricoes: sem named/spread em chamada async; funcao/classe/gerador
+  como argumento = erro; mapa com chave `__rhp_instancia__` = erro
+  (chave reservada ao envelope de instancia).
 
 ## 8. Geradores (RFC 0018)
 
@@ -209,11 +297,14 @@ echo await_race([a(), b()]);     // primeiro pronto vence
 
 - Tarefas isoladas: compartilham o CODIGO (definicoes de topo: funcoes,
   classes, `import native`), nao o ESTADO (globais mutaveis nao atravessam).
-  Captura cruza so valores planos e instancias (com classe); funcao, classe
-  e gerador nao atravessam (erro claro). Metodos `async` rodam sobre snapshot
-  (sem write-back; devolva valores com `return`).
+  Captura cruza so valores planos e instancias (com classe, via envelope
+  `{"__rhp_instancia__": {"classe", "campos"}}`); funcao, classe e gerador
+  nao atravessam (erro claro); mapa com a chave reservada = erro.
+  Metodos `async` rodam sobre snapshot (sem write-back; devolva valores
+  com `return`).
 - Args posicionais (nao nomeados/spread); funcao sem captura vira tarefa;
-  `await`/`async_join` interoperam (handles one-shot, exceto apos timeout).
+  `await`/`async_join` interoperam (handles one-shot, exceto apos timeout:
+  handle consumido vira `Int` comum e `await` dele = identidade).
 - Erro da tarefa vira erro do `join` (`tarefa ... falhou: ...`).
 - Cancelamento e cooperativo (`async_cancel` + `async_cancelled`); timeout
   nao mata a tarefa (segue em voo; junte depois). Sem thread-pool (1 thread
@@ -242,7 +333,7 @@ import {u} from "./c1.rhp";
 - Comentarios `//` de linha e linhas em branco sao preservados pelo
   `rhp fmt` na mesma ordem relativa ao statement.
 
-## 11. Biblioteca-padrao (79 builtins)
+## 11. Biblioteca-padrao (80 builtins)
 
 Aridade checada na compilacao; erros sao `VmError` com mensagem em
 portugues (ver [codigos](#12-erros-e-codigos)).

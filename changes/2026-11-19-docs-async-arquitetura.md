@@ -24,7 +24,7 @@ como compor sistemas reais dentro do modelo.
 - `docs/ASYNC.md` (novo): modelo em uma frase, tabela do que atravessa,
   justificativa tecnica da decisao, 6 padroes com codigo, limites e operacao.
 - `docs/REFERENCIA.md`: secao de concorrencia atualizada (modelo, tabela
-  com os 5 novos builtins, contagem 74 -> 79).
+  com os 5 novos builtins, contagem 74 -> 80).
 
 ## Detalhes técnicos
 
