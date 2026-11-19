@@ -2,6 +2,58 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
+## [0.4.0] — 2026-11-19 (Next Generation: heranca, namespaces, async, tipadas, generics, extensoes, web + itens 1–4)
+
+### Added
+
+- Tarefas async com captura e codigo compartilhado (item 1): worker executa
+  definicoes de topo (funcoes, classes, `import native`); captura transporta
+  valores planos; closures com nomes unicos (`{closure:N}`); `async` aninhado;
+  instancia como argumento agora e erro claro (antes degradava em mapa).
+  Registros: `changes/2026-11-19-feat-async-captura-estado.md`.
+- RHP Web via `rhp pkg` (item 2): `rhp pkg add rhp_web <repo>/framework`
+  vendoriza em `pacotes/rhp_web/` com `rhp.lock`; guia em `docs/WEB.md`.
+  Registro: `changes/2026-11-19-feat-pkg-framework-web.md`.
+- RFCs proposta (item 3): 0028 (`[autoload]` + `use function`), 0029
+  (bounds `<T: X>`), 0030 (cancel/timeout/`all`/`race`). Registro:
+  `changes/2026-11-19-docs-rfcs-fase3.md`.
+
+- Heranca simples (`extends`, `super` com write-back), interfaces
+  (`interface`, `implements` com verificacao de aridade) e traits (`trait`,
+  `use`, precedencia propria > trait > pai, conflito sem override = erro).
+  RFC 0021. Registro: `changes/2026-11-19-feat-next-generation.md`.
+- Namespaces (`namespace`, `A\B`) e autoload (`import A\B [as C]`, PSR-4
+  `A/B.rhp` confinado a arvore). RFC 0022.
+- `async fn` + `await` sobre tarefas isoladas (args posicionais, erros
+  propagados; funcoes autocontidas). RFC 0023.
+- Excecoes tipadas (`catch Tipo [var]`, hierarquia por `parent`, ordem
+  primeiro-match, `finally`). RFC 0024.
+- Generics por apagamento (`class C<T>`, `fn f<T>`, `new C<int>`, `T` sem
+  checagem; `<` binario preservado). RFC 0025.
+- Extensoes nativas estaticas (`import native "demo"`, ABI 1, `demo_eco`/
+  `demo_soma`/`demo_len`). RFC 0026.
+- RHP Web (`framework/web.rhp`: rotas, `:params`, middlewares, `web_json`/
+  `web_text`/`web_redirect`, 404/405, seguranca, templates; exemplo
+  `framework/exemplo_api.rhp`). RFC 0027.
+- Testes de integracao `nextgen_*` (10 casos) + gramatica VSCode com novas
+  palavras-chave.
+
+### Changed
+
+- Worker `http_serve`: executa todo o topo por request exceto a chamada
+  `http_serve` (antes: so `fn`s). Topo deve ser idempotente; permite rotas
+  e estado do framework. Programas so com `fn`s + `http_serve` comportam-se
+  igual.
+- `FuncDef` com `is_async`/`native_id`; `ClassDef` com `parent`; novos ops
+  (`BuildClassEx`, `IsInstanceOf`, `Await`, `CallSuper`, `LoadNative`).
+
+### Fixed
+
+- Desambiguacao de `<` binario vs generics (`i < n` nao vira tipo).
+- Linker: nomes qualificados globais (sem rename) + alias `as` para autoload.
+- Framework `web_casar`: deteccao de `:param` via `starts_with` (indexacao
+  de string nao suportada).
+
 ## [0.3.0] — 2026-11-18 (Segurança: auditoria 20 CVEs + base Docker `trixie`)
 
 ### Changed

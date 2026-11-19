@@ -789,6 +789,15 @@ struct ModuleFile {
     imports: Vec<ResolvedImport>,
     /// Re-exports (`export { } from`) na ordem do fonte, resolvidos.
     reexports: Vec<ResolvedImport>,
+    /// Imports qualificados (`import A\B [as C]`; Fase Next-Gen 2).
+    qualified: Vec<QualifiedImport>,
+}
+
+/// `import A\B [as C]` ja resolvido (arquivo carregado via `imports`).
+#[derive(Debug, Clone)]
+struct QualifiedImport {
+    path: String,
+    alias: Option<String>,
 }
 
 /// `import` (bare ou seletivo) com caminho canonico resolvido.
@@ -910,7 +919,19 @@ fn collect_module(
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
     // Imports e re-exports do nivel superior (bare + seletivos); aninhados = erro.
     // Mesma jaula/ciclo/teto para ambos (re-export tambem cria dependencia).
-    let (raw_imports, raw_reexports) = collect_imports(&program.statements)?;
+    // Fase Next-Gen 2: + qualificados (autoload) e nativos (sem arquivo).
+    let (raw_imports, raw_reexports, raw_qualified, raw_native) =
+        collect_imports(&program.statements)?;
+    // Valida extensoes nativas ja (sem arquivo; o `LoadNative` valida de novo
+    // em runtime com a ABI — defesa em profundidade).
+    for ext in &raw_native {
+        if !rhp_vm::extensions::exists(ext) {
+            return Err(LoadError::Plain(format!(
+                "extensao nativa desconhecida: `{ext}` (disponiveis: {})",
+                available_native()
+            )));
+        }
+    }
     let mut imports = Vec::new();
     for import in raw_imports {
         let (raw, names) = import;
@@ -937,6 +958,37 @@ fn collect_module(
             modules,
         )?);
     }
+    // Autoload qualificado (Fase Next-Gen 2): `A\B` -> `A/B.rhp`.
+    // Tenta relativo ao importador, depois relativo a raiz.
+    // Nota: nao entra em `imports` (sem alias bare): a classe e global
+    // (sem rename), ja executada por `collect_module`; alias `as` e emitido
+    // a parte em `link_modules`.
+    let mut qualified = Vec::new();
+    for (qpath, alias) in &raw_qualified {
+        let rel = qualified_to_relpath(qpath);
+        // Tenta base_dir primeiro; se falhar, tenta root.
+        let _resolved = resolve_dep(&base_dir, root, &rel, None, visiting, by_canonical, modules)
+            .or_else(|_| {
+                resolve_dep(
+                    root,
+                    root,
+                    &rel,
+                    None,
+                    visiting,
+                    by_canonical,
+                    modules,
+                )
+            })
+            .map_err(|_| {
+                LoadError::Plain(format!(
+                    "autoload nao encontrou `{qpath}` (tentado `{rel}` relativo ao importador e a raiz)"
+                ))
+            })?;
+        qualified.push(QualifiedImport {
+            path: qpath.clone(),
+            alias: alias.clone(),
+        });
+    }
     visiting.pop();
     let idx = modules.len();
     by_canonical.insert(canonical.clone(), idx);
@@ -947,6 +999,7 @@ fn collect_module(
         trailing_comments: program.trailing_comments,
         imports,
         reexports,
+        qualified,
     });
     Ok(idx)
 }
@@ -978,18 +1031,28 @@ fn link_modules(modules: &[ModuleFile]) -> Result<(Vec<StmtNode>, Vec<String>), 
             let def_name = match &stmt.stmt {
                 Stmt::Let { name, .. } | Stmt::Const { name, .. } => Some(name.clone()),
                 Stmt::FnDef { name, .. } => Some(name.clone()),
+                Stmt::ClassDef { name, .. }
+                | Stmt::InterfaceDef { name, .. }
+                | Stmt::TraitDef { name, .. } => Some(name.clone()),
                 Stmt::Export { def } => match &def.stmt {
                     Stmt::FnDef { name, .. }
                     | Stmt::Let { name, .. }
-                    | Stmt::Const { name, .. } => Some(name.clone()),
+                    | Stmt::Const { name, .. }
+                    | Stmt::ClassDef { name, .. }
+                    | Stmt::InterfaceDef { name, .. }
+                    | Stmt::TraitDef { name, .. } => Some(name.clone()),
                     _ => {
                         return Err(format!(
-                            "`export` invalido em `{}` (so `fn`, `let`, `const`)",
+                            "`export` invalido em `{}` (so `fn`, `let`, `const`, `class`, `interface`, `trait`)",
                             module.shown
                         ));
                     }
                 },
-                Stmt::Import(_) | Stmt::ImportNames { .. } => None,
+                Stmt::Import(_)
+                | Stmt::ImportNames { .. }
+                | Stmt::ImportQualified { .. }
+                | Stmt::ImportNative { .. }
+                | Stmt::Namespace { .. } => None,
                 _ => None,
             };
             if let Some(name) = def_name {
@@ -1007,10 +1070,13 @@ fn link_modules(modules: &[ModuleFile]) -> Result<(Vec<StmtNode>, Vec<String>), 
                 let name = match &def.stmt {
                     Stmt::FnDef { name, .. }
                     | Stmt::Let { name, .. }
-                    | Stmt::Const { name, .. } => name.clone(),
+                    | Stmt::Const { name, .. }
+                    | Stmt::ClassDef { name, .. }
+                    | Stmt::InterfaceDef { name, .. }
+                    | Stmt::TraitDef { name, .. } => name.clone(),
                     _ => {
                         return Err(format!(
-                            "`export` invalido em `{}` (so `fn`, `let`, `const`)",
+                            "`export` invalido em `{}` (so `fn`, `let`, `const`, `class`, `interface`, `trait`)",
                             module.shown
                         ));
                     }
@@ -1173,14 +1239,38 @@ fn link_modules(modules: &[ModuleFile]) -> Result<(Vec<StmtNode>, Vec<String>), 
                 emit(&visible, rdep, &origin, &mut out)?;
             }
         }
+        // Imports qualificados (Fase Next-Gen 2): o arquivo ja foi carregado
+        // (global, sem rename). Sem alias = nada a emitir (nome global usavel).
+        // Com alias = `let Alias = Qualificado;` (ponte local).
+        for q in &module.qualified {
+            if let Some(alias) = q.alias.as_ref() {
+                // Origem global (sem rename): `A\B`.
+                // `bound` com dep = idx (local) para colisao correta.
+                match bound.get(alias) {
+                    Some(_) => {
+                        return Err(format!(
+                            "colisao de importacao: `{alias}` ja vinculado (de outro modulo)"
+                        ));
+                    }
+                    None => {
+                        bound.insert(alias.clone(), (idx, q.path.clone()));
+                        out.push(alias_let(alias, &q.path));
+                    }
+                }
+            }
+        }
         // Proprios statements: `export` desembrulha a definicao (que e
         // renomeada e fundida como as demais); imports/marcas somem.
+        // `ImportNative` e `Namespace` permanecem (runtime/compilador tratam).
         // A decoracao (comentarios) atravessa o renomeador junto (Etapa 4).
         let own: Vec<StmtNode> = module
             .statements
             .iter()
             .filter_map(|node| match &node.stmt {
-                Stmt::Import(_) | Stmt::ImportNames { .. } | Stmt::ReExport { .. } => None,
+                Stmt::Import(_)
+                | Stmt::ImportNames { .. }
+                | Stmt::ImportQualified { .. }
+                | Stmt::ReExport { .. } => None,
                 Stmt::Export { def } => {
                     let mut inner = def.as_ref().clone();
                     inner.leading = node.leading.iter().chain(&inner.leading).cloned().collect();
@@ -1257,8 +1347,13 @@ impl Renamer<'_> {
     }
 
     /// Referencia (`Var`, callee, alvo de atribuicao): renomeia se resolve
-    /// ao topo sem sombra intermediaria.
+    /// ao topo sem sombra intermediaria. Nomes qualificados (`A\B`, Fase
+    /// Next-Gen 2) sao globais: nunca renomeados (autoload resolve o arquivo,
+    /// a classe vive com o nome qualificado em todos os modulos).
     fn reference(&self, name: &str) -> String {
+        if name.contains('\\') {
+            return name.to_string();
+        }
         if self.scopes.iter().any(|s| s.contains(name)) {
             return name.to_string();
         }
@@ -1270,8 +1365,11 @@ impl Renamer<'_> {
 
     /// Vinculo novo (`let`/`const`/`fn`, parametro, var de laco/catch):
     /// no topo renomeia (e o proprio vinculo de `top`); dentro, registra
-    /// sombra e mantem simples.
+    /// sombra e mantem simples. Qualificados sao globais (sem rename).
     fn declare(&mut self, name: &str) -> String {
+        if name.contains('\\') {
+            return name.to_string();
+        }
         if self.scopes.len() == 1 {
             if self.top.contains(name) {
                 return self.mangled(name);
@@ -1451,6 +1549,8 @@ impl Renamer<'_> {
                 variadic,
                 return_ann,
                 body,
+                is_async,
+                generic_params,
             } => {
                 let renamed = self.declare(name);
                 // Defaults sao constantes (sem Vars validos); renomeia no
@@ -1478,10 +1578,23 @@ impl Renamer<'_> {
                     variadic: variadic.clone(),
                     return_ann: *return_ann,
                     body,
+                    is_async: *is_async,
+                    generic_params: generic_params.clone(),
                 }
             }
-            Stmt::ClassDef { name, methods } => {
+            Stmt::ClassDef {
+                name,
+                parent,
+                interfaces,
+                uses,
+                generic_params,
+                methods,
+            } => {
                 let renamed = self.declare(name);
+                // Pai/interfaces/traits sao referencias (renomeia, nao declara).
+                let parent = parent.as_ref().map(|p| self.reference(p));
+                let interfaces = interfaces.iter().map(|i| self.reference(i)).collect();
+                let uses = uses.iter().map(|u| self.reference(u)).collect();
                 let methods = methods
                     .iter()
                     .map(|m| {
@@ -1514,9 +1627,89 @@ impl Renamer<'_> {
                     .collect();
                 Stmt::ClassDef {
                     name: renamed,
+                    parent,
+                    interfaces,
+                    uses,
+                    generic_params: generic_params.clone(),
                     methods,
                 }
             }
+            Stmt::InterfaceDef {
+                name,
+                generic_params,
+                methods,
+            } => {
+                let renamed = self.declare(name);
+                // Assinaturas: defaults renomeados no escopo externo.
+                let methods = methods
+                    .iter()
+                    .map(|m| {
+                        let params = m
+                            .params
+                            .iter()
+                            .map(|p| rhp_parser::Param {
+                                name: p.name.clone(),
+                                ann: p.ann,
+                                default: p.default.as_ref().map(|e| self.expr(e)),
+                            })
+                            .collect();
+                        rhp_parser::InterfaceMethod {
+                            name: m.name.clone(),
+                            params,
+                            variadic: m.variadic.clone(),
+                            return_ann: m.return_ann,
+                        }
+                    })
+                    .collect();
+                Stmt::InterfaceDef {
+                    name: renamed,
+                    generic_params: generic_params.clone(),
+                    methods,
+                }
+            }
+            Stmt::TraitDef { name, methods } => {
+                let renamed = self.declare(name);
+                let methods = methods
+                    .iter()
+                    .map(|m| {
+                        let params = m
+                            .params
+                            .iter()
+                            .map(|p| rhp_parser::Param {
+                                name: p.name.clone(),
+                                ann: p.ann,
+                                default: p.default.as_ref().map(|e| self.expr(e)),
+                            })
+                            .collect::<Vec<_>>();
+                        self.scopes.push(HashSet::new());
+                        for param in &params {
+                            self.declare(&param.name);
+                        }
+                        if let Some(rest) = &m.variadic {
+                            self.declare(rest);
+                        }
+                        let body = m.body.iter().map(|s| self.stmt(s)).collect();
+                        self.scopes.pop();
+                        rhp_parser::ClassMethod {
+                            name: m.name.clone(),
+                            params,
+                            variadic: m.variadic.clone(),
+                            return_ann: m.return_ann,
+                            body,
+                        }
+                    })
+                    .collect();
+                Stmt::TraitDef {
+                    name: renamed,
+                    methods,
+                }
+            }
+            Stmt::Namespace { name } => Stmt::Namespace { name: name.clone() },
+            Stmt::ImportQualified { path, alias } => Stmt::ImportQualified {
+                path: path.clone(),
+                alias: alias.clone(),
+            },
+            Stmt::ImportNative { name } => Stmt::ImportNative { name: name.clone() },
             Stmt::Return { expr } => Stmt::Return {
                 expr: expr.as_ref().map(|e| self.expr(e)),
             },
@@ -1528,23 +1721,27 @@ impl Renamer<'_> {
             },
             Stmt::Try {
                 body,
-                catch_var,
-                catch_body,
+                catches,
                 finally_body,
             } => {
                 self.scopes.push(HashSet::new());
                 let body = body.iter().map(|s| self.stmt(s)).collect();
                 self.scopes.pop();
-                let (renamed_var, renamed_catch) = match catch_body {
-                    None => (None, None),
-                    Some(catch_body) => {
+                let renamed_catches = catches
+                    .iter()
+                    .map(|c| {
                         self.scopes.push(HashSet::new());
-                        let renamed_var = catch_var.as_deref().map(|v| self.declare(v));
-                        let renamed_catch = catch_body.iter().map(|s| self.stmt(s)).collect();
+                        let type_name = c.type_name.as_ref().map(|t| self.reference(t));
+                        let var = c.var.as_deref().map(|v| self.declare(v));
+                        let renamed_body = c.body.iter().map(|s| self.stmt(s)).collect();
                         self.scopes.pop();
-                        (renamed_var, Some(renamed_catch))
-                    }
-                };
+                        rhp_parser::CatchClause {
+                            type_name,
+                            var,
+                            body: renamed_body,
+                        }
+                    })
+                    .collect();
                 let renamed_finally = finally_body.as_ref().map(|fin| {
                     self.scopes.push(HashSet::new());
                     let renamed: Vec<StmtNode> = fin.iter().map(|s| self.stmt(s)).collect();
@@ -1553,8 +1750,7 @@ impl Renamer<'_> {
                 });
                 Stmt::Try {
                     body,
-                    catch_var: renamed_var,
-                    catch_body: renamed_catch,
+                    catches: renamed_catches,
                     finally_body: renamed_finally,
                 }
             }
@@ -1676,8 +1872,13 @@ impl Renamer<'_> {
                     variadic: data.variadic.clone(),
                     return_ann: data.return_ann,
                     body,
+                    is_async: data.is_async,
                 }))
             }
+            Expr::Super => Expr::Super,
+            Expr::Await { expr } => Expr::Await {
+                expr: Box::new(self.expr(expr)),
+            },
         }
     }
 }
@@ -1685,21 +1886,50 @@ impl Renamer<'_> {
 type RawImports = Vec<(String, Option<Vec<ImportName>>)>;
 /// Re-exports brutos: (caminho, nomes). `export * from` nao existe (RFC 0011).
 type RawReExports = Vec<(String, Vec<ImportName>)>;
+/// Imports qualificados por namespace: (caminho `A\B`, alias opcional).
+type RawQualified = Vec<(String, Option<String>)>;
+/// Imports nativos: nomes de extensao.
+type RawNative = Vec<String>;
 
-fn collect_imports(statements: &[StmtNode]) -> Result<(RawImports, RawReExports), LoadError> {
+fn collect_imports(
+    statements: &[StmtNode],
+) -> Result<(RawImports, RawReExports, RawQualified, RawNative), LoadError> {
     let mut imports = Vec::new();
     let mut reexports = Vec::new();
+    let mut qualified = Vec::new();
+    let mut native = Vec::new();
     for node in statements {
         match &node.stmt {
             Stmt::Import(path) => imports.push((path.clone(), None)),
             Stmt::ImportNames { path, names } => imports.push((path.clone(), Some(names.clone()))),
             Stmt::ReExport { path, names } => reexports.push((path.clone(), names.clone())),
+            Stmt::ImportQualified { path, alias } => {
+                qualified.push((path.clone(), alias.clone()));
+            }
+            Stmt::ImportNative { name } => native.push(name.clone()),
             Stmt::Export { .. } => {}
             _ => {}
         }
     }
     check_no_nested_imports(statements)?;
-    Ok((imports, reexports))
+    Ok((imports, reexports, qualified, native))
+}
+
+/// Resolve `A\B\C` para arquivo: `A/B/C.rhp` relativo ao importador,
+/// senao relativo a raiz do programa (PSR-4 simplificado, Fase Next-Gen 2).
+/// Retorna o caminho relativo a ser resolvido por `resolve_dep`.
+fn qualified_to_relpath(path: &str) -> String {
+    format!("{}.rhp", path.replace('\\', "/"))
+}
+
+/// Extensoes nativas disponiveis (para erro claro no loader).
+fn available_native() -> String {
+    let mut names: Vec<String> = rhp_vm::extensions::registry().keys().cloned().collect();
+    names.sort();
+    if names.is_empty() {
+        return "(nenhuma)".to_string();
+    }
+    names.join(", ")
 }
 
 /// Rejeita `import`/`export` dentro de blocos/funcoes (a semantica seria
@@ -1759,6 +1989,16 @@ fn check_expr_imports(expr: &rhp_parser::Expr) -> Result<(), LoadError> {
     use rhp_parser::Expr as E;
     match expr {
         E::Closure(data) => check_block_imports(&data.body, "em closure"),
+        E::Await { expr } => check_expr_imports(expr),
+        E::Super => Ok(()),
+        E::Member { obj, .. } => check_expr_imports(obj),
+        E::New { class, args } => {
+            check_expr_imports(class)?;
+            for arg in args {
+                check_expr_imports(arg.value())?;
+            }
+            Ok(())
+        }
         E::CallValue { callee, args } => {
             check_expr_imports(callee)?;
             for arg in args {
@@ -1821,6 +2061,9 @@ fn check_no_nested_imports(statements: &[StmtNode]) -> Result<(), LoadError> {
         match &node.stmt {
             Stmt::Import(_)
             | Stmt::ImportNames { .. }
+            | Stmt::ImportQualified { .. }
+            | Stmt::ImportNative { .. }
+            | Stmt::Namespace { .. }
             | Stmt::Export { .. }
             | Stmt::ReExport { .. } => {}
             Stmt::If {
@@ -1861,13 +2104,13 @@ fn check_no_nested_imports(statements: &[StmtNode]) -> Result<(), LoadError> {
             }
             Stmt::Try {
                 body,
-                catch_body,
+                catches,
                 finally_body,
                 ..
             } => {
                 check_block_imports(body, "em `try`")?;
-                if let Some(catch_body) = catch_body {
-                    check_block_imports(catch_body, "em `catch`")?;
+                for catch in catches {
+                    check_block_imports(&catch.body, "em `catch`")?;
                 }
                 if let Some(finally_body) = finally_body {
                     check_block_imports(finally_body, "em `finally`")?;
@@ -1883,9 +2126,21 @@ fn check_no_nested_imports(statements: &[StmtNode]) -> Result<(), LoadError> {
                     }
                 }
             }
+            Stmt::ClassDef { methods, .. } | Stmt::TraitDef { methods, .. } => {
+                for m in methods {
+                    check_block_imports(&m.body, "em metodo")?;
+                    for param in &m.params {
+                        if let Some(default) = &param.default {
+                            check_expr_imports(default)?;
+                        }
+                    }
+                }
+            }
             Stmt::Block(body) => check_block_imports(body, "em bloco")?,
             // Closure e o unico caminho de `import` aninhado via expressao
             // (RFC 0003); rejeita com o mesmo erro claro das funcoes.
+            // (`InterfaceDef`/`Namespace`/etc. nao tem corpos com imports:
+            // caem no `other`, que retorna Ok via `check_stmt_expr_imports`.)
             other => check_stmt_expr_imports(other)?,
         }
     }
@@ -1903,6 +2158,16 @@ fn check_block_imports(body: &[StmtNode], context: &str) -> Result<(), LoadError
             Stmt::ImportNames { path, .. } => {
                 return Err(LoadError::Plain(format!(
                     "import {context} nao suportado (`{path}`): use `import` apenas no nivel superior do arquivo"
+                )));
+            }
+            Stmt::ImportQualified { path, .. } => {
+                return Err(LoadError::Plain(format!(
+                    "import {context} nao suportado (`{path}`): use `import` apenas no nivel superior do arquivo"
+                )));
+            }
+            Stmt::ImportNative { name } => {
+                return Err(LoadError::Plain(format!(
+                    "import native {context} nao suportado (`{name}`): use apenas no nivel superior"
                 )));
             }
             Stmt::Export { .. } => {

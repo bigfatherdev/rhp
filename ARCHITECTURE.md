@@ -1,20 +1,25 @@
-# ARCHITECTURE.md — Arquitetura do RHP (Fases 3–6)
+# ARCHITECTURE.md — Arquitetura do RHP (Next Generation)
 
-Estado real: implementado e validado em 2026-11-14. Nada aqui descreve
+Estado real: implementado e validado em 2026-11-19. Nada aqui descreve
 funcionalidade futura como pronta. Desenho: `ADRs/0001-marco-2.md` (nucleo),
-`0002` (stdlib), `0003` (modulos/ferramentas), `0004` (rede/fronteira).
+`0002` (stdlib), `0003` (modulos/ferramentas), `0004` (rede/fronteira),
+RFCs 0021–0027 (heranca, namespaces, async, tipadas, generics, extensoes, web).
 
 ## Crates do workspace
 
 | Crate | Responsabilidade | Depende de |
 |---|---|---|
-| `rhp-lexer` | Tokens manuais (+`[ ] :`, `import`), erros linha:coluna | — |
-| `rhp-parser` | Precedencia, AST (+compostos, `AssignTarget`, `Import`) | `rhp-lexer` |
-| `rhp-bytecode` | `Value` (+`Array`/`Map`), `Builtin` (10, ids 0–9), `CallBuiltin` etc., `compile()`, `validate()` recursivo | `rhp-parser` |
-| `rhp-vm` | Frames (limite 512), escopos + globais, builtins (+`http_get` std-only) | `rhp-bytecode` (+`rhp-parser` so em dev/testes) |
-| `rhp-fmt` | Formatador canonico idempotente (`format`, `format_source`) | `rhp-parser`, `rhp-lexer` |
-| `rhp-cli` | `rhp run` (com loader de modulos), `rhp fmt [--check]`, `rhp check [--json]` (sem executar), integracao | todos |
-| `rhp-diagnostic` | `Diagnostic` + codigos `E0xxx`–`E3xxx` + `render()` (dado separado de apresentacao; base p/ LSP) | `rhp-lexer`, `rhp-parser` |
+| `rhp-lexer` | Tokens (+`\`, `extends`/`async`/etc.), erros linha:coluna | — |
+| `rhp-parser` | Precedencia, AST (heranca, interfaces, traits, namespaces, async/await, tipadas, generics) | `rhp-lexer` |
+| `rhp-bytecode` | `Value`, `FuncDef.is_async/native_id`, `ClassDef.parent`, ops (`BuildClassEx`, `IsInstanceOf`, `Await`, `CallSuper`, `LoadNative`), `compile()`, `validate()` | `rhp-parser` |
+| `rhp-vm` | Frames (512), escopos + globais, builtins, tarefas async, `extensions` (registro estatico), worker `http_serve` com topo | `rhp-bytecode` (+`rhp-parser` so em dev/testes) |
+| `rhp-fmt` | Formatador canonico idempotente (nova sintaxe) | `rhp-parser`, `rhp-lexer` |
+| `rhp-cli` | `rhp run` (loader + autoload `A\B`->`A/B.rhp`), `fmt`, `check`, `test`, integracao | todos |
+| `rhp-diagnostic` | `Diagnostic` + codigos `E0xxx`–`E3xxx` + `render()` (base p/ LSP) | `rhp-lexer`, `rhp-parser` |
+
+Framework: `framework/web.rhp` (rotas, req/res, middleware, seguranca,
+templates) sobre `http_serve`; exemplo `framework/exemplo_api.rhp`.
+Extensoes: `crates/rhp-vm/src/extensions.rs` (`demo`; ABI 1; sem `unsafe`/`.so`).
 
 Toolchain: Rust stable, edicao 2021.
 Dependencias externas: zero (auditoria: workspace + std; `cargo tree` sem

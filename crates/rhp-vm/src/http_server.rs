@@ -327,7 +327,11 @@ fn preflight(program: &AstProgram, handler: &str) -> Result<(), VmError> {
     Ok(())
 }
 
-/// Programa sintetico por request: todas as `fn` de topo + chamada.
+/// Programa sintetico por request: todo o topo (definicoes + estado) + chamada.
+/// Fase Next-Gen 7: inclui `let`/`const`/`class`/`import native`/`namespace`
+/// e chamadas de registro (ex.: `web_get(...)`), nao so `fn` — o worker
+/// reconstrói o estado executando o topo uma vez por request (idempotente).
+/// A chamada `http_serve(...)` e filtrada (senao o worker serviria de novo).
 fn synthetic_program(
     program: &AstProgram,
     handler: &str,
@@ -336,7 +340,7 @@ fn synthetic_program(
     let mut statements: Vec<StmtNode> = program
         .statements
         .iter()
-        .filter(|node| matches!(&node.stmt, Stmt::FnDef { .. }))
+        .filter(|node| !is_serve_stmt(&node.stmt))
         .cloned()
         .collect();
     statements.push(StmtNode {
@@ -354,6 +358,65 @@ fn synthetic_program(
         statements,
         trailing_comments: Vec::new(),
     })
+}
+
+/// `true` se o statement e (ou contem no topo) uma chamada `http_serve`
+/// — filtrado do programa sintetico do worker (evita re-servir).
+fn is_serve_stmt(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::ExprStmt { expr } => expr_calls_serve(expr),
+        Stmt::Let { init: Some(e), .. }
+        | Stmt::Const { init: e, .. }
+        | Stmt::Return { expr: Some(e) }
+        | Stmt::Throw { expr: e } => expr_calls_serve(e),
+        _ => false,
+    }
+}
+
+/// Procura `http_serve(...)` na expressao (direta ou aninhada em chamada).
+fn expr_calls_serve(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { name, .. } => name == "http_serve",
+        Expr::CallValue { callee, args } => {
+            expr_calls_serve(callee) || args.iter().any(|a| expr_calls_serve(a.value()))
+        }
+        Expr::Binary { left, right, .. } => expr_calls_serve(left) || expr_calls_serve(right),
+        Expr::Unary { expr, .. } | Expr::Await { expr } => expr_calls_serve(expr),
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_calls_serve(cond) || expr_calls_serve(then_branch) || expr_calls_serve(else_branch)
+        }
+        Expr::Array(items) => items.iter().any(expr_calls_serve),
+        Expr::Map(entries) => entries.iter().any(|(_, v)| expr_calls_serve(v)),
+        Expr::Index { base, index } => expr_calls_serve(base) || expr_calls_serve(index),
+        Expr::Member { obj, .. } => expr_calls_serve(obj),
+        Expr::New { class, args } => {
+            expr_calls_serve(class) || args.iter().any(|a| expr_calls_serve(a.value()))
+        }
+        Expr::Match { subject, arms } => {
+            expr_calls_serve(subject)
+                || arms.iter().any(|a| {
+                    a.cond.as_ref().is_some_and(expr_calls_serve) || expr_calls_serve(&a.value)
+                })
+        }
+        Expr::Closure(data) => data.body.iter().any(|n| stmt_calls_serve(&n.stmt)),
+        _ => false,
+    }
+}
+
+/// Procura `http_serve` em statements aninhados (corpos de `if`/`for`/etc.).
+/// Conservador: qualquer bloco com a chamada marca o statement pai.
+fn stmt_calls_serve(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::ExprStmt { expr } | Stmt::Throw { expr } | Stmt::Echo { expr } => {
+            expr_calls_serve(expr)
+        }
+        Stmt::Let { init: Some(e), .. } | Stmt::Const { init: e, .. } => expr_calls_serve(e),
+        _ => false,
+    }
 }
 
 /// Valor RHP => literal AST (request; `Func` nao atravessa).

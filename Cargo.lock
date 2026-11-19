@@ -290,14 +290,14 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rhp-bytecode"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rhp-parser",
 ]
 
 [[package]]
 name = "rhp-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rhp-bytecode",
  "rhp-diagnostic",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "rhp-diagnostic"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rhp-lexer",
  "rhp-parser",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "rhp-fmt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rhp-lexer",
  "rhp-parser",
@@ -325,18 +325,18 @@ dependencies = [
 
 [[package]]
 name = "rhp-lexer"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "rhp-parser"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rhp-lexer",
 ]
 
 [[package]]
 name = "rhp-vm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "bcrypt",

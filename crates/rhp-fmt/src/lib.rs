@@ -178,20 +178,21 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
         }
         Stmt::Try {
             body,
-            catch_var,
-            catch_body,
+            catches,
             finally_body,
         } => {
             indent(level, out);
             out.push_str("try {\n");
             fmt_block(body, level + 1, out);
             indent(level, out);
-            if let Some(catch_body) = catch_body {
-                match catch_var {
-                    Some(var) => out.push_str(&format!("}} catch {var} {{\n")),
-                    None => out.push_str("} catch {\n"),
+            for catch in catches {
+                match (catch.type_name.as_ref(), catch.var.as_ref()) {
+                    (Some(t), Some(v)) => out.push_str(&format!("}} catch {t} {v} {{\n")),
+                    (Some(t), None) => out.push_str(&format!("}} catch {t} {{\n")),
+                    (None, Some(v)) => out.push_str(&format!("}} catch {v} {{\n")),
+                    (None, None) => out.push_str("} catch {\n"),
                 }
-                fmt_block(catch_body, level + 1, out);
+                fmt_block(&catch.body, level + 1, out);
                 indent(level, out);
             }
             match finally_body {
@@ -263,23 +264,54 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             variadic,
             return_ann,
             body,
+            is_async,
+            generic_params,
         } => {
             indent(level, out);
             let ret = return_ann
                 .map(|t| format!(": {}", t.name()))
                 .unwrap_or_default();
+            let async_pfx = if *is_async { "async " } else { "" };
+            let generics = if generic_params.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", generic_params.join(", "))
+            };
             let _ = writeln!(
                 out,
-                "fn {name}({}){ret} {{",
+                "{async_pfx}fn {name}{generics}({}){ret} {{",
                 fmt_params(params, variadic.as_deref())
             );
             fmt_block(body, level + 1, out);
             indent(level, out);
             out.push_str("}\n");
         }
-        Stmt::ClassDef { name, methods } => {
+        Stmt::ClassDef {
+            name,
+            parent,
+            interfaces,
+            uses,
+            generic_params,
+            methods,
+        } => {
             indent(level, out);
-            out.push_str(&format!("class {name} {{\n"));
+            let generics = if generic_params.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", generic_params.join(", "))
+            };
+            let mut head = format!("class {name}{generics}");
+            if let Some(p) = parent {
+                head.push_str(&format!(" extends {p}"));
+            }
+            if !interfaces.is_empty() {
+                head.push_str(&format!(" implements {}", interfaces.join(", ")));
+            }
+            out.push_str(&format!("{head} {{\n"));
+            for u in uses {
+                indent(level + 1, out);
+                let _ = writeln!(out, "use {u};");
+            }
             for method in methods {
                 indent(level + 1, out);
                 let ret = method
@@ -302,6 +334,77 @@ fn fmt_stmt(stmt: &Stmt, level: usize, out: &mut String) {
             }
             indent(level, out);
             out.push_str("}\n");
+        }
+        Stmt::InterfaceDef {
+            name,
+            generic_params,
+            methods,
+        } => {
+            indent(level, out);
+            let generics = if generic_params.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", generic_params.join(", "))
+            };
+            let _ = writeln!(out, "interface {name}{generics} {{");
+            for m in methods {
+                indent(level + 1, out);
+                let ret = m
+                    .return_ann
+                    .map(|t| format!(": {}", t.name()))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "fn {}({}){ret};",
+                    m.name,
+                    fmt_params(&m.params, m.variadic.as_deref())
+                );
+            }
+            indent(level, out);
+            out.push_str("}\n");
+        }
+        Stmt::TraitDef { name, methods } => {
+            indent(level, out);
+            let _ = writeln!(out, "trait {name} {{");
+            for method in methods {
+                indent(level + 1, out);
+                let ret = method
+                    .return_ann
+                    .map(|t| format!(": {}", t.name()))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "fn {}({}){ret} {{",
+                    method.name,
+                    fmt_params(&method.params, method.variadic.as_deref())
+                );
+                let mut body = String::new();
+                fmt_block(&method.body, level + 2, &mut body);
+                out.push_str(&body);
+                indent(level + 1, out);
+                out.push_str("}\n");
+            }
+            indent(level, out);
+            out.push_str("}\n");
+        }
+        Stmt::Namespace { name } => {
+            indent(level, out);
+            let _ = writeln!(out, "namespace {name};");
+        }
+        Stmt::ImportQualified { path, alias } => {
+            indent(level, out);
+            match alias {
+                Some(a) => {
+                    let _ = writeln!(out, "import {path} as {a};");
+                }
+                None => {
+                    let _ = writeln!(out, "import {path};");
+                }
+            }
+        }
+        Stmt::ImportNative { name } => {
+            indent(level, out);
+            let _ = writeln!(out, "import native {name:?};");
         }
         Stmt::Return { expr } => {
             indent(level, out);
@@ -558,6 +661,10 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
             let inner: Vec<String> = args.iter().map(fmt_call_arg).collect();
             format!("{}({})", fmt_atom(callee), inner.join(", "))
         }
+        Expr::Super => "super".to_string(),
+        Expr::Await { expr } => {
+            format!("await {}", fmt_expr(expr, 10))
+        }
         Expr::Closure(data) => {
             // Multilinha com indentacao relativa: estavel e reparsavel
             // (idempotencia garantida; closures aninhadas nao herdam o
@@ -568,8 +675,9 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
                 .return_ann
                 .map(|t| format!(": {}", t.name()))
                 .unwrap_or_default();
+            let async_pfx = if data.is_async { "async " } else { "" };
             format!(
-                "fn ({}){ret} {{\n{body}}}",
+                "{async_pfx}fn ({}){ret} {{\n{body}}}",
                 fmt_params(&data.params, data.variadic.as_deref())
             )
         }
@@ -626,6 +734,8 @@ fn fmt_atom(expr: &Expr) -> String {
         | Expr::Index { .. }
         | Expr::Member { .. }
         | Expr::New { .. }
+        | Expr::Super
+        | Expr::Await { .. }
         | Expr::Array(_)
         | Expr::Map(_)
         | Expr::StringLiteral(_)

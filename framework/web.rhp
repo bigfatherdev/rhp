@@ -1,0 +1,223 @@
+// RHP Web — framework web oficial (Fase Next-Gen 7).
+//
+// Camada sobre `http_serve`: roteamento, middlewares, req/res, seguranca,
+// templates e JSON. Sem dependencias externas.
+//
+// Uso (vendorizado via `rhp pkg`; ver `docs/WEB.md`):
+//   rhp pkg add rhp_web <caminho-do-repo>/framework/web.rhp
+//   import { web_get, web_json, web_despachar } from "pacotes/rhp_web/web.rhp";
+//   web_get("/", fn(req) { return web_text("RHP Web"); });
+//   fn handler(req) { return web_despachar(req); }
+//   http_serve(8080, "handler", {});
+//
+// Semantica:
+// - Rotas: metodo + padrao (`/users/:id`, `*` nao suportado em v1).
+// - Primeiro match vence (ordem de registro). Sem match = 404; metodo
+//   existente em outro padrao = 405 (com `Allow`).
+// - Middlewares globais (`web_use`) rodam antes da rota; qualquer um pode
+//   curto-circuitar devolvendo resposta (mapa/str). `null` = continua.
+// - Respostas: `str` (200 text/plain) ou mapa `{status?, cabecalhos?, corpo?}`.
+// - Seguranca: cabecalhos padrao, teto de payload (1 MiB), sem stack traces
+//   (o `http_serve` ja converte erro em 500 opaco).
+export let __web_routes = [];
+export let __web_middlewares = [];
+
+// --- Respostas --------------------------------------------------------
+export fn web_text(corpo) {
+  return {status: 200, cabecalhos: {"content-type": "text/plain; charset=utf-8"}, corpo: corpo};
+}
+
+export fn web_json(valor) {
+  return {status: 200, cabecalhos: {"content-type": "application/json; charset=utf-8"}, corpo: json_stringify(valor)};
+}
+
+export fn web_html(corpo) {
+  return {status: 200, cabecalhos: {"content-type": "text/html; charset=utf-8"}, corpo: corpo};
+}
+
+export fn web_redirect(destino) {
+  return {status: 302, cabecalhos: {location: destino}, corpo: ""};
+}
+
+export fn web_not_found() {
+  return {status: 404, cabecalhos: {"content-type": "text/plain; charset=utf-8"}, corpo: "nao encontrado"};
+}
+
+export fn web_erro(msg) {
+  return {status: 500, cabecalhos: {"content-type": "text/plain; charset=utf-8"}, corpo: msg};
+}
+
+// --- Rotas ------------------------------------------------------------
+fn web_registrar(metodo, padrao, handler) {
+  __web_routes = push(__web_routes, {metodo: metodo, padrao: padrao, handler: handler});
+  return null;
+}
+
+export fn web_get(padrao, handler) {
+  return web_registrar("GET", padrao, handler);
+}
+
+export fn web_post(padrao, handler) {
+  return web_registrar("POST", padrao, handler);
+}
+
+export fn web_put(padrao, handler) {
+  return web_registrar("PUT", padrao, handler);
+}
+
+export fn web_patch(padrao, handler) {
+  return web_registrar("PATCH", padrao, handler);
+}
+
+export fn web_delete(padrao, handler) {
+  return web_registrar("DELETE", padrao, handler);
+}
+
+export fn web_head(padrao, handler) {
+  return web_registrar("HEAD", padrao, handler);
+}
+
+export fn web_options(padrao, handler) {
+  return web_registrar("OPTIONS", padrao, handler);
+}
+
+export fn web_use(mw) {
+  __web_middlewares = push(__web_middlewares, mw);
+  return null;
+}
+
+// --- Casamento de rotas -----------------------------------------------
+// Padrao: `/users/:id` casa `/users/42` com params `{id: "42"}`.
+// Retorna mapa de params ou `null` (sem match).
+export fn web_casar(padrao, caminho) {
+  let segs_p = split(padrao, "/");
+  let segs_c = split(caminho, "/");
+  if len(segs_p) != len(segs_c) {
+    return null;
+  }
+  let params = {};
+  let i = 0;
+  while i < len(segs_p) {
+    let p = segs_p[i];
+    let c = segs_c[i];
+    if len(p) > 0 {
+      if starts_with(p, ":") {
+        let nome = split(p, ":")[1];
+        params[nome] = c;
+      } else {
+        if p != c {
+          return null;
+        }
+      }
+    } else {
+      if c != p {
+        return null;
+      }
+    }
+    i = i + 1;
+  }
+  return params;
+}
+
+// --- Seguranca --------------------------------------------------------
+export fn web_logger(req) {
+  echo req["metodo"] + " " + req["caminho"];
+  return null;
+}
+
+export fn web_seguranca(req) {
+  // Teto de payload: recusa corpos gigantes antes da rota.
+  let corpo = req["corpo"];
+  if corpo != null {
+    if len(corpo) > 1048576 {
+      return {status: 413, corpo: "payload muito grande"};
+    }
+  }
+  return null;
+}
+
+// --- Despacho (handler do `http_serve`) --------------------------------
+export fn web_despachar(req) {
+  // Middlewares globais.
+  let i = 0;
+  while i < len(__web_middlewares) {
+    let mw = __web_middlewares[i];
+    let r = mw(req);
+    if r != null {
+      return web_finalizar(r);
+    }
+    i = i + 1;
+  }
+  // Roteamento: primeiro match vence.
+  let metodo = req["metodo"];
+  let caminho = req["caminho"];
+  let permitir = [];
+  let j = 0;
+  while j < len(__web_routes) {
+    let rota = __web_routes[j];
+    let params = web_casar(rota["padrao"], caminho);
+    if params != null {
+      if rota["metodo"] == metodo {
+        // Enriquece a requisicao com params (copia por valor).
+        let req2 = merge(req, {params: params});
+        let handler = rota["handler"];
+        let resp = handler(req2);
+        return web_finalizar(resp);
+      } else {
+        permitir = push(permitir, rota["metodo"]);
+      }
+    }
+    j = j + 1;
+  }
+  if len(permitir) > 0 {
+    return {status: 405, cabecalhos: {allow: join(permitir, ", ")}, corpo: "metodo nao permitido"};
+  }
+  return web_not_found();
+}
+
+fn web_finalizar(resp) {
+  // Normaliza `str` para 200; completa cabecalhos de seguranca.
+  if type(resp) == "string" {
+    resp = web_text(resp);
+  }
+  let cab = resp["cabecalhos"];
+  if cab == null {
+    cab = {};
+  }
+  if !has(cab, "x-content-type-options") {
+    cab["x-content-type-options"] = "nosniff";
+  }
+  if !has(cab, "x-frame-options") {
+    cab["x-frame-options"] = "DENY";
+  }
+  resp["cabecalhos"] = cab;
+  return resp;
+}
+
+// --- Templates ----------------------------------------------------------
+// `web_render(texto, valores)`: interpola `{{chave}}` com escape HTML
+// (via `template()`); `web_layout(layout, slot, valores)`: injeta o corpo
+// renderizado em `{{conteudo}}` do layout.
+export fn web_render(texto, valores) {
+  return template(texto, valores);
+}
+
+export fn web_layout(layout, conteudo, valores) {
+  let corpo = template(conteudo, valores);
+  let todos = merge(valores, {conteudo: corpo});
+  // `conteudo` ja escapado acima; o layout escapa de novo — para HTML real,
+  // monte o layout com `template()` em duas etapas no app. v1: simples.
+  return template(layout, todos);
+}
+// --- Servidor ------------------------------------------------------------
+// O `http_serve` exige o NOME de uma `fn` global do modulo de entrada
+// (nao-manglada). Como este framework vive em modulo importado (nomes
+// manglados), o app deve declarar seu proprio handler no entry:
+//
+//   import { web_despachar } from "../framework/web.rhp";
+//   fn handler(req) { return web_despachar(req); }
+//   http_serve(8080, "handler", {});
+//
+// Ou com opcoes (rate limiting etc.):
+//
+//   http_serve(8080, "handler", { max_conexoes: 128, limite_taxa: 100 });

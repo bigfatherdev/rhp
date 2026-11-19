@@ -1682,3 +1682,284 @@ fn rhp_run_all_examples_succeed() {
     }
     assert!(count >= 1, "nenhum exemplo encontrado em examples/");
 }
+
+// --- Next Generation (Fases 1-6) -------------------------------------------
+
+#[test]
+fn nextgen_heranca_basica_e_override() {
+    let output = run_temp_source(
+        "ng_heranca.rhp",
+        "class Animal {\n  fn novo(n) { this[\"nome\"] = n; }\n  fn falar() { return \"Som\"; }\n}\nclass Cachorro extends Animal {\n  fn falar() { return \"Au au\"; }\n}\nlet c = new Cachorro(\"Rex\");\necho c[\"nome\"];\necho c.falar();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"Rex\nAu au\n");
+}
+
+#[test]
+fn nextgen_heranca_rejeita_pai_desconhecido_e_ciclo() {
+    let output = run_temp_source(
+        "ng_pai.rhp",
+        "class B extends A { fn novo() { this[\"x\"] = 1; } }\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("desconhecida"), "obteve: {stderr}");
+    let output = run_temp_source(
+        "ng_ciclo.rhp",
+        "class A extends A { fn novo() { this[\"x\"] = 1; } }\n",
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn nextgen_super_chama_pai_com_writeback() {
+    let output = run_temp_source(
+        "ng_super.rhp",
+        "class Base {\n  fn novo() { this[\"n\"] = 1; }\n  fn inc() { this[\"n\"] = this[\"n\"] + 1; return this[\"n\"]; }\n}\nclass Filha extends Base {\n  fn novo() { this[\"n\"] = 10; }\n  fn inc2() { return super.inc() + 100; }\n}\nlet f = new Filha();\necho f.inc2();\necho f[\"n\"];\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"111\n11\n");
+}
+
+#[test]
+fn nextgen_interface_verificada_e_trait_composta() {
+    let output = run_temp_source(
+        "ng_iface.rhp",
+        "interface Logger { fn log(mensagem); }\nclass ConsoleLogger implements Logger {\n  fn novo() { this[\"x\"] = 0; }\n  fn log(m) { echo m; }\n}\nlet l = new ConsoleLogger();\nl.log(\"ola\");\ntrait T { fn ola() { return \"trait\"; } }\nclass P { use T; fn novo() { this[\"x\"] = 1; } }\nlet p = new P();\necho p.ola();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ola\ntrait\n");
+    // Interface nao implementada = erro de compilacao.
+    let output = run_temp_source(
+        "ng_iface_bad.rhp",
+        "interface L { fn log(m); }\nclass C implements L {\n  fn novo() { this[\"x\"] = 0; }\n}\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nao implementa"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_trait_conflito_exige_override() {
+    let output = run_temp_source(
+        "ng_trait_conf.rhp",
+        "trait A { fn m() { return 1; } }\ntrait B { fn m() { return 2; } }\nclass C { use A, B; fn novo() { this[\"x\"] = 0; } }\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conflito de trait"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_excecao_tipada_por_hierarquia() {
+    let output = run_temp_source(
+        "ng_catch.rhp",
+        "class ValidationException {\n  fn novo(m) { this[\"m\"] = m; }\n  fn message() { return this[\"m\"]; }\n}\nclass DatabaseException {\n  fn novo(m) { this[\"m\"] = m; }\n}\ntry {\n  throw new ValidationException(\"email invalido\");\n} catch ValidationException e {\n  echo e.message();\n} catch DatabaseException e {\n  echo \"banco\";\n}\ntry {\n  throw new DatabaseException(\"x\");\n} catch ValidationException e {\n  echo \"errado\";\n} catch DatabaseException e {\n  echo \"banco\";\n}\ntry {\n  echo json_parse(\"{oops}\");\n} catch e {\n  echo \"generico\";\n}\necho \"fim\";\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"email invalido\nbanco\ngenerico\nfim\n");
+}
+
+#[test]
+fn nextgen_generics_apagados() {
+    let output = run_temp_source(
+        "ng_gen.rhp",
+        "class Caixa<T> {\n  fn novo(v) { this[\"v\"] = v; }\n  fn obter() { return this[\"v\"]; }\n}\nlet c = new Caixa<int>(100);\necho c.obter();\nfn primeiro<T>(items) { return items[0]; }\necho primeiro<int>([7, 8]);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"100\n7\n");
+}
+
+#[test]
+fn nextgen_async_await_concorrente() {
+    let output = run_temp_source(
+        "ng_async.rhp",
+        "async fn buscarA() { sleep(0.2); return \"A\"; }\nasync fn buscarB() { return 42; }\nlet a = buscarA();\nlet b = buscarB();\necho await a;\necho await b;\necho \"fim\";\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"A\n42\nfim\n");
+}
+
+#[test]
+fn nextgen_extensao_nativa_demo() {
+    let output = run_temp_source(
+        "ng_ext.rhp",
+        "import native \"demo\";\necho demo_eco(\"RHP\");\necho demo_soma(20, 22);\necho demo_len([1, 2, 3]);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"RHP\n42\n3\n");
+    let output = run_temp_source("ng_ext_bad.rhp", "import native \"inexistente\";\n");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn nextgen_namespace_e_autoload() {
+    // Autoload: namespace -> diretorio relativo ao programa.
+    let dir = std::env::temp_dir().join(format!("rhp-test-ns-{}", std::process::id()));
+    let appdir = dir.join("App").join("Controllers");
+    std::fs::create_dir_all(&appdir).expect("mkdir");
+    std::fs::write(
+        appdir.join("UsuarioController.rhp"),
+        "class App\\Controllers\\UsuarioController {\n  fn novo() { this[\"x\"] = 1; }\n  fn index() { return \"Usuarios\"; }\n}\n",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("main.rhp"),
+        "import App\\Controllers\\UsuarioController;\nlet c = new App\\Controllers\\UsuarioController();\necho c.index();\n",
+    )
+    .expect("write");
+    let output = run_file(&dir.join("main.rhp"));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"Usuarios\n");
+    // Alias.
+    std::fs::write(
+        dir.join("main2.rhp"),
+        "import App\\Controllers\\UsuarioController as Ctrl;\nlet c = new Ctrl();\necho c.index();\n",
+    )
+    .expect("write");
+    let output = run_file(&dir.join("main2.rhp"));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"Usuarios\n");
+}
+
+#[test]
+fn nextgen_async_captura_ambiente() {
+    // Closure async captura local plano; irmaos nao interferem.
+    let output = run_temp_source(
+        "ng_async_cap.rhp",
+        "fn monta() {\n  let base = 40;\n  let f = async fn(x) { return base + x; };\n  let g = async fn(x) { return base * x; };\n  echo await f(2);\n  echo await g(2);\n}\nmonta();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"42\n80\n");
+}
+
+#[test]
+fn nextgen_async_enxerga_funcoes_e_classes() {
+    // Tarefa chama outra funcao de topo e usa classe definida no programa.
+    let output = run_temp_source(
+        "ng_async_code.rhp",
+        "fn dobra(x) { return x * 2; }\nclass Ponto {\n  fn novo(x) { this[\"x\"] = x; }\n  fn get() { return this[\"x\"]; }\n}\nasync fn cria(v) {\n  let p = new Ponto(v);\n  return dobra(p.get());\n}\necho await cria(21);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"42\n");
+}
+
+#[test]
+fn nextgen_async_rejeita_instancia() {
+    // Instancia nao atravessa (antes corrompia em mapa silencioso).
+    let output = run_temp_source(
+        "ng_async_inst.rhp",
+        "class Ponto {\n  fn novo(x) { this[\"x\"] = x; }\n}\nasync fn usa(p) { return 1; }\nlet p = new Ponto(1);\necho await usa(p);\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nao transporta instancia"),
+        "obteve: {stderr}"
+    );
+}
+
+#[test]
+fn nextgen_async_aninhado() {
+    // Tarefa gera outra tarefa (worker com programa-fonte).
+    let output = run_temp_source(
+        "ng_async_nest.rhp",
+        "async fn interna(x) { return x * 10; }\nasync fn externa(y) {\n  let h = interna(y);\n  return await h;\n}\necho await externa(4);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"40\n");
+}
+
+#[test]
+fn nextgen_framework_via_pkg() {
+    // RHP Web distribuido como pacote v0 (vendorizado em `pacotes/`).
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let dir = std::env::temp_dir().join(format!("rhp-test-pkgweb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("projdir");
+    let run = |args: &[&str]| {
+        std::process::Command::new(rhp_bin)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .expect("rhp pkg")
+    };
+    assert!(run(&["init"]).status.success());
+    let origem = workspace_root().join("framework");
+    let origem = origem.to_string_lossy().into_owned();
+    let out = run(&["pkg", "add", "rhp_web", origem.as_str()]);
+    assert!(
+        out.status.success(),
+        "pkg add falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.join("pacotes/rhp_web/web.rhp").is_file());
+    assert!(dir.join("rhp.lock").is_file());
+    let out = run(&["pkg", "install", "--check"]);
+    assert!(
+        out.status.success(),
+        "pkg install --check falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        dir.join("main.rhp"),
+        "import { web_get, web_json, web_despachar } from \"pacotes/rhp_web/web.rhp\";\nweb_get(\"/users/:id\", fn(req) { return web_json({ id: req[\"params\"][\"id\"] }); });\nfn handler(req) { return web_despachar(req); }\nlet req = {metodo: \"GET\", caminho: \"/users/7\", query: {}, cabecalhos: {}, cookies: {}, corpo: \"\"};\necho handler(req)[\"corpo\"];\n",
+    )
+    .expect("write main");
+    let output = run_file(&dir.join("main.rhp"));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"{\"id\":\"7\"}\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

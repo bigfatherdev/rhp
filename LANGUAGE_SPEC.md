@@ -1,4 +1,4 @@
-# LANGUAGE_SPEC.md — Especificacao da linguagem (Fases 3–6 implementadas)
+# LANGUAGE_SPEC.md — Especificacao da linguagem (Next Generation implementada)
 
 > Regra: descreve apenas o que foi implementado e validado. O restante esta
 > em "Nao especificado ainda".
@@ -398,9 +398,99 @@ Exemplos invalidos:
 - `import "a.rhp"; import "a.rhp";` com `a.rhp` importando de volta
   (erro: importacao circular).
 
-## 8. Nao especificado ainda
+## 8. Classes: heranca, interfaces, traits, `super` (Next Generation)
 
-Tipos/inferencia estatica, classes/interfaces/generics, `export`/privacidade
-de modulos, metodos, `async`/concorrencia, PostgreSQL/Redis (ver ADR 0004),
-formatter alem do canonico atual, LSP, otimizacoes (incluindo chamada em
-cauda), semantica alem da descrita aqui.
+- `class B extends A { ... }`: heranca simples (pai definido antes; senao
+  erro `classe pai ... desconhecida`). Metodos achatados (propria > trait >
+  pai). Auto-heranca e ciclos = erro.
+- `class C implements I, J { ... }`: cada metodo de `I`/`J` deve existir na
+  classe (proprio, trait ou herdado) com mesma aridade (`params` + `...rest`);
+  senao erro de compilacao (`nao implementa`).
+- `interface I { fn m(params); ... }`: so assinaturas (corpo = `;`).
+  `trait T { fn m() { ... } }`: metodos com corpo para `use`.
+- `use T1, T2;` no corpo da classe: composicao; conflito (mesmo metodo em
+  dois traits sem override na classe) = erro.
+- `super.metodo(args)`: metodo do pai com o `this` atual; write-back no
+  `this` do chamador. So em chamada de metodo dentro de metodo; fora = erro.
+  Pai ausente ou sem metodo = erro de runtime.
+- Exemplo valido e invalido: ver RFC 0021. `super` sozinho (sem `.m()`) =
+  erro de compilacao.
+
+## 9. Namespaces e autoload (Next Generation)
+
+- `namespace A\B;`: prefixo das definicoes seguintes do arquivo (multiplos =
+  ultimo vence). Definicoes qualificadas explicitas (`class A\B\C`) sao
+  recomendadas (sem ambiguidade).
+- Nomes com `\` sao globais (sem rename do linker; sem colisao entre
+  modulos). Referencias nao-qualificadas no mesmo namespace resolvem para a
+  forma qualificada se definida antes; senao, global.
+- `import A\B;` / `import A\B as C;`: autoload `A\B` -> `A/B.rhp` (relativo
+  ao importador, senao a raiz; confinado a arvore; ciclo = erro). Sem alias =
+  nome global usavel; com alias = `let C = A\B;` local.
+- `trait`/`interface`/`class` com `\` seguem as mesmas regras.
+
+## 10. Async/await (Next Generation)
+
+- `async fn nome(params) { ... }` e `async fn (params) { ... }` (closure):
+  a chamada gera tarefa (thread isolada, programa recompilado) e devolve
+  handle `Int` imediatamente (compativel com `async_join`).
+- `await expr`: handle valido = bloqueia ate concluir (erros propagam);
+  outro valor = identidade.
+- Fronteira da tarefa (item 1): args posicionais planos; captura por nome
+  transporta so valores planos (`null/bool/int/float/string/array/mapa`;
+  resto fica indisponivel). Codigo compartilhado: o worker executa as
+  definicoes de topo (funcoes, classes, `import native`) e resolve a
+  definicao exata — tarefas chamam outras funcoes, usam classes e aninham
+  `async`. Estado nao compartilhado: globais mutaveis nao atravessam.
+- Restricoes (erro claro): async com `this` (metodo), geradores async,
+  nomeados/spread em chamada mista async, instancia/funcao/classe/gerador
+  como argumento.
+- `async_spawn`/`async_join` legados intactos e interoperaveis com `await`.
+
+## 11. Excecoes tipadas (Next Generation)
+
+- `try B (catch [Tipo] [var] C)* (finally F)?`: multiplos `catch` em ordem;
+  primeiro match vence. Formas: `catch { }`, `catch e` (var, tudo),
+  `catch Tipo` (tipo sem var), `catch Tipo var`.
+- `Tipo` maiusculo = classe (cadeia `parent`); minusculo apos `catch` = var
+  legada. `catch` sem tipo captura tudo e deve ser o ultimo (senao erro).
+- Sem match no ultimo tipado = propaga (`Rethrow` apos `finally`).
+  `finally` sempre executa (normal, `catch`, propagacao).
+
+## 12. Generics por apagamento (Next Generation)
+
+- `class Caixa<T>`, `fn f<T>(x: T)`, `new Caixa<int>(...)`, `f<int>(...)`:
+  parse valida forma (duplicatas = erro); tudo apagado (sem checagem, sem
+  custo). `T` em anotacao = sem checagem.
+- `<` binario preservado: so e lista de tipos se houver `< T (, T)* > (`
+  adiante; senao e comparacao (ex.: `i < n` em `for` segue funcionando).
+
+## 13. Extensoes nativas (Next Generation)
+
+- `import native "ext";`: carrega extensao estatica (sem `.so`; sem
+  `unsafe`); funcoes viram globais. ABI `RHP_EXTENSION_ABI = 1`;
+  incompatibilidade, extensao desconhecida, dupla carga e colisao com global
+  = erro (capturavel por `try` no caso de runtime).
+- Fronteira: so `Null/Bool/Int/Float/Str/Array/Map` (outros = erro claro).
+  Erros da extensao viram erro RHP. Exemplo: `demo` (`demo_eco`, `demo_soma`,
+  `demo_len`). Ver `crates/rhp-vm/src/extensions.rs` e RFC 0026.
+
+## 14. Framework web (Next Generation)
+
+- `framework/web.rhp`: rotas (`web_get/post/put/patch/delete/head/options`),
+  params `:id` (`req["params"]`), middlewares (`web_use`, `null` continua),
+  respostas (`web_json/text/html/redirect`, mapa `{status, cabecalhos,
+  corpo}`), 404/405 (`allow`), seguranca (`nosniff`, `DENY`, teto 1 MiB),
+  templates (`web_render`, `web_layout` via `template()`).
+- O app declara `fn handler(req) { return web_despachar(req); }` no entry e
+  chama `http_serve(porta, "handler", opts)`. Topo do programa executa por
+  request no worker (idempotente); `http_serve(...)` e filtrado no worker.
+- Ver RFC 0027, `framework/web.rhp`, `framework/exemplo_api.rhp`, `docs/WEB.md`.
+
+## 15. Nao especificado ainda
+
+- Tipos/inferencia estatica, metodos `private`/estaticos, heranca multipla,
+  traits com campos, bounds de generics (`T: X`), monomorfizacao,
+  `select`/`cancel`/`timeout` async, thread-pool, `dlopen` dinamico, ORM,
+  sessoes, websockets, otimizacoes (incluindo chamada em cauda), semantica
+  alem da descrita aqui.

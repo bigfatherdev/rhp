@@ -1,4 +1,4 @@
-# VM_SPEC.md — Maquina virtual (Fases 3–6 implementadas)
+# VM_SPEC.md — Maquina virtual (Next Generation)
 
 ## 1. Arquitetura
 
@@ -62,7 +62,21 @@
   `` `return` fora de funcao ``, `indice 5 fora do intervalo (tamanho 2)`,
   `chave inexistente no mapa: k`, `` `http_get` retornou status 404 ``.
 
-## 4. Nao especificado ainda
+## 4. Next Generation (comportamento normativo adicional)
+
+- Heranca: `ClassDef.parent`; metodos achatados; `CallSuper` com
+  `pending_super` (write-back no `this` do chamador).
+- Excecoes tipadas: `IsInstanceOf` via cadeia `parent` (limite 256);
+  cadeia de `catch` com primeiro match; `catch` sem tipo por ultimo.
+- Async: `FuncDef.is_async` gera tarefa em `Call`/`CallMixed` (args JSON,
+  thread isolada); `Await` junta ou identidade; `async_spawn`/`async_join`
+  interoperam.
+- Extensoes: `LoadNative` + `FuncDef.native_id` (execucao sincrona Rust,
+  fronteira validada, erros capturaveis).
+- `http_serve` (worker): executa todo o topo por request exceto a chamada
+  `http_serve` (estado reconstruido; topo deve ser idempotente).
+
+## 5. Nao especificado ainda
 
 Limites de operandos, chamada em cauda, closures, excecoes, GC,
 threads/async, debug/introspeccao, formato serializado, compatibilidade

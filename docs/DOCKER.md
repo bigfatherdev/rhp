@@ -12,7 +12,7 @@ docker pull bigfatherdev/rhp:latest
 Versão fixada (recomendado para produção):
 
 ```bash
-docker pull bigfatherdev/rhp:0.3.0
+docker pull bigfatherdev/rhp:0.4.0
 ```
 
 ## Executar
@@ -21,7 +21,7 @@ docker pull bigfatherdev/rhp:0.3.0
 
 ```bash
 docker run --rm bigfatherdev/rhp:latest --version
-# rhp 0.3.0
+# rhp 0.4.0
 ```
 
 Programa local (monte o diretório como volume; o `WORKDIR` é `/work`):
@@ -53,12 +53,14 @@ Arquivos criados via volume pertencem ao UID 10001 no host (use
 | Tag | Significado |
 |---|---|
 | `latest` | `main` atual (sempre com CI verde) |
-| `0.3.0` | Release exata (imutavel) |
+| `0.4.0` | Release exata (imutavel) |
+| `0.3.0` | Release anterior (imutavel) |
+| `0.4` | Ultimo `0.4.x` |
 | `0.3` | Ultimo `0.3.x` |
 | `0` | Ultimo `0.x` |
 
 Tags `X.Y.Z`/`X.Y`/`X` sao geradas automaticamente da tag git
-(`v0.3.0` => `0.3.0`, `0.3`, `0`); `latest` acompanha a `main`.
+(`v0.4.0` => `0.4.0`, `0.4`, `0`); `latest` acompanha a `main`.
 Quando sair a `1.0.0` real, `1.0.0`/`1.0`/`1` passam a existir sem
 mudar o pipeline.
 
@@ -68,14 +70,14 @@ mudar o pipeline.
    `crates/*/Cargo.toml` (mantidos sincronizados).
 2. Crie e envie a tag (o `v` inicial e removido nas tags Docker):
    ```bash
-   git tag v0.3.0 && git push origin v0.3.0
+   git tag v0.4.0 && git push origin v0.4.0
    ```
 3. O workflow `docker-publish` (gatilho: tags `v*`): roda fmt + clippy +
    testes (com Postgres de servico), depois build amd64+arm64 e push
-   (`0.3.0`, `0.3`, `0`; conferir no Docker Hub).
+   (`0.4.0`, `0.4`, `0`; conferir no Docker Hub).
 
 > `latest` acompanha a `main` (qualquer push nela republica `latest`,
-> sempre com CI verde). Versoes fixadas (`0.3.0` etc.) so mudam com a
+> sempre com CI verde). Versoes fixadas (`0.4.0` etc.) so mudam com a
 > tag correspondente — use-as em producao.
 
 ## Secrets do GitHub (obrigatorio, manual)

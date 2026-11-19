@@ -59,6 +59,10 @@ pub struct Frame {
     /// Metodo em voo (`var.metodo()`; RFC 0017): nome da variavel para
     /// write-back do `this` final. Vive no frame DO METODO.
     pub pending_method: Option<String>,
+    /// `super.metodo()` em voo (Fase Next-Gen 1): write-back do `this`
+    /// final no `this` do chamador (escopo de ativacao). Vive no frame DO
+    /// METODO DO PAI.
+    pub pending_super: bool,
     /// Gerador em voo (RFC 0018): de quem e este resume; o `Yield`/`Return`
     /// do frame salva/marca o gerador e devolve o valor ao chamador.
     /// Vive no frame DO GERADOR (morre com ele no unwind, sem stale).
@@ -134,9 +138,12 @@ pub struct Handler {
 /// Definicao de classe compilada (RFC 0017, Etapa 5): nome + tabela de
 /// metodos (cada um um `FuncValue` com ambiente capturado na definicao;
 /// `this` e vinculado na chamada).
+/// Fase Next-Gen 1: `parent` guarda o nome da classe pai (para `super` e
+/// captura tipada); os metodos ja vao achatados (herdados + proprios).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassDef {
     pub name: String,
+    pub parent: Option<String>,
     pub methods: HashMap<String, FuncValue>,
 }
 
@@ -223,6 +230,12 @@ pub struct FuncDef {
     /// `true` se o corpo contem `yield` (funcao geradora; RFC 0018).
     /// Chamar NAO executa: devolve `Value::Generator` lazy.
     pub is_generator: bool,
+    /// `true` se `async fn` (Fase Next-Gen 3): a chamada gera tarefa
+    /// (nao bloqueia o chamador; `await` junta o resultado).
+    pub is_async: bool,
+    /// Nativa (Fase Next-Gen 6): `Some("ext::func")` executa Rust em vez de
+    /// bytecode (sem frame; chamada sincrona com os mesmos erros). `None` = RHP.
+    pub native_id: Option<String>,
     pub body: Rc<Chunk>,
 }
 
@@ -612,6 +625,21 @@ pub enum Op {
     /// Constroi classe (`BuildClass(nome_idx, n)`): desempilha `n` pares
     /// `[nome(Str), metodo(Func)]` e empilha `Value::Class` (RFC 0017).
     BuildClass(u32, u32),
+    /// Constroi classe com heranca (`BuildClassEx(nome, pai, n)`; Fase
+    /// Next-Gen 1): como `BuildClass`, mas herda os metodos do pai (a VM
+    /// busca o pai nas globais; erro se inexistente ou nao-classe) e guarda
+    /// o nome do pai para `super` e captura tipada. Metodos proprios
+    /// sobrescrevem os herdados.
+    BuildClassEx(u32, u32, u32),
+    /// Checa instancia contra classe (`IsInstanceOf(nome_idx)`; Fase
+    /// Next-Gen 4): desempilha o valor e empilha `Bool` (`true` se for
+    /// instancia da classe ou de subclasse via cadeia `parent`).
+    IsInstanceOf(u32),
+    /// Suspende ate a tarefa concluir (`Await`; Fase Next-Gen 3):
+    /// desempilha o valor; se for handle de tarefa (`Int` valido), bloqueia
+    /// ate o fim e empilha o retorno (erros propagam); senao, empilha o
+    /// proprio valor (identidade para nao-tarefas).
+    Await,
     /// Instancia (`NewMixed(desc_idx)`, como `CallMixed`): desempilha os
     /// valores + a classe, ativa `novo` com `this` e entrega a
     /// instancia (retorno do construtor ignorado; RFC 0017).
@@ -620,6 +648,16 @@ pub enum Op {
     /// RFC 0017): como `Index` + chamada, mas com write-back do `this`
     /// final na variavel (mutacoes via `obj.metodo()` persistem).
     CallMethod(u32, u32, u32),
+    /// Chamada de metodo do pai (`CallSuper(campo, desc)`; Fase Next-Gen 1):
+    /// como `CallMethod`, mas o `this` e o da ativacao atual e o metodo vem
+    /// da classe pai (erro se sem pai ou sem metodo). O `this` final volta
+    /// ao escopo (write-back local, coerente com metodos normais).
+    CallSuper(u32, u32),
+    /// Carrega extensao nativa (`LoadNative(nome_idx)`; Fase Next-Gen 6):
+    /// registra as funcoes da extensao como globais (erro se inexistente
+    /// ou ABI incompativel). Idempotente por extensao (segunda carga = erro
+    /// claro para evitar sombra silenciosa).
+    LoadNative(u32),
     /// Suspender gerador (`Yield`; RFC 0018): desempilha o valor e o
     /// entrega ao retomador, guardando o frame para continuar depois.
     Yield,
@@ -883,6 +921,24 @@ impl Chunk {
                         "chunk invalido em `{context}`: nome {name_idx} fora do pool"
                     )));
                 }
+                Op::BuildClassEx(name_idx, parent_idx, _)
+                    if (name_idx as usize) >= self.names.len()
+                        || (parent_idx as usize) >= self.names.len() =>
+                {
+                    return Err(CompileError::new(format!(
+                        "chunk invalido em `{context}`: nome fora do pool em BuildClassEx"
+                    )));
+                }
+                Op::IsInstanceOf(name_idx) if (name_idx as usize) >= self.names.len() => {
+                    return Err(CompileError::new(format!(
+                        "chunk invalido em `{context}`: nome {name_idx} fora do pool"
+                    )));
+                }
+                Op::LoadNative(name_idx) if (name_idx as usize) >= self.names.len() => {
+                    return Err(CompileError::new(format!(
+                        "chunk invalido em `{context}`: nome {name_idx} fora do pool"
+                    )));
+                }
                 Op::DefineFunc(idx) | Op::MakeFunc(idx) if (idx as usize) >= self.funcs.len() => {
                     return Err(CompileError::new(format!(
                         "chunk invalido em `{context}`: funcao {idx} inexistente"
@@ -917,6 +973,17 @@ impl Chunk {
                         _ => {
                             return Err(CompileError::new(format!(
                                 "chunk invalido em `{context}`: campo de metodo {field_idx} invalido"
+                            )));
+                        }
+                    }
+                    call_mixed_slots(&self.constants, desc, context)?;
+                }
+                Op::CallSuper(field_idx, desc) => {
+                    match self.constants.get(field_idx as usize) {
+                        Some(Value::Str(_)) => {}
+                        _ => {
+                            return Err(CompileError::new(format!(
+                                "chunk invalido em `{context}`: campo de super {field_idx} invalido"
                             )));
                         }
                     }
@@ -1083,6 +1150,25 @@ fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(
                 check_depth(height, pairs * 2, op, context)?;
                 (height - pairs * 2 + 1, Some(vec![ip + 1]))
             }
+            Op::BuildClassEx(_, _, count) => {
+                let pairs = count as i64;
+                check_depth(height, pairs * 2, op, context)?;
+                (height - pairs * 2 + 1, Some(vec![ip + 1]))
+            }
+            Op::IsInstanceOf(_) => {
+                check_depth(height, 1, op, context)?;
+                (height, Some(vec![ip + 1]))
+            }
+            Op::LoadNative(_) => (height, Some(vec![ip + 1])),
+            Op::Await => {
+                check_depth(height, 1, op, context)?;
+                (height, Some(vec![ip + 1]))
+            }
+            Op::CallSuper(_, desc) => {
+                let slots = call_mixed_slots(constants, desc, context)? as i64;
+                check_depth(height, slots, op, context)?;
+                (height - slots + 1, Some(vec![ip + 1]))
+            }
             Op::CallBuiltin(id) => {
                 // `validate_shallow` ja rejeitou ids desconhecidos.
                 // Builtins nao recebem callee: desempilha so os argumentos.
@@ -1197,6 +1283,53 @@ struct Compiler {
     emitting_finally: u32,
     /// Contador de lacos `for` (nomes ocultos unicos por laco).
     for_counter: u32,
+    /// Sequencia de closures anonimas (`{closure:N}`; item 1): nomes unicos
+    /// e deterministicos (ordem de travessia), para resolucao precisa de
+    /// tarefas async no worker (antes, todas chamavam-se `{closure}`).
+    closure_seq: u32,
+    /// Namespace atual (`namespace A\B;`; Fase Next-Gen 2): prefixo aplicado
+    /// as definicoes seguintes no mesmo arquivo.
+    current_namespace: Option<String>,
+    /// Classes ja definidas (nome => info): para heranca/interfaces/traits
+    /// (Fase Next-Gen 1). Metodos achatados nao ficam aqui (viva no chunk);
+    /// guardamos assinaturas para checagem de `implements` e aridade.
+    classes: std::collections::HashMap<String, ClassInfo>,
+    /// Interfaces (nome => metodos): so assinaturas (Fase Next-Gen 1).
+    interfaces: std::collections::HashMap<String, Vec<SigInfo>>,
+    /// Traits (nome => metodos com corpo): para composicao `use` (Fase Next-Gen 1).
+    traits: std::collections::HashMap<String, Vec<TraitMethodInfo>>,
+}
+
+/// Assinatura de metodo para checagem de interface (nome + aridade).
+#[derive(Debug, Clone)]
+struct SigInfo {
+    name: String,
+    params: usize,
+    variadic: bool,
+}
+
+/// Metodo de trait guardado para composicao (assinatura + indice da funcao).
+#[derive(Debug, Clone)]
+struct TraitMethodInfo {
+    name: String,
+    params: usize,
+    variadic: bool,
+    func_idx: u32,
+}
+
+/// Info de classe para heranca (Fase Next-Gen 1).
+#[derive(Debug, Clone)]
+struct ClassInfo {
+    parent: Option<String>,
+    methods: std::collections::HashMap<String, SigInfoEx>,
+}
+
+/// Assinatura estendida (com indice da funcao para heranca/traits).
+#[derive(Debug, Clone)]
+struct SigInfoEx {
+    params: usize,
+    variadic: bool,
+    func_idx: u32,
 }
 
 /// Contexto de um `try` em compilacao (para `break`/`continue`/`return`
@@ -1412,6 +1545,22 @@ impl Compiler {
             pending_trys: Vec::new(),
             emitting_finally: 0,
             for_counter: 0,
+            closure_seq: 0,
+            current_namespace: None,
+            classes: std::collections::HashMap::new(),
+            interfaces: std::collections::HashMap::new(),
+            traits: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Aplica o namespace atual ao nome (se nao-qualificado e namespace ativo).
+    fn qualify(&self, name: &str) -> String {
+        if name.contains('\\') {
+            return name.to_string();
+        }
+        match self.current_namespace.as_ref() {
+            Some(ns) => format!("{ns}\\{name}"),
+            None => name.to_string(),
         }
     }
 
@@ -1525,6 +1674,7 @@ impl Compiler {
         variadic: Option<&str>,
         return_ann: Option<TypeTag>,
         body: &[StmtNode],
+        is_async: bool,
     ) -> Result<u32, CompileError> {
         let mut seen = std::collections::HashSet::new();
         let mut names = Vec::with_capacity(params.len());
@@ -1547,7 +1697,16 @@ impl Compiler {
             }
         }
         let mut fn_compiler = Compiler::new(true);
+        // Herda contexto de namespaces e tipos (Fase Next-Gen): metodos e
+        // closures enxergam as mesmas classes/interfaces/traits. A sequencia
+        // de closures e compartilhada (ida e volta) para nomes deterministicos.
+        fn_compiler.current_namespace = self.current_namespace.clone();
+        fn_compiler.classes = self.classes.clone();
+        fn_compiler.interfaces = self.interfaces.clone();
+        fn_compiler.traits = self.traits.clone();
+        fn_compiler.closure_seq = self.closure_seq;
         fn_compiler.compile_stmts(body)?;
+        self.closure_seq = fn_compiler.closure_seq;
         let null_idx = fn_compiler.add_constant(Value::Null)?;
         fn_compiler.emit(Op::Constant(null_idx));
         fn_compiler.emit(Op::Return);
@@ -1566,6 +1725,8 @@ impl Compiler {
             param_types,
             return_type: return_ann,
             is_generator,
+            is_async,
+            native_id: None,
             body: Rc::new(body_chunk),
         }));
         Ok((self.chunk.funcs.len() - 1) as u32)
@@ -1585,6 +1746,15 @@ impl Compiler {
         let id = self.for_counter;
         self.for_counter += 1;
         format!("\0tmp:{what}:{id}")
+    }
+
+    /// Nome de closure anonima (`{closure:N}`; item 1): unico por programa e
+    /// deterministico (ordem de travessia, com ida-e-volta em corpos
+    /// aninhados), para o worker async resolver a definicao exata pelo nome.
+    fn fresh_closure_name(&mut self) -> String {
+        let id = self.closure_seq;
+        self.closure_seq += 1;
+        format!("{{closure:{id}}}")
     }
 
     /// Compila `for VAR in ITER BLOCO`.
@@ -1803,19 +1973,13 @@ impl Compiler {
         Ok(())
     }
 
-    /// Compila `try B (catch V? C)? (finally F)?` (RFC 0001).
-    ///
-    /// Desenho: `TryBegin->alvo` + escopo + corpo; `TryEnd` + `finally`
-    /// (caminho normal); `catch`: vinculo do erro + corpo + `finally`;
-    /// sem `catch`: `finally` + `Rethrow`. `finally` e duplicado por
-    /// caminho (codigo neutro na pilha; validador aprova cada copia).
-    /// `break`/`continue`/`return` dentro do corpo fecham handler e rodam
-    /// `finally` via `emit_abrupt_exits` (braco respectivo).
-    fn compile_try(
+    /// `try` com multiplos `catch` tipados (Fase Next-Gen 4).
+    /// Sem tipo = captura tudo (legado). Com tipo = `IsInstanceOf` + salto.
+    /// Ordem: primeiro match vence; `finally` sempre respeitado.
+    fn compile_try_multi(
         &mut self,
         body: &[StmtNode],
-        catch_var: &Option<String>,
-        catch_body: &Option<Vec<StmtNode>>,
+        catches: &[rhp_parser::CatchClause],
         finally_body: &Option<Vec<StmtNode>>,
     ) -> Result<(), CompileError> {
         let handler_jump = self.emit(Op::TryBegin(u32::MAX));
@@ -1839,35 +2003,420 @@ impl Compiler {
         let end_jump = self.emit(Op::Jump(u32::MAX));
         let handler_target = self.chunk.code.len() as u32;
         self.patch_jump(handler_jump, handler_target);
-        if let Some(cbody) = catch_body {
-            self.emit_scope_open();
-            match catch_var {
-                Some(name) => {
-                    let name_idx = self.intern_name(name)?;
-                    self.emit(Op::DeclareName(name_idx));
-                }
-                None => {
-                    self.emit(Op::Pop);
-                }
-            }
-            let saved_catch = self.scopes.clone();
-            self.compile_stmts(cbody)?;
-            self.scopes = saved_catch;
-            if let Some(fin) = finally_body {
-                self.emit_finally_copy(fin)?;
-            }
-            self.emit_scope_close()?;
-        } else {
-            // Sem `catch`: `finally` roda e o erro segue propagando.
-            // A pilha aqui tem exatamente o valor do erro (altura 1).
+        if catches.is_empty() {
             if let Some(fin) = finally_body {
                 self.emit_finally_copy(fin)?;
             }
             self.emit(Op::Rethrow);
+        } else {
+            // Cadeia de catches: cada um testa (se tipado) e consome ou repassa.
+            let mut next_jumps: Vec<usize> = Vec::new();
+            for (i, catch) in catches.iter().enumerate() {
+                let is_last = i + 1 == catches.len();
+                // Pilha aqui: [erro]. Cada catch nao-final deixa [erro] para o proximo.
+                if let Some(tname) = catch.type_name.as_ref() {
+                    let qtype = self.resolve_type_name(tname);
+                    self.emit(Op::Dup);
+                    let type_idx = self.intern_name(&qtype)?;
+                    self.emit(Op::IsInstanceOf(type_idx));
+                    let to_next = self.emit(Op::JumpIfFalse(u32::MAX));
+                    // Match: consome a copia? Dup+IsInstanceOf consumiu uma copia
+                    // e empilhou Bool; JumpIfFalse desempilhou o Bool. Resta [erro].
+                    // Vincula var ou dispensa e executa o corpo.
+                    self.emit_catch_body(catch, finally_body)?;
+                    let to_end = self.emit(Op::Jump(u32::MAX));
+                    let next_target = self.chunk.code.len() as u32;
+                    self.patch_jump(to_next, next_target);
+                    // Nao-match: [erro] permanece para o proximo catch.
+                    // Se for o ultimo e nao casou, repassa (rethrow).
+                    if is_last {
+                        // [erro] -> finally + rethrow.
+                        if let Some(fin) = finally_body {
+                            // `finally` em caminho de erro: precisa do valor?
+                            // `emit_finally_copy` nao toca na pilha de operandos
+                            // (neutra); o [erro] segue abaixo dela.
+                            self.emit_finally_copy(fin)?;
+                        }
+                        self.emit(Op::Rethrow);
+                    }
+                    // Remenda o salto do corpo para o fim (apos toda a cadeia).
+                    next_jumps.push(to_end);
+                } else {
+                    // Sem tipo: captura tudo (legado). Consome [erro].
+                    self.emit_catch_body(catch, finally_body)?;
+                    let to_end = self.emit(Op::Jump(u32::MAX));
+                    next_jumps.push(to_end);
+                    // Catches apos um catch sem tipo sao inalancaveis: erro claro.
+                    if !is_last {
+                        return Err(CompileError::new(
+                            "`catch` sem tipo deve ser o ultimo (ele captura tudo)".to_string(),
+                        ));
+                    }
+                }
+            }
+            let end_target = self.chunk.code.len() as u32;
+            for pos in next_jumps {
+                self.patch_jump(pos, end_target);
+            }
         }
         let end_target = self.chunk.code.len() as u32;
         self.patch_jump(end_jump, end_target);
         self.pending_trys.pop();
+        Ok(())
+    }
+
+    /// Corpo de um `catch` (vinculo + stmts + finally + fechamento).
+    fn emit_catch_body(
+        &mut self,
+        catch: &rhp_parser::CatchClause,
+        finally_body: &Option<Vec<StmtNode>>,
+    ) -> Result<(), CompileError> {
+        self.emit_scope_open();
+        match catch.var.as_ref() {
+            Some(name) => {
+                let name_idx = self.intern_name(name)?;
+                self.emit(Op::DeclareName(name_idx));
+            }
+            None => {
+                self.emit(Op::Pop);
+            }
+        }
+        let saved_catch = self.scopes.clone();
+        self.compile_stmts(&catch.body)?;
+        self.scopes = saved_catch;
+        if let Some(fin) = finally_body {
+            self.emit_finally_copy(fin)?;
+        }
+        self.emit_scope_close()?;
+        Ok(())
+    }
+
+    /// Resolve nome de tipo para forma qualificada (namespace atual).
+    fn resolve_type_name(&self, name: &str) -> String {
+        self.qualify(name)
+    }
+
+    /// Resolve nome de valor (variavel/funcao/classe) para forma qualificada.
+    /// Se nao-qualificado, namespace ativo e a forma qualificada ja foi
+    /// definida antes neste chunk, usa a qualificada; senao mantem.
+    fn resolve_name(&self, name: &str) -> String {
+        if name.contains('\\') {
+            return name.to_string();
+        }
+        if builtin_by_name(name).is_some() {
+            return name.to_string();
+        }
+        if let Some(ns) = self.current_namespace.as_ref() {
+            let q = format!("{ns}\\{name}");
+            if self.classes.contains_key(&q)
+                || self.interfaces.contains_key(&q)
+                || self.traits.contains_key(&q)
+            {
+                return q;
+            }
+            // Funcoes definidas? Rastreamos via `names`? `names` tem todas as
+            // globais, inclusive qualificadas. Se `q` ja foi internado, e forte
+            // indicio de que a definicao prefixada veio antes.
+            if self.names.contains_key(&q) {
+                return q;
+            }
+        }
+        name.to_string()
+    }
+
+    /// `class Nome<T> extends Pai implements I... { use T...; fn ... }`.
+    /// Precedencia: propria > trait > pai. Valida interfaces e conflitos.
+    fn compile_class(
+        &mut self,
+        name: &str,
+        parent: &Option<String>,
+        interfaces: &[String],
+        uses: &[String],
+        generic_params: &[String],
+        methods: &[rhp_parser::ClassMethod],
+    ) -> Result<(), CompileError> {
+        let qname = self.qualify(name);
+        // Generics: apagamento (Fase Next-Gen 5); duplicata ja checada no parse.
+        let _ = generic_params.len();
+        // Pai: deve existir (definido antes) e nao formar ciclo.
+        let qparent: Option<String> = match parent.as_ref() {
+            Some(p) => {
+                let qp = self.qualify(p);
+                if qp == qname {
+                    return Err(CompileError::new(format!(
+                        "classe `{qname}` nao pode herdar de si mesma"
+                    )));
+                }
+                let pinfo = self.classes.get(&qp).ok_or_else(|| {
+                    CompileError::new(format!(
+                        "classe pai `{qp}` desconhecida (defina antes de `{qname}`)"
+                    ))
+                })?;
+                // Ciclo A->B->A: como o pai deve existir antes, basta checar se
+                // o pai (transitivamente) ja e o filho (impossivel sem forward,
+                // mas checa a cadeia por seguranca).
+                let mut chain = pinfo.parent.clone();
+                while let Some(cur) = chain {
+                    if cur == qname {
+                        return Err(CompileError::new(format!(
+                            "hierarquia circular envolvendo `{qname}`"
+                        )));
+                    }
+                    chain = self.classes.get(&cur).and_then(|i| i.parent.clone());
+                }
+                Some(qp)
+            }
+            None => None,
+        };
+        // Metodos proprios: compila corpos, detecta duplicata (parse ja fez).
+        let mut own: std::collections::HashMap<String, (u32, usize, bool)> =
+            std::collections::HashMap::new();
+        for method in methods {
+            let func_idx = self.compile_func_body(
+                &format!("{qname}::{}", method.name),
+                &method.params,
+                method.variadic.as_deref(),
+                method.return_ann,
+                &method.body,
+                false,
+            )?;
+            if own
+                .insert(
+                    method.name.clone(),
+                    (func_idx, method.params.len(), method.variadic.is_some()),
+                )
+                .is_some()
+            {
+                return Err(CompileError::new(format!(
+                    "metodo duplicado `{}` na classe `{qname}`",
+                    method.name
+                )));
+            }
+        }
+        // Traits: `use` compoe; conflito trait-trait sem override = erro.
+        let mut from_traits: std::collections::HashMap<String, (u32, usize, bool, String)> =
+            std::collections::HashMap::new();
+        for tname in uses {
+            let qt = self.qualify(tname);
+            let tmethods = self.traits.get(&qt).cloned().ok_or_else(|| {
+                CompileError::new(format!(
+                    "trait `{qt}` desconhecido (defina antes de `{qname}`)"
+                ))
+            })?;
+            for tm in tmethods {
+                if own.contains_key(&tm.name) {
+                    continue; // propria vence trait.
+                }
+                if let Some((_, _, _, other)) = from_traits.get(&tm.name) {
+                    if other != &qt {
+                        return Err(CompileError::new(format!(
+                            "conflito de trait: metodo `{}` vem de `{}` e `{}` (resolva com override em `{qname}`)",
+                            tm.name, other, qt
+                        )));
+                    }
+                    continue;
+                }
+                from_traits.insert(
+                    tm.name.clone(),
+                    (tm.func_idx, tm.params, tm.variadic, qt.clone()),
+                );
+            }
+        }
+        // Pai: herda metodos nao-sobrescritos (propria > trait > pai).
+        let mut inherited: Vec<(String, u32)> = Vec::new();
+        if let Some(qp) = qparent.as_ref() {
+            let pinfo = self.classes.get(qp).expect("pai verificado");
+            for (mname, sig) in pinfo.methods.iter() {
+                if own.contains_key(mname) || from_traits.contains_key(mname) {
+                    continue;
+                }
+                inherited.push((mname.clone(), sig.func_idx));
+            }
+        }
+        // Interfaces: todos os metodos exigidos devem existir (proprio/trait/pai)
+        // com aridade compativel.
+        for iname in interfaces {
+            let qi = self.qualify(iname);
+            let sigs = self.interfaces.get(&qi).cloned().ok_or_else(|| {
+                CompileError::new(format!(
+                    "interface `{qi}` desconhecida (defina antes de `{qname}`)"
+                ))
+            })?;
+            for sig in sigs {
+                let found = own
+                    .get(&sig.name)
+                    .map(|(_, p, v)| (*p, *v))
+                    .or_else(|| from_traits.get(&sig.name).map(|(_, p, v, _)| (*p, *v)))
+                    .or_else(|| {
+                        qparent.as_ref().and_then(|qp| {
+                            self.classes
+                                .get(qp)
+                                .and_then(|pi| pi.methods.get(&sig.name))
+                                .map(|s| (s.params, s.variadic))
+                        })
+                    });
+                match found {
+                    Some((p, v)) => {
+                        if p != sig.params || v != sig.variadic {
+                            return Err(CompileError::new(format!(
+                                "classe `{qname}` nao implementa `{qi}::{}` com aridade compativel",
+                                sig.name
+                            )));
+                        }
+                    }
+                    None => {
+                        return Err(CompileError::new(format!(
+                            "classe `{qname}` nao implementa metodo `{}` de `{qi}`",
+                            sig.name
+                        )));
+                    }
+                }
+            }
+        }
+        // Emite: herdados (pai) + traits + proprios. Ordem irrelevante (mapa).
+        let mut total = 0u32;
+        for (mname, fidx) in &inherited {
+            let midx = self.add_constant(Value::Str(mname.clone()))?;
+            self.emit(Op::Constant(midx));
+            self.emit(Op::MakeFunc(*fidx));
+            total += 1;
+        }
+        // `from_traits`/`own`: itera por referencia para reusar abaixo.
+        let trait_list: Vec<(String, u32, usize, bool)> = from_traits
+            .iter()
+            .map(|(k, (f, p, v, _))| (k.clone(), *f, *p, *v))
+            .collect();
+        for (mname, fidx, _, _) in &trait_list {
+            let midx = self.add_constant(Value::Str(mname.clone()))?;
+            self.emit(Op::Constant(midx));
+            self.emit(Op::MakeFunc(*fidx));
+            total += 1;
+        }
+        let own_list: Vec<(String, u32, usize, bool)> = own
+            .iter()
+            .map(|(k, (f, p, v))| (k.clone(), *f, *p, *v))
+            .collect();
+        for (mname, fidx, _, _) in &own_list {
+            let midx = self.add_constant(Value::Str(mname.clone()))?;
+            self.emit(Op::Constant(midx));
+            self.emit(Op::MakeFunc(*fidx));
+            total += 1;
+        }
+        let count = total;
+        // Registra a classe achatada para filhos/interfaces/catch.
+        let mut flat: std::collections::HashMap<String, SigInfoEx> =
+            std::collections::HashMap::new();
+        if let Some(qp) = qparent.as_ref() {
+            if let Some(pi) = self.classes.get(qp) {
+                for (k, v) in pi.methods.iter() {
+                    flat.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        for (mname, fidx, p, v) in trait_list {
+            flat.insert(
+                mname,
+                SigInfoEx {
+                    params: p,
+                    variadic: v,
+                    func_idx: fidx,
+                },
+            );
+        }
+        for (mname, fidx, p, v) in own_list {
+            flat.insert(
+                mname,
+                SigInfoEx {
+                    params: p,
+                    variadic: v,
+                    func_idx: fidx,
+                },
+            );
+        }
+        if self.classes.contains_key(&qname) {
+            return Err(CompileError::new(format!("classe `{qname}` ja declarada")));
+        }
+        self.classes.insert(
+            qname.clone(),
+            ClassInfo {
+                parent: qparent.clone(),
+                methods: flat,
+            },
+        );
+        // Emite construcao: com pai usa `BuildClassEx`, senao `BuildClass`.
+        let name_idx = self.intern_name(&qname)?;
+        if let Some(qp) = qparent.as_ref() {
+            let parent_idx = self.intern_name(qp)?;
+            self.emit(Op::BuildClassEx(name_idx, parent_idx, count));
+        } else {
+            self.emit(Op::BuildClass(name_idx, count));
+        }
+        self.emit(Op::DeclareName(name_idx));
+        Ok(())
+    }
+
+    /// `interface Nome<T> { fn m(params); ... }`: so assinaturas, sem runtime.
+    /// Registra para checagem de `implements`; redefinicao = erro.
+    fn compile_interface(
+        &mut self,
+        name: &str,
+        generic_params: &[String],
+        methods: &[rhp_parser::InterfaceMethod],
+    ) -> Result<(), CompileError> {
+        let qname = self.qualify(name);
+        if self.interfaces.contains_key(&qname)
+            || self.classes.contains_key(&qname)
+            || self.traits.contains_key(&qname)
+        {
+            return Err(CompileError::new(format!(
+                "interface `{qname}` ja declarada"
+            )));
+        }
+        let _ = generic_params;
+        let mut sigs = Vec::with_capacity(methods.len());
+        for m in methods {
+            sigs.push(SigInfo {
+                name: m.name.clone(),
+                params: m.params.len(),
+                variadic: m.variadic.is_some(),
+            });
+        }
+        self.interfaces.insert(qname, sigs);
+        Ok(())
+    }
+
+    /// `trait Nome { fn m() { } }`: compila corpos para reuso via `use`.
+    /// Sem runtime proprio (so registro); redefinicao = erro.
+    fn compile_trait(
+        &mut self,
+        name: &str,
+        methods: &[rhp_parser::ClassMethod],
+    ) -> Result<(), CompileError> {
+        let qname = self.qualify(name);
+        if self.traits.contains_key(&qname)
+            || self.classes.contains_key(&qname)
+            || self.interfaces.contains_key(&qname)
+        {
+            return Err(CompileError::new(format!("trait `{qname}` ja declarado")));
+        }
+        let mut infos = Vec::with_capacity(methods.len());
+        for m in methods {
+            let func_idx = self.compile_func_body(
+                &format!("{qname}::{}", m.name),
+                &m.params,
+                m.variadic.as_deref(),
+                m.return_ann,
+                &m.body,
+                false,
+            )?;
+            infos.push(TraitMethodInfo {
+                name: m.name.clone(),
+                params: m.params.len(),
+                variadic: m.variadic.is_some(),
+                func_idx,
+            });
+        }
+        self.traits.insert(qname, infos);
         Ok(())
     }
 
@@ -2095,7 +2644,8 @@ impl Compiler {
     fn compile_call_mixed(&mut self, callee: &Expr, args: &[CallArg]) -> Result<(), CompileError> {
         match callee {
             Expr::Var(name) => {
-                let name_idx = self.intern_name(name)?;
+                let rname = self.resolve_name(name);
+                let name_idx = self.intern_name(&rname)?;
                 self.emit(Op::LoadName(name_idx));
             }
             other => {
@@ -2427,10 +2977,23 @@ impl Compiler {
                 variadic,
                 return_ann,
                 body,
+                is_async,
+                generic_params,
             } => {
-                let func_idx =
-                    self.compile_func_body(name, params, variadic.as_deref(), *return_ann, body)?;
-                self.intern_name(name)?;
+                if !generic_params.is_empty() {
+                    // Apagamento: valida duplicatas (parser ja valida) e ignora.
+                    let _ = generic_params;
+                }
+                let qname = self.qualify(name);
+                let func_idx = self.compile_func_body(
+                    &qname,
+                    params,
+                    variadic.as_deref(),
+                    *return_ann,
+                    body,
+                    *is_async,
+                )?;
+                self.intern_name(&qname)?;
                 self.emit(Op::DefineFunc(func_idx));
             }
             Stmt::Return { expr } => {
@@ -2469,28 +3032,36 @@ impl Compiler {
             }
             Stmt::Try {
                 body,
-                catch_var,
-                catch_body,
+                catches,
                 finally_body,
-            } => self.compile_try(body, catch_var, catch_body, finally_body)?,
-            Stmt::ClassDef { name, methods } => {
+            } => self.compile_try_multi(body, catches, finally_body)?,
+            Stmt::ClassDef {
+                name,
+                parent,
+                interfaces,
+                uses,
+                generic_params,
+                methods,
+            } => self.compile_class(name, parent, interfaces, uses, generic_params, methods)?,
+            Stmt::InterfaceDef {
+                name,
+                generic_params,
+                methods,
+            } => self.compile_interface(name, generic_params, methods)?,
+            Stmt::TraitDef { name, methods } => self.compile_trait(name, methods)?,
+            Stmt::Namespace { name } => {
+                // `namespace A\B;` define o prefixo das definicoes seguintes.
+                // Multiplos `namespace` (ex.: modulos ligados) = ultimo vence.
+                self.current_namespace = Some(name.clone());
+            }
+            Stmt::ImportQualified { .. } => {
+                return Err(CompileError::new(
+                    "`import A\\B` sem resolucao: use o loader (`rhp run`/`rhp check`)".to_string(),
+                ));
+            }
+            Stmt::ImportNative { name } => {
                 let name_idx = self.intern_name(name)?;
-                for method in methods {
-                    let func_idx = self.compile_func_body(
-                        &format!("{name}::{}", method.name),
-                        &method.params,
-                        method.variadic.as_deref(),
-                        method.return_ann,
-                        &method.body,
-                    )?;
-                    let method_name_idx = self.add_constant(Value::Str(method.name.clone()))?;
-                    self.emit(Op::Constant(method_name_idx));
-                    self.emit(Op::MakeFunc(func_idx));
-                }
-                let count = u32::try_from(methods.len())
-                    .map_err(|_| CompileError::new("classe com metodos demais".to_string()))?;
-                self.emit(Op::BuildClass(name_idx, count));
-                self.emit(Op::DeclareName(name_idx));
+                self.emit(Op::LoadNative(name_idx));
             }
             Stmt::Block(stmts) => {
                 self.emit_scope_open();
@@ -2555,7 +3126,8 @@ impl Compiler {
                 self.emit(Op::Constant(idx));
             }
             Expr::Var(name) => {
-                let name_idx = self.intern_name(name)?;
+                let rname = self.resolve_name(name);
+                let name_idx = self.intern_name(&rname)?;
                 self.emit(Op::LoadName(name_idx));
             }
             Expr::Array(items) => {
@@ -2660,15 +3232,16 @@ impl Compiler {
                 };
             }
             Expr::Call { name, args } => {
-                if let Some(builtin) = builtin_by_name(name) {
+                let rname = self.resolve_name(name);
+                if let Some(builtin) = builtin_by_name(&rname) {
                     if args.iter().any(|a| !matches!(a, CallArg::Pos(_))) {
                         return Err(CompileError::new(format!(
-                            "builtin `{name}` nao aceita argumentos nomeados nem spread"
+                            "builtin `{rname}` nao aceita argumentos nomeados nem spread"
                         )));
                     }
                     if args.len() != builtin_arity(builtin) {
                         return Err(CompileError::new(format!(
-                            "`{name}` espera {} argumentos, recebeu {}",
+                            "`{rname}` espera {} argumentos, recebeu {}",
                             builtin_arity(builtin),
                             args.len()
                         )));
@@ -2678,7 +3251,7 @@ impl Compiler {
                     }
                     self.emit(Op::CallBuiltin(BuiltinId::from(builtin)));
                 } else if args.iter().all(|a| matches!(a, CallArg::Pos(_))) {
-                    let name_idx = self.intern_name(name)?;
+                    let name_idx = self.intern_name(&rname)?;
                     self.emit(Op::LoadName(name_idx));
                     for arg in args {
                         self.compile_expr(arg.value())?;
@@ -2688,23 +3261,34 @@ impl Compiler {
                     }
                     self.emit(Op::Call(args.len() as u32));
                 } else {
-                    self.compile_call_mixed(&Expr::Var(name.clone()), args)?;
+                    let rv = Expr::Var(rname);
+                    self.compile_call_mixed(&rv, args)?;
                 }
             }
             Expr::CallValue { callee, args } => {
                 // `f(x)` direto preserva o caminho classico (precedencia
                 // de builtins e erro de aridade em compilacao).
                 if let Expr::Var(name) = callee.as_ref() {
+                    let rname = self.resolve_name(name);
                     self.compile_expr(&Expr::Call {
-                        name: name.clone(),
+                        name: rname,
                         args: args.clone(),
                     })?;
                 } else if let Expr::Member { obj, field } = callee.as_ref() {
-                    if let Expr::Var(var) = obj.as_ref() {
+                    // `super.metodo(args)`: chamada ao pai com `this` atual.
+                    if matches!(obj.as_ref(), Expr::Super) {
+                        if !self.in_function {
+                            return Err(CompileError::new("`super` fora de metodo".to_string()));
+                        }
+                        let field_idx = self.add_constant(Value::Str(field.clone()))?;
+                        let desc_idx = self.emit_call_args(args)?;
+                        self.emit(Op::CallSuper(field_idx, desc_idx));
+                    } else if let Expr::Var(var) = obj.as_ref() {
                         // `var.metodo(args)`: chamada de metodo com
                         // write-back do `this` (RFC 0017; coerente com
                         // `a[i] = v`, que tambem exige variavel nomeada).
-                        let var_idx = self.intern_name(var)?;
+                        let rvar = self.resolve_name(var);
+                        let var_idx = self.intern_name(&rvar)?;
                         let field_idx = self.add_constant(Value::Str(field.clone()))?;
                         let desc_idx = self.emit_call_args(args)?;
                         self.emit(Op::CallMethod(var_idx, field_idx, desc_idx));
@@ -2712,6 +3296,10 @@ impl Compiler {
                         // `expr.metodo(args)`: via `Index`, sem write-back.
                         self.compile_call_mixed(callee, args)?;
                     }
+                } else if matches!(callee.as_ref(), Expr::Super) {
+                    return Err(CompileError::new(
+                        "`super` so em chamada de metodo (`super.m(...)`)".to_string(),
+                    ));
                 } else if args.iter().all(|a| matches!(a, CallArg::Pos(_))) {
                     self.compile_expr(callee)?;
                     for arg in args {
@@ -2726,14 +3314,27 @@ impl Compiler {
                 }
             }
             Expr::Closure(data) => {
+                let name = self.fresh_closure_name();
                 let func_idx = self.compile_func_body(
-                    "{closure}",
+                    &name,
                     &data.params,
                     data.variadic.as_deref(),
                     data.return_ann,
                     &data.body,
+                    data.is_async,
                 )?;
                 self.emit(Op::MakeFunc(func_idx));
+            }
+            Expr::Super => {
+                return Err(CompileError::new(
+                    "`super` so em chamada de metodo (`super.m(...)`)".to_string(),
+                ));
+            }
+            Expr::Await { expr } => {
+                // `await` vale em qualquer lugar (topo ou funcao): bloqueia
+                // ate a tarefa concluir; em nao-tarefa e identidade.
+                self.compile_expr(expr)?;
+                self.emit(Op::Await);
             }
             Expr::Match { subject, arms } => {
                 self.compile_match(subject, arms)?;
@@ -3024,10 +3625,11 @@ mod tests {
 
     #[test]
     fn compiles_closure_and_general_calls() {
-        // Closure vira `MakeFunc` (valor); `f(1)` direto preserva `Call`.
+        // Closure vira `MakeFunc` (valor, nome unico `{closure:N}`); `f(1)`
+        // direto preserva `Call`.
         let chunk = compile_src("let f = fn (x) { return x; }; echo f(1);");
         assert_eq!(chunk.funcs.len(), 1);
-        assert_eq!(chunk.funcs[0].name, "{closure}");
+        assert_eq!(chunk.funcs[0].name, "{closure:0}");
         assert!(chunk.code.contains(&Op::MakeFunc(0)));
         assert!(chunk.code.contains(&Op::Call(1)));
         // Chamada de callee arbitrario compila callee + `Call`.
@@ -3456,6 +4058,8 @@ mod tests {
             param_types: vec![],
             return_type: None,
             is_generator: false,
+            is_async: false,
+            native_id: None,
             body: Rc::new(Chunk::new()),
         });
         assert_eq!(
