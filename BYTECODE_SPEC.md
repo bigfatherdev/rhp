@@ -106,9 +106,11 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
   (escopo + vinculo de `V`/descarte + `C` + `F`) ou, sem `catch`,
   `F` + `Rethrow`. `finally` duplicado por caminho (neutro na pilha).
 - `break`/`continue` = desenrolha escopos ate a base do laco + `Jump`
-  (saida/inicio ou incremento); fora de laco = erro de compilacao. `return` fora de funcao = erro.
+  (saida/inicio ou incremento); fora de laco = erro de compilacao. `return fora de funcao = erro.
   Cruzando `try` com `finally`, `break`/`continue`/`return` emitem antes
-  `TryEnd` + copia do `finally` (do mais interno para fora).
+  `TryEnd` + copia do `finally` (do mais interno para fora). Excecao:
+  o operando de `return e;`/`yield e;` e compilado ANTES dessas saidas
+  (0.6.0): erros da avaliacao pertencem ao `try` e alcançam o `catch`.
 - Ternario = cond + `JumpIfFalse->else` + ramo + `Jump->fim` + ramo-senão.
 - `a ?? b` = `a` + `Dup` + `JumpIfNotNull->fim` + `Pop` + `b` (avalia uma vez).
 - `fn` = corpo compilado em `Compiler` aninhado + epilogo

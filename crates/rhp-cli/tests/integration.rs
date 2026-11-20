@@ -330,6 +330,7 @@ fn rhp_run_time_builtins() {
 struct ServerChild {
     child: Option<std::process::Child>,
     port: u16,
+    announce: String,
 }
 
 impl ServerChild {
@@ -362,6 +363,7 @@ impl ServerChild {
         Self {
             child: Some(child),
             port,
+            announce: first,
         }
     }
 
@@ -415,6 +417,24 @@ impl ServerChild {
         stream
             .write_all(request.as_bytes())
             .expect("enviar request");
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).expect("ler resposta");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Roundtrip de bytes crus (para requests que nao sao UTF-8 válido
+    /// como texto ou que fecham o envio antes do corpo).
+    fn roundtrip_bytes(port: u16, request: &[u8], shutdown_write: bool) -> String {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("conectar no servidor");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        stream.write_all(request).expect("enviar request");
+        if shutdown_write {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
         let mut out = Vec::new();
         stream.read_to_end(&mut out).expect("ler resposta");
         String::from_utf8_lossy(&out).into_owned()
@@ -641,6 +661,241 @@ fn rhp_run_http_serve_rejeita_handler_desconhecido() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn rhp_run_http_serve_host_bind() {
+    // Bind em todas as interfaces: anuncio mostra 0.0.0.0 e 127.0.0.1 alcanca.
+    let server = ServerChild::spawn(
+        "srvhost.rhp",
+        "fn app(req) {\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"host\": \"0.0.0.0\", \"max_requisicoes\": 1});\n",
+    );
+    assert!(
+        server.announce.contains("0.0.0.0"),
+        "anuncio={}",
+        server.announce
+    );
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("ok"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+    // Bind default continua local.
+    let server = ServerChild::spawn(
+        "srvhost2.rhp",
+        "fn app(req) {\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 1});\n",
+    );
+    assert!(
+        server.announce.contains("127.0.0.1"),
+        "anuncio={}",
+        server.announce
+    );
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_rejeita_host_invalido() {
+    for host in ["999.1.1.1", "", "example.com", "0.0.0.0/0"] {
+        let output = run_temp_source(
+            "srvhostbad.rhp",
+            &format!("fn app(req) {{\n  return \"x\";\n}}\nhttp_serve(0, \"app\", {{\"host\": \"{host}\"}});\n"),
+        );
+        assert!(!output.status.success(), "host aceito: {host}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("`host` invalido"),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // `localhost` e apelido de 127.0.0.1 (anuncio prova).
+    let server = ServerChild::spawn(
+        "srvlocal.rhp",
+        "fn app(req) {\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"host\": \"localhost\", \"max_requisicoes\": 1});\n",
+    );
+    assert!(
+        server.announce.contains("127.0.0.1"),
+        "anuncio={}",
+        server.announce
+    );
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_porta_ocupada() {
+    let ocupada = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local deve passar");
+    let porta = ocupada.local_addr().expect("addr").port();
+    let output = run_temp_source(
+        "srvbusy.rhp",
+        &format!("fn app(req) {{\n  return \"x\";\n}}\nhttp_serve({porta}, \"app\", {{}});\n"),
+    );
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(err.contains("bind"), "stderr={err}");
+    assert!(err.contains(&porta.to_string()), "stderr={err}");
+    drop(ocupada);
+}
+
+#[test]
+fn rhp_run_http_serve_handler_como_valor() {
+    // Nome de funcao como valor (sem string) resolve no topo.
+    let server = ServerChild::spawn(
+        "srvval.rhp",
+        "fn app(req) {\n  return \"via-valor\";\n}\nhttp_serve(0, app, {\"max_requisicoes\": 1});\n",
+    );
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("via-valor"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+    // Closure nao tem entrada no topo: erro claro, sem hang.
+    let output = run_temp_source(
+        "srvclo.rhp",
+        "let h = fn (req) => \"x\";\nhttp_serve(0, h, {});\n",
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nivel superior"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_http_serve_400s_e_sobrevive() {
+    let server = ServerChild::spawn(
+        "srv400.rhp",
+        "fn app(req) {\n  if req[\"caminho\"] == \"/eco\" {\n    return req[\"corpo\"];\n  }\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 7});\n",
+    );
+    // Sem status-line valida.
+    let r = ServerChild::roundtrip_bytes(server.port, b"GARBAGE\r\n\r\n", false);
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // `Transfer-Encoding: chunked` funciona (corpo remontado e ecoado).
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /eco HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nola, \r\n6\r\nmundo!\r\n0\r\n\r\n",
+        false,
+    );
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("ola, mundo!"), "obteve: {r}");
+    // Chunk com tamanho invalido = 400.
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /eco HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nZZ\r\nxx\r\n0\r\n\r\n",
+        false,
+    );
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // Chunk truncado (declara 5, envia 2 e fecha envio) = 400.
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /eco HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nab",
+        true,
+    );
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // Corpo incompleto (declara 100, envia 5 e fecha envio).
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /x HTTP/1.0\r\nHost: x\r\nContent-Length: 100\r\nConnection: close\r\n\r\ncurto",
+        true,
+    );
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // Content-Length invalido.
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /x HTTP/1.0\r\nHost: x\r\nContent-Length: muitos\r\nConnection: close\r\n\r\n",
+        false,
+    );
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // Servidor segue atendendo apos os 400s.
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("ok"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_cabecalhos_grandes_e_utf8() {
+    let server = ServerChild::spawn(
+        "srvbig.rhp",
+        "fn app(req) {\n  return req[\"query\"][\"nome\"];\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 2});\n",
+    );
+    // Cabecalhos acima do teto (64 KiB) viram 400.
+    let grande = format!(
+        "GET / HTTP/1.0\r\nHost: x\r\nX-Lixo: {}\r\nConnection: close\r\n\r\n",
+        "a".repeat(70 * 1024)
+    );
+    let r = ServerChild::roundtrip_bytes(server.port, grande.as_bytes(), false);
+    assert!(
+        r.contains("400 Bad Request"),
+        "obteve: {}",
+        &r[..r.len().min(60)]
+    );
+    // Query UTF-8 percent-encoded decodifica em bytes (nao latin1).
+    let r = server.get("/q?nome=caf%C3%A9");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("café"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_handler_loop_limitado() {
+    // Handler em loop eterno: orcamento de passos vira 500; servidor segue.
+    let server = ServerChild::spawn(
+        "srvloop.rhp",
+        "fn app(req) {\n  while true {\n  }\n  return \"nunca\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 2, \"max_passos\": 200000});\n",
+    );
+    let r = server.get("/loop");
+    assert!(r.contains("500 Internal Server Error"), "obteve: {r}");
+    assert!(r.ends_with("erro interno"), "obteve: {r}");
+    // Servidor segue vivo (nao atingiu `max_requisicoes`): o Drop mata o filho.
+}
+
+#[test]
+fn rhp_run_http_serve_aninhado_rejeitado() {
+    // `http_serve` dentro do handler: erro claro (500), sem hang, segue.
+    let server = ServerChild::spawn(
+        "srvnest.rhp",
+        "fn app(req) {\n  http_serve(9999, \"app\", {});\n  return \"x\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 2});\n",
+    );
+    let r = server.get("/a");
+    assert!(r.contains("500 Internal Server Error"), "obteve: {r}");
+    let r = server.get("/b");
+    assert!(r.contains("500 Internal Server Error"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_conexoes_concorrentes() {
+    // 8 clientes simultaneos: todos 200 (thread por conexao).
+    let server = ServerChild::spawn(
+        "srvconc.rhp",
+        "fn app(req) {\n  return \"ok\" + req[\"query\"][\"n\"];\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 8});\n",
+    );
+    let port = server.port;
+    let mut alvos = Vec::new();
+    for n in 0..8 {
+        alvos.push(std::thread::spawn(move || {
+            ServerChild::roundtrip(
+                port,
+                &format!("GET /?n={n} HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n"),
+            )
+        }));
+    }
+    for (n, alvo) in alvos.into_iter().enumerate() {
+        let r = alvo.join().expect("thread do cliente");
+        assert!(r.contains("200 OK"), "cliente {n}: {r}");
+        assert!(r.ends_with(&format!("ok{n}")), "cliente {n}: {r}");
+    }
+    let out = server.wait();
+    assert!(out.status.success());
 }
 
 #[test]

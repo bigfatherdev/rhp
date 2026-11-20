@@ -1,5 +1,15 @@
 # ROADMAP.md — Planejamento e estado (Next Generation + limitacoes cuidadas)
 
+## RHP 0.6.0 — Engenharia de correcao e robustez (2026-11-20, implementado e validado)
+
+- [x] `return`/`yield` em `try` capturam erro do operando (ordem do compilador corrigida; 8 casos).
+- [x] `http_serve` com `host` configuravel (default local; `0.0.0.0` opt-in) + erro claro de bind.
+- [x] HTTP: 400s corretos, teto de headers, CL estrito, corpo incompleto/chunked rejeitados, prazo total, accept resiliente, percent-decode UTF-8.
+- [x] Handler como valor + `max_passos`/`max_heap_bytes` + anti-reentrada (sem hangs).
+- [x] Corpo `chunked` (RFC 9112), `"localhost"` = 127.0.0.1, reasons 408/413/422/502/504.
+- [x] Provas Docker reais (container↔container, nginx reverso, port forwarding, controle negativo).
+- [x] Suite 354 testes + fmt/clippy limpos; baseline de bench 0.6.0; docs e changelog sincronizados.
+
 ## Limitacoes cuidadas (2026-11-19, implementado e validado)
 
 - [x] Bounds de generics (RFC 0029 implementada): `type_args` preservados,

@@ -5102,6 +5102,67 @@ mod tests {
     }
 
     #[test]
+    fn runs_return_inside_try_catches_operand_error() {
+        // Caso 1 — retorno de chamada invalida.
+        assert_eq!(
+            run_src("fn test() { try { return unknown_fn(); } catch e { return \"capturado\"; } } echo test();").expect("ok"),
+            "capturado\n"
+        );
+        // Caso 2 — JSON invalido no operando do `return`.
+        assert_eq!(
+            run_src("fn test(s) { try { return json_parse(s); } catch e { return \"json-capturado\"; } } echo test(\"invalido\");").expect("ok"),
+            "json-capturado\n"
+        );
+        // Caso 3 — retorno normal nao aciona o `catch`.
+        assert_eq!(
+            run_src("fn test() { try { return 123; } catch e { return 999; } } echo test();")
+                .expect("ok"),
+            "123\n"
+        );
+        // Caso 4 — erro em `let` seguido de `return` (ja funcionava; trava).
+        assert_eq!(
+            run_src("fn test() { try { let x = json_parse(\"invalido\"); return x; } catch e { return \"capturado\"; } } echo test();").expect("ok"),
+            "capturado\n"
+        );
+        // Caso 5 — erro em funcao aninhada chamada no operando.
+        assert_eq!(
+            run_src("fn dentro() { throw \"fundo\"; } fn test() { try { return dentro(); } catch e { return \"pegou:\" + e; } } echo test();").expect("ok"),
+            "pegou:fundo\n"
+        );
+        // Caso 6 — `try` aninhado: handler mais interno vence.
+        assert_eq!(
+            run_src("fn test() { try { try { return json_parse(\"x\"); } catch e { return \"interno\"; } } catch e { return \"externo\"; } } echo test();").expect("ok"),
+            "interno\n"
+        );
+        // Caso 7 — `return` com operando que falha dentro de estruturas.
+        assert_eq!(
+            run_src("fn test(x) { if x { try { return json_parse(\"!\"); } catch e { return \"no-if\"; } } return \"fora\"; } echo test(true);").expect("ok"),
+            "no-if\n"
+        );
+        assert_eq!(
+            run_src("fn f(n) { if n <= 0 { return 0; } try { return f(n - 1) + json_parse(\"!\"); } catch e { return -1; } } echo f(3);").expect("ok"),
+            "-1\n"
+        );
+        assert_eq!(
+            run_src("fn test() { let i = 0; while i < 3 { i = i + 1; try { return json_parse(\"!\"); } catch e { return \"no-while\"; } } return \"fim\"; } echo test();").expect("ok"),
+            "no-while\n"
+        );
+        // Operando avaliado ANTES do `finally` (semantica padrao).
+        assert_eq!(
+            run_src("let x = 1; fn f() { try { return x; } finally { x = 2; } } echo f(); echo x;")
+                .expect("ok"),
+            "1\n2\n"
+        );
+        // Caso 8 — sem handler, o erro do operando ainda propaga.
+        let err = run_err("fn test() { return json_parse(\"invalido\"); } echo test();");
+        assert!(err.contains("json_parse"), "obteve: {err}");
+        let err = run_err(
+            "fn test() { try { return json_parse(\"x\"); } catch e { throw e; } } echo test();",
+        );
+        assert!(err.contains("json_parse"), "obteve: {err}");
+    }
+
+    #[test]
     fn runs_finally_on_all_paths() {
         // Caminho normal.
         assert_eq!(

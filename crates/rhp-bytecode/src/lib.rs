@@ -3196,8 +3196,10 @@ impl Compiler {
                 if !self.in_function {
                     return Err(CompileError::new("`return` fora de funcao"));
                 }
-                // `return` cruza todos os `try`s do frame (handler + `finally`).
-                self.emit_abrupt_exits(None)?;
+                // O operando e avaliado ANTES de cruzar os `try`s: o erro da
+                // avaliacao e "erro em B" (LANGUAGE_SPEC) e deve alcancar o
+                // handler ativo. `TryEnd`/`finally` rodam depois, com o valor
+                // ja empilhado (copias de `finally` sao neutras na pilha).
                 match expr {
                     Some(expr) => self.compile_expr(expr)?,
                     None => {
@@ -3205,14 +3207,15 @@ impl Compiler {
                         self.emit(Op::Constant(idx));
                     }
                 }
+                // `return` cruza todos os `try`s do frame (handler + `finally`).
+                self.emit_abrupt_exits(None)?;
                 self.emit(Op::Return);
             }
             Stmt::Yield { expr } => {
                 if !self.in_function {
                     return Err(CompileError::new("`yield` fora de funcao"));
                 }
-                // `yield` cruza `try`s como `return` (handler + `finally`).
-                self.emit_abrupt_exits(None)?;
+                // Mesma ordem do `return`: operando antes de cruzar `try`s.
                 match expr {
                     Some(expr) => self.compile_expr(expr)?,
                     None => {
@@ -3220,6 +3223,8 @@ impl Compiler {
                         self.emit(Op::Constant(idx));
                     }
                 }
+                // `yield` cruza `try`s como `return` (handler + `finally`).
+                self.emit_abrupt_exits(None)?;
                 self.emit(Op::Yield);
             }
             Stmt::Throw { expr } => {

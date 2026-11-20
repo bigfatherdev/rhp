@@ -192,8 +192,11 @@ ExprStmt   := Expr ";"
   e valor, nao aciona padrao). Nomeados (`f(x: 1)`, qualquer ordem) e
   spread (`f(...arr)`, splice em ordem; RFC 0009) ligam em runtime:
   desconhecido, conflito posicional+nomeado e spread nao-`Array` = erro.
-  `return e;` sai da funcao com o valor (`return;``
+  `return e;` sai da funcao com o valor (`return;`
   retorna `null`); fim do corpo sem `return` tambem retorna `null`.
+  `e` e avaliado antes de `finally`/fechamento de `try` (0.6.0): erros
+  de `e` sao "erro em B" e alcançam o `catch` ativo; `finally` roda
+  depois, com o valor ja calculado.
   `return` fora de funcao e erro de compilacao. Recursao permitida ate
   `MAX_CALL_DEPTH = 512` (erro apos o limite). Funcoes enxergam parametros,
   locais proprios, ambiente capturado (closures) e globais.

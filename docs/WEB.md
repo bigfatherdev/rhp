@@ -47,6 +47,29 @@ fn handler(req) {
 http_serve(8080, "handler", {});
 ```
 
+## `http_serve(porta, handler, opts)`
+
+- `porta` 0–65535 (0 = porta livre do SO; o anuncio `rhp: ouvindo em ...`
+  mostra onde escutou). `host` (opt): interface de escuta —
+  `"127.0.0.1"` (padrao, so local), `"localhost"` (apelido do padrao),
+  `"0.0.0.0"` (todas IPv4) ou IP literal (v4/v6) especifico.
+- `handler`: nome de `fn` como string **ou** a propria funcao como valor
+  (`http_serve(8080, handler, {})` resolve no topo; closures nao sao
+  suportadas — erro claro em vez de hang).
+- Opts: `max_conexoes` (default 32, teto 1024; acima = 503),
+  `max_requisicoes` (0 = para sempre; N = serve N e retorna — ancora de
+  testes), `limite_taxa` (req/s por IP; excedeu = 429), `max_passos`
+  (default 10M instrucoes por request; 0 = sem limite; estouro = 500 e o
+  servidor segue), `max_heap_bytes` (0 = sem limite).
+- Request malformado = 400 (`requisicao invalida`; inclui cabecalhos acima
+  de 64 KiB, `Content-Length` invalido, corpo incompleto e
+  `Transfer-Encoding` desconhecido). `chunked` e suportado (RFC 9112
+  §7.1; tem precedencia sobre `Content-Length`); corpo sempre entregue
+  como string UTF-8 ao handler.
+  Falha de `accept` nao derruba o servidor (log + nova tentativa).
+- `http_serve` dentro do handler = erro (500), nao hang.
+- `exit(codigo)` no handler encerra o servidor (codigo de saida).
+
 ## Rotas
 
 - Metodos: `web_get/post/put/patch/delete/head/options(padrao, handler)`.
@@ -76,6 +99,11 @@ web_use(fn(req) {
 
 ## Seguranca
 
+- Bind padrao e LOCAL (`127.0.0.1`): outro container/host nao alcanca.
+  Para expor (Docker, reverse proxy, port forwarding), use
+  `http_serve(8080, "handler", {"host": "0.0.0.0"})` — e entenda que
+  TODAS as interfaces passam a aceitar conexoes (restrinja com firewall /
+  security groups; nao exponha debug/admin sem autenticacao).
 - Cabecalhos `x-content-type-options: nosniff`, `x-frame-options: DENY`.
 - Teto de payload 1 MiB (413). Rate limiting via `http_serve`:
   `http_serve(8080, "handler", { limite_taxa: 100 })`.

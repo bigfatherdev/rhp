@@ -96,7 +96,9 @@ break; continue; break 2; continue 2; // N = niveis para fora (padrao 1)
 - `try { } catch e { } finally { }` (ao menos um de `catch`/`finally`
   obrigatorio); `throw v` lanca; nao capturado = `excecao nao capturada`.
   Erro de runtime capturado vira mapa `{tipo: "runtime",
-  mensagem: "..."}`; `exit()` nunca e capturado.
+  mensagem: "..."}`; `exit()` nunca e capturado. `return e;` dentro do
+  `try` tem `e` avaliado antes do `finally`: erros de `e` (ex.:
+  `return json_parse(s);`) sao capturados pelo `catch` ativo.
 
 ## 5. Funcoes e closures
 
@@ -417,7 +419,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 |---|---|
 | `http_get(url)` | GET `http://` com timeouts de 5s (DNS: resolvedor do sistema), teto de corpo 1 MiB, so 2xx com corpo UTF-8; resto = erro. |
 | `http_fetch(url, opts)` | GET com `opts` (`seguir`, `max_redirecionamentos` 0–10, `timeout` 0–60s, `headers`, `metodo`: so `GET`); `https://` verificado (raizes embutidas + `RHP_CA_BUNDLE`); redirects 301/302/303/307/308 (ate 10; sem downgrade https→http); devolve mapa `{status, cabecalhos, corpo}` (chaves minusculas). |
-| `http_serve(porta, handler, opts)` | Servidor HTTP (thread por conexao; handler stateless; erro 500 sem vazar; `exit(codigo)` encerra). `porta` 0–65535 (0 = livre). Handler `fn req => ...`: `req` = mapa `{metodo, caminho, query, cabecalhos, cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Opts: `max_conexoes`, `max_requisicoes`, `limite_taxa` (req/s por IP; excedeu = 429). |
+| `http_serve(porta, handler, opts)` | Servidor HTTP (thread por conexao; handler stateless; erro 500 sem vazar; `exit(codigo)` encerra). `porta` 0–65535 (0 = livre). Handler: nome de `fn` (string) ou valor de funcao do topo (`app`, nao closure). `req` = mapa `{metodo, caminho, query, cabecalhos, cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Opts: `host` (default `"127.0.0.1"`; `"localhost"` = idem; `"0.0.0.0"` = todas IPv4 — ver seguranca em `docs/WEB.md`), `max_conexoes`, `max_requisicoes`, `limite_taxa` (req/s por IP; excedeu = 429), `max_passos` (default 10M; estouro = 500), `max_heap_bytes`. Request malformado = 400; corpo `chunked` suportado; `http_serve` no handler = erro; falha de `accept` nao para o servidor. |
 | `template(texto, valores)` | Interpola `{{chave}}` com escape HTML obrigatorio; chave ausente/`{{` aberto/tipo invalido = erro; sem laco/condicional. |
 
 ### Banco de dados (Fase B + Etapa 5)
