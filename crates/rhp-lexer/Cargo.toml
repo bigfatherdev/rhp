@@ -1,6 +1,6 @@
 [package]
 name = "rhp-lexer"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2021"
 description = "Lexer escrito a mao para a linguagem RHP (Fase 1)"
 license = "MIT OR Apache-2.0"

@@ -63,9 +63,13 @@ export new class yield echo true false null`
 ## 3. Operadores
 
 Precedencia (da menor para a maior): ternario `a ? b : c` (a direita)
-< Elvis/?? (`a ?: b` = `a ?? b`; so `null` aciona)
+< `||` < `&&` < Elvis/?? (`a ?: b` = `a ?? b`; so `null` aciona)
 < `==`, `!=` < `|` < `^` < `&` < `< <= > >=` < `<< >>` < `+ -` <
 `* / %` < unarios `! - ~` (+ unario e identidade) < primario.
+
+- `&&`/`||` com curto-circuito, estritamente `Bool` (RFC 0031):
+  `false && x` / `true || x` nao avaliam `x`; nao-`Bool` = erro E3003.
+  Ex.: `if ok && n > 0 || emergencia { }` = `((ok && (n > 0)) || emergencia)`.
 
 - `/` e `%` por zero (int ou float) sao erro; estouro de `Int` e erro.
 - `Int + Float` promove para `Float`.
@@ -363,7 +367,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 
 | Funcao | Efeito |
 |---|---|
-| `contains(s, parte)` | `true` se `parte` ocorre em `s` (ambos `Str`). |
+| `contains(s, parte)` / `contains(arr, valor)` | `true` se `parte` ocorre em `s` (ambos `Str`) ou `valor` ocorre em `arr` (igualdade por valor de `==`; `[]` = `false`). |
 | `starts_with(s, prefixo)` / `ends_with(s, sufixo)` | Prefixo/sufixo (`Bool`). |
 | `split(s, sep)` | `Array` de pedacos; separador vazio divide em caracteres. |
 | `join(arr, sep)` | Junta `Array` de `Str`; nao-`Str` = erro. |
@@ -429,7 +433,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 |---|---|
 | `db_open(caminho)` | Abre/cria SQLite (`Int` = handle); relativo resolve no cwd; roda com as permissoes do usuario. |
 | `db_open("pg:...")` | Conecta no PostgreSQL (`host`, `port`, `user`, `dbname`; auth `trust`; padroes host 127.0.0.1/porta 5432/user `postgres`/dbname = user). |
-| `db_open("mysql:...")` | Conecta no MySQL (protocolo 4.1 + `mysql_native_password`; chaves `host`, `port` (padrao 127.0.0.1:3306), `user` (padrao `root`), `password`, `dbname`). |
+| `db_open("mysql:...")` | Conecta no MySQL (protocolo 4.1 + `mysql_native_password` ou `caching_sha2_password` com fast_auth e full auth RSA-OAEP; chaves `host`, `port` (padrao 127.0.0.1:3306), `user` (padrao `root`), `password`, `dbname`). |
 | `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); `?` posicionais (SQLite/MySQL via escape client-side; PG `$1`... nativo); devolve linhas afetadas (`Int`). `SELECT` via `exec`: MySQL devolve erro (use `db_query`); PG devolve a contagem. Linhas de SELECT sao descartadas. |
 | `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna=>valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB SQLite = erro; tipos PG mapeados por OID, resto vira `Str`; MySQL: numericos=>numero, resto (incl. datas)=>`Str`). Nota: SQLite/MySQL nao tem booleano nativo — `true` gravado volta como `1` (`Int`); so o PG round-tripa `Bool`. |
 | `db_close(h)` | Fecha (reuso = erro); devolve `null`. Fim do programa fecha o resto. |
@@ -543,7 +547,7 @@ main();
 
 ## Divergencias honestas do PHP
 
-Sem `&&`/`||` (so bitwise); `?:`/`??` sem truthiness (so `null`
+`&&`/`||` estritos (`Bool`, sem truthiness); `?:`/`??` sem truthiness (so `null`
 aciona); `for x in mapa` itera chaves ordenadas; `for-in` nao tem
 `&$ref`; `define()`/variaveis dinamicas nao existem; OO sem heranca;
 geradores com `==` por identidade; tarefas sem memoria compartilhada;

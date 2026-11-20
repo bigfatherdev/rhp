@@ -66,12 +66,15 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 | `TryEnd` | Remove o handler (caminho normal). Sem handler = erro. |
 | `Throw` | Desempilha valor e inicia unwinding (frame atual para a base). |
 | `Rethrow` | Relanca o erro em propagacao (fim de `finally` sem `catch`). |
-| `CallBuiltin(id)` | Executa builtin de id 0–63 com aridade fixa (tabela §4).
+| `CallBuiltin(id)` | Executa builtin de id 0–82 com aridade fixa (tabela §4).
   HOFs com callback (`Map`/`Filter`/`Usort`, RFC 0005) nao passam pelo
   `call_builtin` sincrono: o `step` intercepta, guarda `PendingHof` no frame
   e empilha ativacoes; o `Return` retoma (`advance_hof`). |
 | `StrictEq` | `pop` 2 valores; empilha `Bool` (igualdade estrita: mesmo tipo;
   `Int`/`Float` comparam numericamente). Usado pelo `match` (RFC 0008). |
+| `AssertBool` | Espia o topo; exige `Bool` (E3003 `condicao deve ser bool` fora disso).
+  Neutro na pilha. Usado pelo operando direito de `&&`/`||` (o esquerdo
+  passa por `JumpIfFalse`/`JumpIfTrue`; RFC 0031). |
 | `BuildClassEx(nome, pai, n)` | Como `BuildClass`, com pai (Next Generation): `Value::Class { parent: Some(pai) }`. Metodos ja achatados pelo compilador. |
 | `IsInstanceOf(nome)` | `pop` valor; empilha `Bool` (instancia da classe ou subclasse via `parent`; Next Generation, excecoes tipadas). |
 | `Await` | `pop` valor; handle de tarefa = join (erros propagam), senao identidade (Next Generation, async). |
@@ -148,7 +151,12 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
 44 DbOpen 45 DbExec 46 DbQuery 47 DbClose
 48 HttpServe 49 Template 50 Map 51 Filter 52 Usort
 53 Rand 54 RandRange 55 FsList 56 HashPassword 57 VerifyPassword
-58 RegexMatch 59 RegexReplace 60 RegexSplit 61 Sha256 62 HmacSha256 63 HmacVerify`
+58 RegexMatch 59 RegexReplace 60 RegexSplit 61 Sha256 62 HmacSha256 63 HmacVerify
+64 Next 65 Exhausted 66 AsyncSpawn 67 AsyncJoin
+68 TcpConnect 69 TcpSend 70 TcpRecv 71 TcpClose
+72 RedisOpen 73 RedisExec 74 RedisClose
+75 AwaitTimeout 76 AsyncCancel 77 AsyncCancelled 78 AwaitAll 79 AwaitRace
+80 FsRename 81 FsRemove 82 FsMkdir`
 (aridades na tabela §6 de `LANGUAGE_SPEC.md`). Ids desconhecidos invalidam
 o chunk; `BuiltinId` tem teste anti-deriva.
 HOFs com callback (`Map`/`Filter`/`Usort`, RFC 0005) nao passam pelo

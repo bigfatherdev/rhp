@@ -126,8 +126,12 @@ pub(super) fn call_builtin(
         },
         Builtin::Contains => match (&args[0], &args[1]) {
             (Value::Str(hay), Value::Str(needle)) => Ok(Value::Bool(hay.contains(needle as &str))),
+            // RFC 0032: pertinencia em array (igualdade por valor de `==`).
+            (Value::Array(items), needle) => Ok(Value::Bool(
+                items.iter().any(|item| super::values_equal(item, needle)),
+            )),
             (a, b) => Err(VmError::new(format!(
-                "`contains` exige (string, string), encontrado ({}, {})",
+                "`contains` exige (string, string) ou (array, valor), encontrado ({}, {})",
                 type_name(a),
                 type_name(b)
             ))),

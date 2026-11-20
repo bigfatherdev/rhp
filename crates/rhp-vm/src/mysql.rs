@@ -16,6 +16,9 @@ const CAPS_DB: u32 = 0x0000_0008;
 const CHARSET: u8 = 45;
 /// Teto de pacote lido (anti-DoS; MySQL permite ate 16 MiB por padrao).
 const MAX_PACKET: usize = 16 * 1024 * 1024;
+/// Plugins de autenticacao suportados (RFC 0033).
+const PLUGIN_NATIVE: &str = "mysql_native_password";
+const PLUGIN_CACHING_SHA2: &str = "caching_sha2_password";
 
 /// Conexao MySQL (sequencia de pacotes + handle TCP).
 #[derive(Debug)]
@@ -94,6 +97,77 @@ fn native_password(password: &[u8], seed: &[u8]) -> [u8; 20] {
         out[i] = stage1[i] ^ stage2[i];
     }
     out
+}
+
+/// RNG do SO sobre `getrandom` (rsa 0.10 usa `rand_core` 0.10, sem
+/// `OsRng`; `getrandom::fill` e a primitiva estavel). Uso: OAEP e chaves
+/// de teste (visivel nos testes do modulo).
+struct SysRng;
+impl rand_core::TryRng for SysRng {
+    type Error = core::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_ne_bytes(b))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_ne_bytes(b))
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        // Falha aqui = entropia do SO quebrada: sem como cifrar com
+        // seguranca; falhar alto em vez de degradar.
+        getrandom::fill(dest).expect("getrandom falhou");
+        Ok(())
+    }
+}
+impl rand_core::TryCryptoRng for SysRng {}
+
+/// `caching_sha2_password`, estagio rapido (RFC 0033):
+/// `XOR(SHA256(senha), SHA256(SHA256(SHA256(senha)) + seed))`
+/// (32 bytes, sempre — validado contra o algoritmo de referencia).
+fn caching_sha2_token(password: &[u8], seed: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let p1 = Sha256::digest(password);
+    let p2 = Sha256::digest(p1);
+    let mut h = Sha256::new();
+    h.update(p2);
+    h.update(seed);
+    let p3 = h.finalize();
+    p1.iter().zip(p3.iter()).map(|(a, b)| a ^ b).collect()
+}
+
+/// Full auth do `caching_sha2_password` (RFC 0033): cifra
+/// `(senha + NUL) XOR seed` (seed repetido) com RSA-OAEP(SHA1) e a chave
+/// publica PEM do servidor. Puro Rust (`rsa` + `sha1`), sem C.
+fn rsa_oaep_encrypt(
+    password: &[u8],
+    seed: &[u8],
+    public_key_pem: &[u8],
+) -> Result<Vec<u8>, String> {
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::{Oaep, PublicKey};
+    let mut message = Vec::with_capacity(password.len() + 1);
+    message.extend_from_slice(password);
+    message.push(0);
+    let xored: Vec<u8> = message
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if seed.is_empty() {
+                b
+            } else {
+                b ^ seed[i % seed.len()]
+            }
+        })
+        .collect();
+    let pem = std::str::from_utf8(public_key_pem)
+        .map_err(|_| "`db_open`: chave publica RSA invalida (nao UTF-8)".to_string())?;
+    let key = PublicKey::from_public_key_pem(pem)
+        .map_err(|e| format!("`db_open`: chave publica RSA invalida: {e}"))?;
+    key.encrypt(&mut SysRng, Oaep::<sha1::Sha1>::new(), &xored)
+        .map_err(|e| format!("`db_open`: falha ao cifrar senha (RSA): {e}"))
 }
 
 fn read_lenenc(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
@@ -190,6 +264,10 @@ impl Connection {
         }
         let mut payload = Vec::new();
         self.conn.read_exact(len, &mut payload)?;
+        // Contador compartilhado com o servidor: apos ler o pacote N, o
+        // proximo pacote do cliente usa N+1 (handshake/auth; comandos
+        // reiniciam em 0 via `command()`).
+        self.seq = seq.wrapping_add(1);
         Ok((payload, seq))
     }
 
@@ -269,9 +347,26 @@ impl Connection {
             pos += 1;
         }
         seed.extend_from_slice(&greeting[rest_start..pos]);
-        // (nome do plugin ignorado: sempre `mysql_native_password` aqui.)
+        // Nome do plugin anunciado (NUL-terminado apos a seed; ausente em
+        // servidores antigos = `mysql_native_password` por padrao).
+        let plugin = if pos < greeting.len() && greeting[pos] == 0 {
+            pos += 1;
+            let end = greeting[pos..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|i| pos + i)
+                .unwrap_or(greeting.len());
+            let name = String::from_utf8_lossy(&greeting[pos..end]).into_owned();
+            if name.is_empty() {
+                PLUGIN_NATIVE.to_string()
+            } else {
+                name
+            }
+        } else {
+            PLUGIN_NATIVE.to_string()
+        };
         let mut this = Self { conn, seq: 1 };
-        // Resposta de handshake.
+        // Resposta de handshake (estagio inicial do plugin anunciado).
         let mut caps = CAPS_BASE;
         if dbname.is_some() {
             caps |= CAPS_DB;
@@ -283,22 +378,166 @@ impl Connection {
         resp.extend_from_slice(&[0u8; 23]);
         resp.extend_from_slice(user.as_bytes());
         resp.push(0);
-        if password.is_empty() {
-            resp.push(0);
-        } else {
-            let token = native_password(password.as_bytes(), &seed);
-            resp.push(token.len() as u8);
-            resp.extend_from_slice(&token);
-        }
+        resp.extend_from_slice(&Self::auth_token(&plugin, password.as_bytes(), &seed)?);
         if let Some(db) = dbname {
             resp.extend_from_slice(db.as_bytes());
             resp.push(0);
         }
-        resp.extend_from_slice(b"mysql_native_password\0");
+        resp.extend_from_slice(plugin.as_bytes());
+        resp.push(0);
         this.write_packet(&resp)?;
-        let (reply, _) = this.read_packet()?;
-        Self::check_ok_or_err(&reply, "`db_open`")?;
+        this.finish_auth(&plugin, &user, password.as_bytes(), &seed)?;
         Ok(this)
+    }
+
+    /// Token do estagio inicial para o plugin (`[len, bytes...]` ja com o
+    /// prefixo de tamanho). Vazio quando sem senha.
+    fn auth_token(plugin: &str, password: &[u8], seed: &[u8]) -> Result<Vec<u8>, String> {
+        if password.is_empty() {
+            return Ok(vec![0]);
+        }
+        let token = match plugin {
+            PLUGIN_NATIVE => native_password(password, seed).to_vec(),
+            PLUGIN_CACHING_SHA2 => caching_sha2_token(password, seed),
+            other => {
+                return Err(format!(
+                    "`db_open`: plugin de autenticacao nao suportado: `{other}` (use usuario `mysql_native_password` ou servidor compativel)"
+                ));
+            }
+        };
+        let mut out = Vec::with_capacity(token.len() + 1);
+        out.push(token.len() as u8);
+        out.extend_from_slice(&token);
+        Ok(out)
+    }
+
+    /// Conclui a autenticacao apos a resposta do handshake (RFC 0033):
+    /// `OK` direto; `AuthSwitchRequest` (troca de plugin com nova seed);
+    /// `more-data` do `caching_sha2` (fast ou full com RSA).
+    fn finish_auth(
+        &mut self,
+        plugin: &str,
+        user: &str,
+        password: &[u8],
+        seed: &[u8],
+    ) -> Result<(), String> {
+        let (reply, _) = self.read_packet()?;
+        match reply.first() {
+            Some(0x00) => return Ok(()),
+            Some(0xFF) => return Err(Self::err_text(&reply, "`db_open`")),
+            Some(0xFE) => {
+                // AuthSwitchRequest: plugin NUL + seed NUL.
+                let mut pos = 1;
+                let start = pos;
+                while pos < reply.len() && reply[pos] != 0 {
+                    pos += 1;
+                }
+                let next_plugin = String::from_utf8_lossy(&reply[start..pos]).into_owned();
+                pos += 1;
+                let end = reply[pos..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|i| pos + i)
+                    .unwrap_or(reply.len());
+                let seed = &reply[pos..end];
+                return self.auth_switched(&next_plugin, user, password, seed);
+            }
+            Some(0x01) => {
+                // More-data ja no handshake (variante de fast path).
+                return self.caching_more_data(&reply[1..], user, password, seed);
+            }
+            _ => {}
+        }
+        Err(format!(
+            "`db_open`: resposta inesperada do MySQL no handshake (plugin `{plugin}`)"
+        ))
+    }
+
+    /// Responde a um `AuthSwitchRequest` (RFC 0033).
+    fn auth_switched(
+        &mut self,
+        plugin: &str,
+        _user: &str,
+        password: &[u8],
+        seed: &[u8],
+    ) -> Result<(), String> {
+        match plugin {
+            PLUGIN_NATIVE => {
+                let token = if password.is_empty() {
+                    Vec::new()
+                } else {
+                    native_password(password, seed).to_vec()
+                };
+                self.write_packet(&token)?;
+                let (reply, _) = self.read_packet()?;
+                Self::check_ok_or_err(&reply, "`db_open`")
+            }
+            PLUGIN_CACHING_SHA2 => {
+                let token = if password.is_empty() {
+                    Vec::new()
+                } else {
+                    caching_sha2_token(password, seed)
+                };
+                self.write_packet(&token)?;
+                let (reply, _) = self.read_packet()?;
+                match reply.first() {
+                    Some(0x00) => Ok(()),
+                    Some(0x01) => self.caching_more_data(&reply[1..], _user, password, seed),
+                    Some(0xFF) => Err(Self::err_text(&reply, "`db_open`")),
+                    _ => Err(format!(
+                        "`db_open`: resposta inesperada do MySQL apos troca para `{plugin}`"
+                    )),
+                }
+            }
+            other => Err(format!(
+                "`db_open`: servidor pediu plugin nao suportado `{other}` (use usuario `mysql_native_password`)"
+            )),
+        }
+    }
+
+    /// Continua `caching_sha2_password` apos `more-data` (RFC 0033):
+    /// `n==3` = fast ok (le o `OK`); `n==4` = full auth via RSA;
+    /// demais = erro claro (sem hang, sem vazar a senha).
+    fn caching_more_data(
+        &mut self,
+        data: &[u8],
+        _user: &str,
+        password: &[u8],
+        seed: &[u8],
+    ) -> Result<(), String> {
+        match data.first() {
+            Some(0) | Some(3) => {
+                // `fast_auth_success` (0 direto, ou more-data com `n==3`):
+                // segue o `OK`.
+                let (reply, _) = self.read_packet()?;
+                Self::check_ok_or_err(&reply, "`db_open`")
+            }
+            Some(4) => self.caching_full_auth(password, seed),
+            Some(1) => Err(
+                "`db_open`: `caching_sha2_password` exige autenticacao completa (RSA), mas o servidor nao enviou o passo seguinte; use usuario `mysql_native_password` ou conexao com chave publica configurada"
+                    .to_string(),
+            ),
+            _ => Err(
+                "`db_open`: resposta inesperada do MySQL no `caching_sha2_password` (use usuario `mysql_native_password`)"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Full auth do `caching_sha2_password` (RFC 0033): pede a chave
+    /// publica (`0x02`), cifra `senha+NUL XOR seed` com RSA-OAEP(SHA1)
+    /// e envia; espera `OK`. Puro Rust (`rsa` + `sha1`), sem C.
+    fn caching_full_auth(&mut self, password: &[u8], seed: &[u8]) -> Result<(), String> {
+        // 0x02 = pedido da chave publica do servidor.
+        self.write_packet(&[2])?;
+        let (key_reply, _) = self.read_packet()?;
+        if key_reply.first() != Some(&1) {
+            return Err("`db_open`: chave publica nao recebida do MySQL (use usuario `mysql_native_password`)".to_string());
+        }
+        let encrypted = rsa_oaep_encrypt(password, seed, &key_reply[1..])?;
+        self.write_packet(&encrypted)?;
+        let (reply, _) = self.read_packet()?;
+        Self::check_ok_or_err(&reply, "`db_open`")
     }
 
     /// Confere OK (`0x00`) ou converte ERR (`0xFF`) em erro legivel
@@ -684,23 +923,7 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("timeout");
         let mut seq = 0u8;
-        // Saudacao: protocolo 10, versao, conn_id, seed[0..8], filler,
-        // caps, charset, status, caps_hi, auth_len, reservado, seed[8..]+NUL.
-        let mut greeting = vec![10u8];
-        greeting.extend_from_slice(b"mock-8.0\0");
-        greeting.extend_from_slice(&42u32.to_le_bytes());
-        greeting.extend_from_slice(&MOCK_SEED[..8]);
-        greeting.push(0);
-        greeting.extend_from_slice(&0x0200u16.to_le_bytes());
-        greeting.push(33);
-        greeting.extend_from_slice(&2u16.to_le_bytes());
-        greeting.extend_from_slice(&0x8087u16.to_le_bytes());
-        greeting.push(21);
-        greeting.extend_from_slice(&[0u8; 10]);
-        greeting.extend_from_slice(&MOCK_SEED[8..]);
-        greeting.push(0);
-        greeting.extend_from_slice(b"mysql_native_password\0");
-        mock_packet(&mut stream, &mut seq, &greeting);
+        mock_greeting(&mut stream, &mut seq, b"mysql_native_password\0", MOCK_SEED);
         // Resposta do cliente: valida usuario + token.
         let (hs, _) = mock_read(&mut stream);
         let mut pos = 4 + 4 + 1 + 23;
@@ -718,9 +941,35 @@ mod tests {
         assert_eq!(token, &expected[..], "auth invalida");
         // OK de boas-vindas.
         mock_packet(&mut stream, &mut seq, &[0, 0, 0, 2, 0, 0, 0]);
-        // RHP-AUD-008: cada comando reinicia a numeracao em 0 (protocolo);
-        // sem isso o servidor real responde 1156 ja no primeiro comando.
-        while let Some((cmd, cseq)) = mock_read_opt(&mut stream) {
+        serve_mock_commands(&mut stream, &mut seq);
+    }
+
+    /// Saudacao com plugin e seed configuraveis.
+    fn mock_greeting(stream: &mut TcpStream, seq: &mut u8, plugin: &[u8], seed: &[u8; 20]) {
+        // Saudacao: protocolo 10, versao, conn_id, seed[0..8], filler,
+        // caps, charset, status, caps_hi, auth_len, reservado, seed[8..]+NUL.
+        let mut greeting = vec![10u8];
+        greeting.extend_from_slice(b"mock-8.0\0");
+        greeting.extend_from_slice(&42u32.to_le_bytes());
+        greeting.extend_from_slice(&seed[..8]);
+        greeting.push(0);
+        greeting.extend_from_slice(&0x0200u16.to_le_bytes());
+        greeting.push(33);
+        greeting.extend_from_slice(&2u16.to_le_bytes());
+        greeting.extend_from_slice(&0x8087u16.to_le_bytes());
+        greeting.push(21);
+        greeting.extend_from_slice(&[0u8; 10]);
+        greeting.extend_from_slice(&seed[8..]);
+        greeting.push(0);
+        greeting.extend_from_slice(plugin);
+        mock_packet(stream, seq, &greeting);
+    }
+
+    /// Laco de comandos do mock (SELECT `um`/`s`, INSERT, erro 1064).
+    /// RHP-AUD-008: cada comando reinicia a numeracao em 0 (protocolo);
+    /// sem isso o servidor real responde 1156 ja no primeiro comando.
+    fn serve_mock_commands(stream: &mut TcpStream, seq: &mut u8) {
+        while let Some((cmd, cseq)) = mock_read_opt(stream) {
             if matches!(cmd.first(), Some(0x01) | Some(0x03)) {
                 assert_eq!(cseq, 0, "comando MySQL deve usar seq 0, veio {cseq}");
             }
@@ -730,25 +979,25 @@ mod tests {
                     let sql = String::from_utf8_lossy(&cmd[1..]).into_owned();
                     if sql.contains("um") {
                         // 2 colunas: `um` LONGLONG, `s` VAR_STRING.
-                        mock_packet(&mut stream, &mut seq, &[2]);
+                        mock_packet(stream, seq, &[2]);
                         let mut col_um = Vec::new();
                         mock_column("um", 8, &mut col_um);
-                        mock_packet(&mut stream, &mut seq, &col_um);
+                        mock_packet(stream, seq, &col_um);
                         let mut col_s = Vec::new();
                         mock_column("s", 253, &mut col_s);
-                        mock_packet(&mut stream, &mut seq, &col_s);
-                        mock_packet(&mut stream, &mut seq, &[0xFE, 0, 0, 2, 0]);
+                        mock_packet(stream, seq, &col_s);
+                        mock_packet(stream, seq, &[0xFE, 0, 0, 2, 0]);
                         // Linha: 1, "x".
-                        mock_packet(&mut stream, &mut seq, &[1, b'1', 1, b'x']);
-                        mock_packet(&mut stream, &mut seq, &[0xFE, 0, 0, 2, 0]);
+                        mock_packet(stream, seq, &[1, b'1', 1, b'x']);
+                        mock_packet(stream, seq, &[0xFE, 0, 0, 2, 0]);
                     } else if sql.starts_with("INSERT") {
                         // OK: 1 linha afetada.
-                        mock_packet(&mut stream, &mut seq, &[0, 1, 0, 2, 0, 0, 0]);
+                        mock_packet(stream, seq, &[0, 1, 0, 2, 0, 0, 0]);
                     } else {
                         // ERRO 1064 (0x0428, little-endian).
                         let mut err = vec![0xFF, 0x28, 0x04, b'#', b'4', b'2', b'0', b'0', b'0'];
                         err.extend_from_slice(b"syntax mock");
-                        mock_packet(&mut stream, &mut seq, &err);
+                        mock_packet(stream, seq, &err);
                     }
                 }
                 _ => break,
@@ -761,6 +1010,130 @@ mod tests {
         let port = listener.local_addr().expect("porta").port();
         std::thread::spawn(move || mysql_mock(listener));
         port
+    }
+
+    /// Sobe o mock `caching_sha2_password` (fast ou full auth).
+    /// Gera par RSA-1024 por teste (rapido o bastante). Devolve a porta;
+    /// o mock usa clones das chaves e valida tudo (stage-1, RSA).
+    fn mysql_caching_port(fast: bool) -> u16 {
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        use rsa::{PrivateKey, PublicKey};
+        let mut rng = super::SysRng;
+        let priv_key = PrivateKey::new(&mut rng, 1024).expect("gerar RSA mock");
+        let pub_key = PublicKey::from(&priv_key);
+        let pub_pem = pub_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("PEM mock")
+            .into_bytes();
+        let priv_der = priv_key
+            .to_pkcs8_der()
+            .expect("DER mock")
+            .as_bytes()
+            .to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("porta").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let pub_pem = pub_pem.clone();
+                let priv_der = priv_der.clone();
+                std::thread::spawn(move || mysql_caching_conn(stream, fast, &pub_pem, &priv_der));
+            }
+        });
+        port
+    }
+
+    const MOCK_CACHING_SEED: &[u8; 20] = b"0123456789ABCDEFGHIJ";
+    const MOCK_CACHING_SEED2: &[u8; 20] = b"KLMNOPQRSTuvwxyz1234";
+
+    /// Stage-1 esperado (recomputado; igual ao cliente).
+    fn mock_caching_token(password: &[u8], seed: &[u8]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let p1 = Sha256::digest(password);
+        let p2 = Sha256::digest(p1);
+        let mut h = Sha256::new();
+        h.update(p2);
+        h.update(seed);
+        let p3 = h.finalize();
+        p1.iter().zip(p3.iter()).map(|(a, b)| a ^ b).collect()
+    }
+
+    /// Decifra RSA-OAEP(SHA1) com a chave privada (somente mock/teste).
+    fn mock_rsa_decrypt(enc: &[u8], priv_der: &[u8]) -> Vec<u8> {
+        use rsa::pkcs8::DecodePrivateKey;
+        use rsa::{Oaep, PrivateKey};
+        let key = PrivateKey::from_pkcs8_der(priv_der).expect("chave mock invalida");
+        key.decrypt(Oaep::<sha1::Sha1>::new(), enc)
+            .expect("decifrar RSA mock")
+    }
+
+    /// Mock `caching_sha2_password`: greeting anuncia o plugin; valida o
+    /// stage-1 (inicial e pos-switch); `fast=true` devolve fast_auth_success
+    /// (more-data n==3 + OK), `fast=false` faz full auth (pede chave com
+    /// `0x02`, verifica o RSA decifrado). Depois serve comandos normais.
+    fn mysql_caching_conn(mut stream: TcpStream, fast: bool, pub_pem: &[u8], priv_pem: &[u8]) {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        let mut seq = 0u8;
+        mock_greeting(
+            &mut stream,
+            &mut seq,
+            b"caching_sha2_password\0",
+            MOCK_CACHING_SEED,
+        );
+        // Handshake inicial: usuario + stage-1 de 32 bytes.
+        let (hs, _) = mock_read(&mut stream);
+        let mut pos = 4 + 4 + 1 + 23;
+        let mut user = Vec::new();
+        while hs[pos] != 0 {
+            user.push(hs[pos]);
+            pos += 1;
+        }
+        pos += 1;
+        assert_eq!(user, MOCK_USER.as_bytes(), "usuario inesperado");
+        let token_len = hs[pos] as usize;
+        pos += 1;
+        assert_eq!(token_len, 32, "stage-1 caching tem 32 bytes");
+        let expected = mock_caching_token(MOCK_PASS.as_bytes(), MOCK_CACHING_SEED);
+        assert_eq!(&hs[pos..pos + token_len], &expected[..], "stage-1 invalido");
+        // AuthSwitchRequest para o mesmo plugin com nova seed.
+        let mut sw = vec![0xFEu8];
+        sw.extend_from_slice(b"caching_sha2_password\0");
+        sw.extend_from_slice(MOCK_CACHING_SEED2);
+        sw.push(0);
+        mock_packet(&mut stream, &mut seq, &sw);
+        // Stage-1 com a nova seed.
+        let (hs2, _) = mock_read(&mut stream);
+        let expected2 = mock_caching_token(MOCK_PASS.as_bytes(), MOCK_CACHING_SEED2);
+        assert_eq!(&hs2[..], &expected2[..], "stage-1 pos-switch invalido");
+        if fast {
+            // fast_auth_success: more-data n==3, depois OK.
+            mock_packet(&mut stream, &mut seq, &[0x01, 0x03]);
+            mock_packet(&mut stream, &mut seq, &[0, 0, 0, 2, 0, 0, 0]);
+        } else {
+            // fast_auth_fail: more-data n==4; cliente pede a chave (0x02).
+            mock_packet(&mut stream, &mut seq, &[0x01, 0x04]);
+            let (keyreq, _) = mock_read(&mut stream);
+            assert_eq!(keyreq, vec![0x02], "pedido de chave deve ser 0x02");
+            // more-data com a chave PEM.
+            let mut keypkt = vec![0x01u8];
+            keypkt.extend_from_slice(pub_pem);
+            mock_packet(&mut stream, &mut seq, &keypkt);
+            // Bloco cifrado: RSA-OAEP(SHA1) de XOR(senha+NUL, seed nova).
+            let (enc, _) = mock_read(&mut stream);
+            let plain = mock_rsa_decrypt(&enc, priv_pem);
+            let mut want = Vec::from(MOCK_PASS.as_bytes());
+            want.push(0);
+            let seed = MOCK_CACHING_SEED2;
+            let want: Vec<u8> = want
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b ^ seed[i % seed.len()])
+                .collect();
+            assert_eq!(plain, want, "conteudo RSA invalido");
+            mock_packet(&mut stream, &mut seq, &[0, 0, 0, 2, 0, 0, 0]);
+        }
+        serve_mock_commands(&mut stream, &mut seq);
     }
 
     fn run_mysql(src: &str) -> Result<String, String> {
@@ -801,5 +1174,32 @@ mod tests {
         ))
         .expect("dreno apos exec-select");
         assert_eq!(out, "erro-ok\n[{s: x, um: 1}]\nnull\n");
+    }
+
+    #[test]
+    fn mysql_caching_sha2_fast_auth_against_mock() {
+        // RFC 0033: fast path (stage-1 + AuthSwitch + n==3 + OK).
+        let port = mysql_caching_port(true);
+        let open =
+            format!("db_open(\"mysql:host=127.0.0.1 port={port} user=teste password=segredo\")");
+        let out = run_mysql(&format!(
+            "let h = {open};\nlet linhas = db_query(h, \"SELECT 1 AS um, 'x' AS s\", []);\necho linhas;\necho db_close(h);\n"
+        ))
+        .expect("caching fast auth");
+        assert_eq!(out, "[{s: x, um: 1}]\nnull\n");
+    }
+
+    #[test]
+    fn mysql_caching_sha2_full_auth_against_mock() {
+        // RFC 0033: full auth (stage-1 + AuthSwitch + n==4 + chave + RSA).
+        // O mock decifra e confere XOR(senha+NUL, seed).
+        let port = mysql_caching_port(false);
+        let open =
+            format!("db_open(\"mysql:host=127.0.0.1 port={port} user=teste password=segredo\")");
+        let out = run_mysql(&format!(
+            "let h = {open};\necho db_exec(h, \"INSERT INTO t VALUES (1)\", []);\necho db_close(h);\n"
+        ))
+        .expect("caching full auth");
+        assert_eq!(out, "1\nnull\n");
     }
 }

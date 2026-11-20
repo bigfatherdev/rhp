@@ -35,7 +35,9 @@
 //! ExprStmt   := Expr ";"
 //! Expr       := Ternary
 //! Ternary    := NullCoalesce ("?" Ternary ":" Ternary)?
-//! NullCoalesce := Equality ("??" NullCoalesce)?
+//! NullCoalesce := LogicalOr (("??") NullCoalesce)?
+//! LogicalOr  := LogicalAnd (("||") LogicalAnd)*
+//! LogicalAnd := Equality (("&&") Equality)*
 //! Equality   := BitOr (("==" | "!=") BitOr)*
 //! BitOr      := BitXor (("|") BitXor)*
 //! BitXor     := BitAnd ("^" BitAnd)*
@@ -566,6 +568,10 @@ pub enum BinOp {
     Ge,
     BitAnd,
     BitOr,
+    /// `&&` logico com curto-circuito (RFC 0031; estritamente `Bool`).
+    LogicalAnd,
+    /// `||` logico com curto-circuito (RFC 0031; estritamente `Bool`).
+    LogicalOr,
     BitXor,
     Shl,
     Shr,
@@ -784,7 +790,9 @@ fn token_width(token: &Token) -> usize {
         | TokenKind::GtEq
         | TokenKind::Shl
         | TokenKind::Shr
-        | TokenKind::QuestionQuestion => 2,
+        | TokenKind::QuestionQuestion
+        | TokenKind::LogicalAnd
+        | TokenKind::LogicalOr => 2,
         _ => 1,
     }
 }
@@ -2730,8 +2738,48 @@ fn parse_null_coalesce_rest(cursor: &mut Cursor<'_>, left: Expr) -> Result<Expr,
     })
 }
 
+/// `||` com curto-circuito (RFC 0031): `a || b` avalia `b` so se `a`
+/// for falso. Precedencia: abaixo do ternario, acima de `&&`.
+fn parse_logical_or(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let mut expr = parse_logical_and(cursor)?;
+    let mut chain = 0u32;
+    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LogicalOr)) {
+        cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
+        let right = parse_logical_and(cursor)?;
+        expr = Expr::Binary {
+            op: BinOp::LogicalOr,
+            left: Box::new(expr),
+            right: Box::new(right),
+        };
+    }
+    Ok(expr)
+}
+
+/// `&&` com curto-circuito (RFC 0031): `a && b` avalia `b` so se `a`
+/// for verdadeiro. Precedencia: acima de `||`, abaixo de `??`.
+fn parse_logical_and(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let mut expr = parse_equality(cursor)?;
+    let mut chain = 0u32;
+    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LogicalAnd)) {
+        cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
+        let right = parse_equality(cursor)?;
+        expr = Expr::Binary {
+            op: BinOp::LogicalAnd,
+            left: Box::new(expr),
+            right: Box::new(right),
+        };
+    }
+    Ok(expr)
+}
+
 fn parse_null_coalesce(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
-    let left = parse_equality(cursor)?;
+    // `??` e o mais frouxo dos tres (RFC 0031, como PHP/C#): os operandos
+    // sao `||` (que contem `&&`), entao `a ?? b || c` = `a ?? (b || c)`.
+    let left = parse_logical_or(cursor)?;
     if matches!(
         cursor.peek().map(|t| &t.kind),
         Some(TokenKind::QuestionQuestion)
@@ -3348,6 +3396,8 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Slash => "`/`".to_string(),
         TokenKind::BitAnd => "`&`".to_string(),
         TokenKind::BitOr => "`|`".to_string(),
+        TokenKind::LogicalAnd => "`&&`".to_string(),
+        TokenKind::LogicalOr => "`||`".to_string(),
         TokenKind::BitXor => "`^`".to_string(),
         TokenKind::BitNot => "`~`".to_string(),
         TokenKind::Shl => "`<<`".to_string(),
@@ -4066,6 +4116,67 @@ mod tests {
             Stmt::Echo {
                 expr: Expr::Binary {
                     op: BinOp::NullCoalesce,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_logical_and_or_with_precedence() {
+        // RFC 0031: `||` abaixo de `&&` abaixo de `??` abaixo de `==`.
+        let program = lex_and_parse("echo a && b;").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0].stmt,
+            Stmt::Echo {
+                expr: Expr::Binary {
+                    op: BinOp::LogicalAnd,
+                    ..
+                }
+            }
+        ));
+        // `a || b && c` => Or(a, And(b, c)).
+        let program = lex_and_parse("echo a || b && c;").expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::Echo {
+                expr:
+                    Expr::Binary {
+                        op: BinOp::LogicalOr,
+                        right,
+                        ..
+                    },
+            } => {
+                assert!(
+                    matches!(
+                        right.as_ref(),
+                        Expr::Binary {
+                            op: BinOp::LogicalAnd,
+                            ..
+                        }
+                    ),
+                    "lado direito deveria ser &&: {right:?}"
+                );
+            }
+            outra => panic!("forma inesperada: {outra:?}"),
+        }
+        // `a ?? b || c` => ??(a, Or(b, c)) — `??` o mais frouxo dos tres.
+        let program = lex_and_parse("echo a ?? b || c;").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0].stmt,
+            Stmt::Echo {
+                expr: Expr::Binary {
+                    op: BinOp::NullCoalesce,
+                    ..
+                }
+            }
+        ));
+        // `&` sozinho continua bitwise (sem regressao).
+        let program = lex_and_parse("echo a & b;").expect("parse deve passar");
+        assert!(matches!(
+            program.statements[0].stmt,
+            Stmt::Echo {
+                expr: Expr::Binary {
+                    op: BinOp::BitAnd,
                     ..
                 }
             }

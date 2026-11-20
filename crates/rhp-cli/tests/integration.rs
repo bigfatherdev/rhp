@@ -1455,6 +1455,28 @@ fn rhp_run_reports_both_arg_types() {
 }
 
 #[test]
+fn rhp_run_logical_operators_end_to_end() {
+    // RFC 0031: curto-circuito observavel + precedencia + erro em nao-Bool.
+    let output = run_temp_source(
+        "logica.rhp",
+        "fn lado(n) { echo n; return true; }\necho false && lado(\"x\");\necho true || lado(\"y\");\necho true || true && false;\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"false\ntrue\ntrue\n");
+    let output = run_temp_source("logica2.rhp", "echo 1 && true;\n");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("condicao deve ser bool"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn rhp_run_error_shows_call_stack() {
     // Etapa 4: stack trace da mais interna para a mais externa; erro no
     // nivel superior nao imprime pilha.
