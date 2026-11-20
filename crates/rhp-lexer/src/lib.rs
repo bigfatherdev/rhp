@@ -76,6 +76,10 @@ pub enum TokenKind {
     BitNot,
     BitAnd,
     BitOr,
+    /// `&&` logico com curto-circuito (RFC 0031).
+    LogicalAnd,
+    /// `||` logico com curto-circuito (RFC 0031).
+    LogicalOr,
     BitXor,
     Shl,
     Shr,
@@ -292,14 +296,28 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 col += 1;
             }
             '&' => {
-                tokens.push(Token::new(TokenKind::BitAnd, line, col));
+                let start_col = col;
                 chars.next();
                 col += 1;
+                if chars.peek().copied().is_some_and(|(_, c)| c == '&') {
+                    chars.next();
+                    col += 1;
+                    tokens.push(Token::new(TokenKind::LogicalAnd, line, start_col));
+                } else {
+                    tokens.push(Token::new(TokenKind::BitAnd, line, start_col));
+                }
             }
             '|' => {
-                tokens.push(Token::new(TokenKind::BitOr, line, col));
+                let start_col = col;
                 chars.next();
                 col += 1;
+                if chars.peek().copied().is_some_and(|(_, c)| c == '|') {
+                    chars.next();
+                    col += 1;
+                    tokens.push(Token::new(TokenKind::LogicalOr, line, start_col));
+                } else {
+                    tokens.push(Token::new(TokenKind::BitOr, line, start_col));
+                }
             }
             '^' => {
                 tokens.push(Token::new(TokenKind::BitXor, line, col));

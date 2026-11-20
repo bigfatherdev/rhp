@@ -2,6 +2,48 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
+## [0.7.0] — 2026-11-20 (Operadores lógicos, pertinência em array, MySQL caching_sha2)
+
+### Added
+
+- Operadores lógicos `&&` e `||` com curto-circuito (RFC 0031):
+  estritamente `Bool` (E3003 fora disso); `false && x` / `true || x` não
+  avaliam `x`. Precedência: ternario < `||` < `&&` < `??` < `==`.
+  Opcode novo `AssertBool` (neutro na pilha) para o operando direito.
+  Registro: `changes/2026-11-20-feat-logical-operators.md`.
+- `contains(array, valor)` (RFC 0032): pertinência por igualdade de valor
+  (`==`); `[]` = `false`. Registro: `changes/2026-11-20-feat-contains-array.md`.
+- MySQL `caching_sha2_password` (RFC 0033): stage-1, fast_auth_success e
+  full auth com RSA-OAEP(SHA1) e chave pública do servidor (puro Rust;
+  validado contra MySQL 8.0 default + mock com RSA real). Registro:
+  `changes/2026-11-20-feat-caching-sha2.md`.
+
+### Fixed
+
+- `rhp build ... [--check]` tratado como arquivo de saída (USAGE mentia).
+  USAGE corrigido para `[saida]` + teste que trava o texto.
+
+### Improved
+
+- `docs/REFERENCIA.md`, `LANGUAGE_SPEC.md`, `BYTECODE_SPEC.md` (tabela de
+  builtins 64–82 + `AssertBool`), `docs/DOCKER.md`, `README.md` e RFCs
+  0031–0033 (aceitas e implementadas).
+- `tools/fuzz-smoke.sh`: fuzz mutacional versionado (300 casos limpos).
+
+### Compatibility
+
+- Adições puras: `&&`/`||`/`contains-array`/`caching_sha2` não alteram
+  programas válidos existentes. Nenhuma sintaxe removida; nenhum E-code
+  alterado.
+- Contagem stdlib: 83 builtins (0.6.2 adicionou `fs_*`; sem mudança aqui).
+
+### Known limitations
+
+- Sem `and`/`or` (sintaxe alternativa rejeitada na RFC 0031); sem `in`
+  (rejeitado na RFC 0032 — usar `contains`); sem TLS no MySQL (terminar
+  TLS no proxy/rede; documentado na RFC 0033); `db_exec(SELECT)` segue
+  inconsistente entre drivers (documentado).
+
 ## [0.6.2] — 2026-11-20 (Auditoria independente: HOF, dreno DB, FS, diagnósticos)
 
 ### Fixed

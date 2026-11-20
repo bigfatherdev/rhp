@@ -216,11 +216,16 @@ ExprStmt   := Expr ";"
 
 ## 3. Expressoes e precedencia (da menor para a maior)
 
-Ternario (`a ? b : c`, associativo a direita) < coalescencia nula
+Ternario (`a ? b : c`, associativo a direita) < OU-logico (`a || b`,
+curto-circuito) < E-logico (`a && b`, curto-circuito) < coalescencia nula
 (`a ?? b`, avalia `a` uma vez; `null` usa `b`) < igualdade (`==`, `!=`) <
 OU-bit (`|`) < XOR-bit (`^`) < E-bit (`&`) < comparacao (`<`, `<=`, `>`,
 `>=`) < deslocamento (`<<`, `>>`) < aditiva (`+`, `-`) < multiplicativa
 (`*`, `/`, `%`) < unaria (`!`, `-`, `~` e `+x` como identidade) < primaria.
+
+`&&`/`||` exigem `Bool` nos dois operandos (E3003 fora disso) e devolvem
+`Bool`; o lado direito nao e avaliado quando o esquerdo decide
+(`false && x`, `true || x`).
 
 ```text
 Primary   := Int | Float | String | "true" | "false" | "null"

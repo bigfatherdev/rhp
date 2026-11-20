@@ -538,23 +538,25 @@ fn fmt_for_c_head(
 }
 
 /// Precedencia para parenteses minimos (maior = liga mais forte).
-/// Espelha a gramatica do parser (ternario < `??` < igualdade < bits).
+/// Espelha a gramatica do parser (ternario < `||` < `&&` < `??` < igualdade < bits).
 fn prec_of(expr: &Expr) -> u8 {
     match expr {
         Expr::Ternary { .. } => 0,
         Expr::Binary { op, .. } => match op {
-            BinOp::NullCoalesce => 1,
-            BinOp::Eq | BinOp::Ne => 2,
-            BinOp::BitOr => 3,
-            BinOp::BitXor => 4,
-            BinOp::BitAnd => 5,
-            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 6,
-            BinOp::Shl | BinOp::Shr => 7,
-            BinOp::Add | BinOp::Sub => 8,
-            BinOp::Mul | BinOp::Div | BinOp::Mod => 9,
+            BinOp::LogicalOr => 1,
+            BinOp::LogicalAnd => 2,
+            BinOp::NullCoalesce => 3,
+            BinOp::Eq | BinOp::Ne => 4,
+            BinOp::BitOr => 5,
+            BinOp::BitXor => 6,
+            BinOp::BitAnd => 7,
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 8,
+            BinOp::Shl | BinOp::Shr => 9,
+            BinOp::Add | BinOp::Sub => 10,
+            BinOp::Mul | BinOp::Div | BinOp::Mod => 11,
         },
-        Expr::Unary { .. } => 10,
-        _ => 11,
+        Expr::Unary { .. } => 12,
+        _ => 13,
     }
 }
 
@@ -596,8 +598,8 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
                 UnaryOp::BitNot => "~",
             };
             // O proprio filho binario adiciona parenteses quando
-            // `prec < 10`; aqui basta concatenar.
-            format!("{symbol}{}", fmt_expr(expr, 10))
+            // `prec < 12` (precedencia do unario); aqui basta concatenar.
+            format!("{symbol}{}", fmt_expr(expr, 12))
         }
         Expr::Ternary {
             cond,
@@ -631,6 +633,8 @@ fn fmt_expr(expr: &Expr, parent_prec: u8) -> String {
                 BinOp::Ge => ">=",
                 BinOp::BitAnd => "&",
                 BinOp::BitOr => "|",
+                BinOp::LogicalAnd => "&&",
+                BinOp::LogicalOr => "||",
                 BinOp::BitXor => "^",
                 BinOp::Shl => "<<",
                 BinOp::Shr => ">>",

@@ -698,6 +698,10 @@ pub enum Op {
     /// Suspender gerador (`Yield`; RFC 0018): desempilha o valor e o
     /// entrega ao retomador, guardando o frame para continuar depois.
     Yield,
+    /// Exige `Bool` no topo (RFC 0031): `&&`/`||` verificam o operando
+    /// direito (o esquerdo ja passa por `JumpIfFalse`/`JumpIfTrue`).
+    /// Neutro na pilha (espia); erro E3003 fora de `Bool`.
+    AssertBool,
 }
 
 /// Identificador numerico estavel de builtin (para o bytecode).
@@ -1119,7 +1123,8 @@ fn check_stack_flow(code: &[Op], constants: &[Value], context: &str) -> Result<(
                 (height, Some(vec![ip + 1]))
             }
             // `CheckType` so espia o topo (anotacao `: tipo`, RFC 0016).
-            Op::CheckType(_) => {
+            // `AssertBool` idem (RFC 0031).
+            Op::CheckType(_) | Op::AssertBool => {
                 check_depth(height, 1, op, context)?;
                 (height, Some(vec![ip + 1]))
             }
@@ -1564,6 +1569,15 @@ fn eval_const_binary(op: BinOp, l: Value, r: Value) -> Result<Value, CompileErro
                 BinOp::BitAnd => a & b,
                 BinOp::BitOr => a | b,
                 _ => a ^ b,
+            })),
+            _ => Err(invalid()),
+        },
+        // `&&`/`||` em constantes: so literais `Bool` (mesma regra estrita
+        // do runtime; curto-circuito irrelevante sem efeitos colaterais).
+        BinOp::LogicalAnd | BinOp::LogicalOr => match (l, r) {
+            (B(a), B(b)) => Ok(B(match op {
+                BinOp::LogicalAnd => a && b,
+                _ => a || b,
             })),
             _ => Err(invalid()),
         },
@@ -3421,6 +3435,46 @@ impl Compiler {
                 let end_target = self.chunk.code.len() as u32;
                 self.patch_jump(end, end_target);
             }
+            Expr::Binary {
+                op: BinOp::LogicalAnd,
+                left,
+                right,
+            } => {
+                // Curto-circuito: `false && _` nao avalia a direita.
+                // Ambos os lados sao estritamente `Bool`: o esquerdo via
+                // `JumpIfFalse`, o direito via `AssertBool` (E3003).
+                self.compile_expr(left)?;
+                let false_jump = self.emit(Op::JumpIfFalse(u32::MAX));
+                self.compile_expr(right)?;
+                self.emit(Op::AssertBool);
+                let end_jump = self.emit(Op::Jump(u32::MAX));
+                let false_target = self.chunk.code.len() as u32;
+                self.patch_jump(false_jump, false_target);
+                let idx = self.add_constant(Value::Bool(false))?;
+                self.emit(Op::Constant(idx));
+                let end_target = self.chunk.code.len() as u32;
+                self.patch_jump(end_jump, end_target);
+            }
+            Expr::Binary {
+                op: BinOp::LogicalOr,
+                left,
+                right,
+            } => {
+                // Curto-circuito: `true || _` nao avalia a direita.
+                // Ambos os lados sao estritamente `Bool`: o esquerdo via
+                // `JumpIfTrue`, o direito via `AssertBool` (E3003).
+                self.compile_expr(left)?;
+                let true_jump = self.emit(Op::JumpIfTrue(u32::MAX));
+                self.compile_expr(right)?;
+                self.emit(Op::AssertBool);
+                let end_jump = self.emit(Op::Jump(u32::MAX));
+                let true_target = self.chunk.code.len() as u32;
+                self.patch_jump(true_jump, true_target);
+                let idx = self.add_constant(Value::Bool(true))?;
+                self.emit(Op::Constant(idx));
+                let end_target = self.chunk.code.len() as u32;
+                self.patch_jump(end_jump, end_target);
+            }
             Expr::Ternary {
                 cond,
                 then_branch,
@@ -3460,6 +3514,13 @@ impl Compiler {
                         // Inalcancavel: tratado no braco dedicado acima.
                         return Err(CompileError::new(
                             "erro interno: NullCoalesce fora do caminho dedicado".to_string(),
+                        ));
+                    }
+                    BinOp::LogicalAnd | BinOp::LogicalOr => {
+                        // Inalcancaveis: tratados nos bracos dedicados acima
+                        // (curto-circuito via jumps).
+                        return Err(CompileError::new(
+                            "erro interno: operador logico fora do caminho dedicado".to_string(),
                         ));
                     }
                 };

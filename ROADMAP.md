@@ -1,5 +1,13 @@
 # ROADMAP.md — Planejamento e estado (Next Generation + limitacoes cuidadas)
 
+## RHP 0.7.0 — Lógica, pertinência e caching_sha2 (2026-11-20, RFCs 0031–0033)
+
+- [x] `&&`/`||` com curto-circuito (E3003 estrito; `AssertBool`; precedência documentada).
+- [x] `contains(array, valor)` (igualdade por valor).
+- [x] MySQL `caching_sha2_password` (fast + full RSA; live 8.0 default).
+- [x] `tools/fuzz-smoke.sh` versionado; suíte + bench + docs.
+- [ ] Futuro (fora do escopo 0.7.0): `and`/`or`, `in`, TLS no MySQL, builder de strings, `fs_chmod`/`stat`, unificar `db_exec(SELECT)`.
+
 ## RHP 0.6.2 — Auditoria independente (2026-11-20, P0/P1 zerados)
 
 - [x] HOF `pending` obsoleto → amarra + descarte no unwind + regressão.

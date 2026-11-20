@@ -1268,6 +1268,20 @@ impl Vm {
                 check_type_or_err(value, tag)?;
                 self.frames[idx].ip += 1;
             }
+            Op::AssertBool => {
+                let is_bool = matches!(self.frames[idx].stack.last(), Some(Value::Bool(_)));
+                if !is_bool {
+                    let got = self.frames[idx]
+                        .stack
+                        .last()
+                        .map(type_name)
+                        .unwrap_or("vazio");
+                    return Err(VmError::new(format!(
+                        "condicao deve ser bool, encontrado {got}"
+                    )));
+                }
+                self.frames[idx].ip += 1;
+            }
             Op::IterList => {
                 let value = self.pop(idx, "iteracao")?;
                 let list = match value {
@@ -3613,6 +3627,71 @@ mod tests {
     }
 
     #[test]
+    fn runs_logical_and_or() {
+        // RFC 0031: tabela-verdade.
+        assert_eq!(
+            run_src(
+                "echo true && true; echo true && false; echo false && true; echo false && false;"
+            )
+            .expect("ok"),
+            "true\nfalse\nfalse\nfalse\n"
+        );
+        assert_eq!(
+            run_src("echo true || false; echo false || true; echo false || false;").expect("ok"),
+            "true\ntrue\nfalse\n"
+        );
+        // Curto-circuito: lado direito com efeito nao executa.
+        assert_eq!(
+            run_src(
+                "fn lado(n) { echo n; return true; } echo false && lado(\"x\"); echo \"depois\";"
+            )
+            .expect("ok"),
+            "false\ndepois\n"
+        );
+        assert_eq!(
+            run_src(
+                "fn lado(n) { echo n; return false; } echo true || lado(\"y\"); echo \"depois\";"
+            )
+            .expect("ok"),
+            "true\ndepois\n"
+        );
+        assert_eq!(
+            run_src("fn lado(n) { echo n; return n == \"b\"; } echo lado(\"a\") && lado(\"b\");")
+                .expect("ok"),
+            "a\nfalse\n"
+        );
+        assert_eq!(
+            run_src("fn lado(n) { echo n; return n == \"b\"; } echo lado(\"b\") && lado(\"b\");")
+                .expect("ok"),
+            "b\nb\ntrue\n"
+        );
+        // Precedencia: `&&` prende mais que `||`; `??` mais frouxo que ambos.
+        assert_eq!(
+            run_src("echo true || true && false; echo (true || true) && false; echo true && false || true && true;").expect("ok"),
+            "true\nfalse\ntrue\n"
+        );
+        assert_eq!(
+            run_src("echo true ? false : true || true; echo null ?? false || true;").expect("ok"),
+            "false\ntrue\n"
+        );
+        // `??` e o mais frouxo: `false ?? true || true` = `false ?? (true || true)`.
+        assert_eq!(
+            run_src("echo false ?? true || true;").expect("ok"),
+            "false\n"
+        );
+        // Estrito: nao-`Bool` = E3003 (via JumpIfFalse/JumpIfTrue).
+        let err = run_err("echo 1 && true;");
+        assert!(err.contains("condicao deve ser bool"), "obteve: {err}");
+        let err = run_err("echo false || 0;");
+        assert!(err.contains("condicao deve ser bool"), "obteve: {err}");
+        // Em condicoes e com `!`: composicao total.
+        assert_eq!(
+            run_src("let ok = true; let n = 5; if ok && n > 0 || false { echo \"sim\"; } echo !ok || n == 5;").expect("ok"),
+            "sim\ntrue\n"
+        );
+    }
+
+    #[test]
     fn runs_filter_with_callback() {
         assert_eq!(
             run_src("echo filter([1, 2, 3, 4], fn (x) { return x > 2; });").expect("ok"),
@@ -4432,6 +4511,7 @@ mod tests {
                 rng.next(n_consts as u64 + 2) as u32,
             ),
             51 => Op::JumpIfTrue(rng.next(code_len as u64 + 2) as u32),
+            53 => Op::AssertBool,
             52 => Op::Yield,
             _ => Op::EnterScope,
         }
@@ -4848,6 +4928,16 @@ mod tests {
         assert_eq!(
             run_src("echo contains(\"ola mundo\", \"mundo\");").expect("ok"),
             "true\n"
+        );
+        // RFC 0032: pertinencia em array (igualdade por valor).
+        assert_eq!(
+            run_src("echo contains([1, 2, 3], 2); echo contains([1], 9); echo contains([], 1);")
+                .expect("ok"),
+            "true\nfalse\nfalse\n"
+        );
+        assert_eq!(
+            run_src("echo contains([[1], [2]], [2]); echo contains([1, 2.0], 2);").expect("ok"),
+            "true\ntrue\n"
         );
         assert_eq!(
             run_src("echo starts_with(\"ola\", \"o\");").expect("ok"),
