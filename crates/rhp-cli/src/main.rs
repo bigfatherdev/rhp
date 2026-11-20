@@ -14,7 +14,7 @@ use rhp_parser::{AssignTarget, Expr, ImportName, Program, Stmt, StmtNode};
 mod lsp;
 mod pkg;
 
-const USAGE: &str = "uso: rhp run [--max-steps N] [--max-heap-bytes N] [--trace] <arquivo.rhp> [args] | rhp repl | rhp lsp | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [--check]";
+const USAGE: &str = "uso: rhp run [--max-steps N] [--max-heap-bytes N] [--trace] <arquivo.rhp> [args] | rhp repl | rhp lsp | rhp fmt [--check] <arquivo> | rhp check [--json] <arquivo> | rhp test [dir|arquivo] | rhp doctor | rhp init [dir] | rhp pkg add <nome> <caminho> | rhp pkg install [dir] [--check] | rhp build <arquivo.rhp> [saida]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -2206,6 +2206,16 @@ fn check_block_imports(body: &[StmtNode], context: &str) -> Result<(), LoadError
 mod tests {
     use super::*;
 
+    #[test]
+    fn usage_documents_build_output_arg() {
+        // RHP-AUD-IND-005: USAGE dizia `build ... [--check]`, mas o 4o
+        // argumento e a saida (docs e implementacao: `[saida]`).
+        assert!(
+            USAGE.contains("rhp build <arquivo.rhp> [saida]"),
+            "USAGE desatualizado: {USAGE}"
+        );
+    }
+
     fn write_temp_module(dir: &Path, name: &str, content: &str) -> PathBuf {
         let file = dir.join(name);
         std::fs::write(&file, content).expect("nao foi possivel escrever modulo temporario");
@@ -2714,6 +2724,50 @@ mod tests {
             .expect_err("deve falhar")
             .into_message();
         assert!(err.contains("fs_list"), "obteve: {err}");
+    }
+
+    #[test]
+    fn runs_fs_lifecycle_builtins() {
+        // RHP-AUD-IND-004: mkdir (com pais) + rename + remove (arquivo e
+        // diretorio vazio) + erros limpos (nao-vazio, ausente, tipo).
+        let dir = temp_dir("fs-life");
+        let sub = dir.join("sub").join("ninho");
+        let src = format!(
+            concat!(
+                "echo fs_mkdir({sub:?});\n",
+                "echo fs_write({f:?}, \"x\");\n",
+                "echo fs_rename({f:?}, {g:?});\n",
+                "echo fs_exists({f:?});\n",
+                "echo fs_exists({g:?});\n",
+                "try {{ echo fs_remove({subparent:?}); }} catch e {{ echo \"cheio\"; }}\n",
+                "echo fs_remove({g:?});\n",
+                "echo fs_remove({ninho:?});\n",
+                "echo fs_remove({subparent:?});\n",
+                "echo fs_exists({subparent:?});\n",
+            ),
+            sub = sub.to_string_lossy(),
+            f = sub.join("f.txt").to_string_lossy(),
+            g = sub.join("g.txt").to_string_lossy(),
+            subparent = dir.join("sub").to_string_lossy(),
+            ninho = sub.to_string_lossy(),
+        );
+        let main = write_temp_module(&dir, "main.rhp", &src);
+        let mut buf: Vec<u8> = Vec::new();
+        run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect("deve passar");
+        assert_eq!(
+            String::from_utf8(buf).expect("saida utf8"),
+            "null\n1\nnull\nfalse\ntrue\ncheio\nnull\nnull\nnull\nfalse\n"
+        );
+        let bad = write_temp_module(
+            &dir,
+            "bad.rhp",
+            "echo fs_remove(\"/caminho/que/nao/existe-xyz\");\n",
+        );
+        let mut buf_bad: Vec<u8> = Vec::new();
+        let err = run_file_with_args(&bad.to_string_lossy(), &[], &mut buf_bad)
+            .expect_err("deve falhar")
+            .into_message();
+        assert!(err.contains("fs_remove"), "obteve: {err}");
     }
 
     #[test]
