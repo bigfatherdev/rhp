@@ -2,6 +2,37 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
+## [0.6.1] — 2026-11-20 (Auditoria full-system: crash do parser, MySQL, diagnósticos)
+
+### Fixed
+
+- Estouro de pilha nativa (SIGABRT) com cadeias planas longas
+  (`1+1+...`, `!!!x`, `a?b:c?d...`, `a??b??...`, `a.b.c`, `a[0][1]`,
+  `f()()()`): teto uniforme de 64 níveis + `nest` nas recursões; tudo
+  vira E1000 limpo com posição. Registro:
+  `changes/2026-11-20-fix-parser-depth-chains.md`.
+- MySQL 100% inoperante: `seq` de pacote não zerava por comando (erro
+  1156 já no primeiro comando). Uma linha em `command()`; validado ao
+  vivo em MariaDB 11 e MySQL 8.0 (`mysql_native_password`).
+  Registro: `changes/2026-11-20-fix-mysql-seq-reset.md`.
+- 23 mensagens de erro de tipo 2-arg citavam só o 1º tipo
+  (`split("a,b", 1)` dizia "encontrado string"). Agora ambos
+  (`(string, int)`). Registro:
+  `changes/2026-11-20-improved-builtin-arg-types.md`.
+
+### Changed
+
+- Teto sintático 128→64 níveis (medição: ~120 já estoura threads de 2 MiB
+  em debug; 64 ≈ 2× margem). Cadeias 65–128 agora E1000 (patológicas;
+  código real não chega perto). Spec e docs atualizados.
+- `docs/REFERENCIA.md` (`db_query`): `true` gravado volta `1` (`Int`) no
+  SQLite/MySQL (sem bool nativo); só PG round-tripa `Bool`.
+
+### Known limitations
+
+- Sem `&&`/`||`, sem pertinência em array, MySQL `caching_sha2_password`
+  (exigem RFC — planejado 0.7.0). Detalhes: `audit/full-system/`.
+
 ## [0.6.0] — 2026-11-20 (Correcao, robustez do runtime e evolucao do HTTP)
 
 ### Fixed

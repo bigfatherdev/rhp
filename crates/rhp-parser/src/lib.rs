@@ -621,7 +621,12 @@ struct Cursor<'a> {
 /// entradas patologicas; ver AUD-001). Cadeias planas (`1+1+...`, instrucoes
 /// em sequencia) nao acumulam profundidade. Calibrado para caber com folga
 /// na pilha de 2 MiB das threads de teste (~9 frames Rust por nivel).
-pub const MAX_PARSE_DEPTH: u32 = 128;
+/// Teto de profundidade sintatica (niveis de `nest` + elos de cadeia).
+/// Calibrado por medicao (RHP-AUD-001): em builds debug, ~120 niveis de
+/// parenteses ja estouram threads de 2 MiB (cada nivel ~15 quadros de
+/// parse); 64 da ~2x de margem. Vale para aninhamento E cadeias planas
+/// (`1+1+...`, `a.b.c`, `!!!x`), que aprofundam a AST do mesmo jeito.
+pub const MAX_PARSE_DEPTH: u32 = 64;
 
 impl<'a> Cursor<'a> {
     fn new(tokens: &'a [Token]) -> Self {
@@ -731,6 +736,23 @@ impl<'a> Cursor<'a> {
         let result = f(&mut *self);
         self.depth -= 1;
         result
+    }
+
+    /// Conta um elo de cadeia esquerda (`a op b op c...`, `a.b.c`,
+    /// `a[0][1]`) contra o teto de profundidade. Cadeias nao passam por
+    /// `nest` (sao lacos, nao niveis), mas cada elo aprofunda a AST a
+    /// esquerda — sem teto, `1+1+...` arbitrariamente longo estoura a
+    /// pilha nativa em `compile`/`Display`/`Drop` (RHP-AUD-001).
+    fn check_chain(&self, chain: u32, what: &str) -> Result<(), ParseError> {
+        if self.depth + chain > MAX_PARSE_DEPTH {
+            let (line, col) = self.end_pos();
+            return Err(ParseError::new(
+                format!("profundidade maxima excedida em {what} (limite {MAX_PARSE_DEPTH})"),
+                line,
+                col,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2671,9 +2693,9 @@ fn parse_ternary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) {
             return parse_elvis_rest(cursor, cond);
         }
-        let then_branch = parse_ternary(cursor)?;
+        let then_branch = cursor.nest("ramo do ternario", parse_ternary)?;
         expect_token(cursor, &TokenKind::Colon, "esperado `:` no ternario")?;
-        let else_branch = parse_ternary(cursor)?;
+        let else_branch = cursor.nest("ramo do ternario", parse_ternary)?;
         return Ok(Expr::Ternary {
             cond: Box::new(cond),
             then_branch: Box::new(then_branch),
@@ -2696,6 +2718,18 @@ fn parse_elvis_rest(cursor: &mut Cursor<'_>, cond: Expr) -> Result<Expr, ParseEr
     })
 }
 
+/// Resto do `??` apos o operador (associativo a direita via `nest`, com
+/// teto — sem isso, `a ?? b ?? ...` arbitrariamente longo estoura a
+/// pilha nativa; ver RHP-AUD-001).
+fn parse_null_coalesce_rest(cursor: &mut Cursor<'_>, left: Expr) -> Result<Expr, ParseError> {
+    let right = cursor.nest("operador `??`", parse_null_coalesce)?;
+    Ok(Expr::Binary {
+        op: BinOp::NullCoalesce,
+        left: Box::new(left),
+        right: Box::new(right),
+    })
+}
+
 fn parse_null_coalesce(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let left = parse_equality(cursor)?;
     if matches!(
@@ -2704,18 +2738,14 @@ fn parse_null_coalesce(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     ) {
         cursor.next();
         // Associativo a direita: `a ?? b ?? c` = `a ?? (b ?? c)`.
-        let right = parse_null_coalesce(cursor)?;
-        return Ok(Expr::Binary {
-            op: BinOp::NullCoalesce,
-            left: Box::new(left),
-            right: Box::new(right),
-        });
+        return parse_null_coalesce_rest(cursor, left);
     }
     Ok(left)
 }
 
 fn parse_equality(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_bitor(cursor)?;
+    let mut chain = 0u32;
     loop {
         let op = match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::EqEq) => BinOp::Eq,
@@ -2723,6 +2753,8 @@ fn parse_equality(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             _ => break,
         };
         cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
         let right = parse_bitor(cursor)?;
         expr = Expr::Binary {
             op,
@@ -2735,8 +2767,11 @@ fn parse_equality(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_bitor(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_bitxor(cursor)?;
+    let mut chain = 0u32;
     while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::BitOr)) {
         cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
         let right = parse_bitxor(cursor)?;
         expr = Expr::Binary {
             op: BinOp::BitOr,
@@ -2749,8 +2784,11 @@ fn parse_bitor(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_bitxor(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_bitand(cursor)?;
+    let mut chain = 0u32;
     while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::BitXor)) {
         cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
         let right = parse_bitand(cursor)?;
         expr = Expr::Binary {
             op: BinOp::BitXor,
@@ -2763,8 +2801,11 @@ fn parse_bitxor(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_bitand(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_comparison(cursor)?;
+    let mut chain = 0u32;
     while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::BitAnd)) {
         cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
         let right = parse_comparison(cursor)?;
         expr = Expr::Binary {
             op: BinOp::BitAnd,
@@ -2777,6 +2818,7 @@ fn parse_bitand(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_comparison(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_shift(cursor)?;
+    let mut chain = 0u32;
     loop {
         let op = match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::Lt) => BinOp::Lt,
@@ -2786,6 +2828,8 @@ fn parse_comparison(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             _ => break,
         };
         cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
         let right = parse_shift(cursor)?;
         expr = Expr::Binary {
             op,
@@ -2798,6 +2842,7 @@ fn parse_comparison(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_shift(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_addition(cursor)?;
+    let mut chain = 0u32;
     loop {
         let op = match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::Shl) => BinOp::Shl,
@@ -2805,6 +2850,8 @@ fn parse_shift(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             _ => break,
         };
         cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
         let right = parse_addition(cursor)?;
         expr = Expr::Binary {
             op,
@@ -2817,6 +2864,7 @@ fn parse_shift(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_addition(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_multiplication(cursor)?;
+    let mut chain = 0u32;
     loop {
         let op = match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::Plus) => BinOp::Add,
@@ -2824,6 +2872,8 @@ fn parse_addition(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             _ => break,
         };
         cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
         let right = parse_multiplication(cursor)?;
         expr = Expr::Binary {
             op,
@@ -2836,6 +2886,7 @@ fn parse_addition(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_multiplication(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_unary(cursor)?;
+    let mut chain = 0u32;
     loop {
         let op = match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::Star) => BinOp::Mul,
@@ -2844,6 +2895,8 @@ fn parse_multiplication(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             _ => break,
         };
         cursor.next();
+        chain += 1;
+        cursor.check_chain(chain, "expressao")?;
         let right = parse_unary(cursor)?;
         expr = Expr::Binary {
             op,
@@ -2855,38 +2908,41 @@ fn parse_multiplication(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 }
 
 fn parse_unary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    // Recursao por operador contida por `nest` (teto de profundidade):
+    // sem isso, `!!!...x` arbitrariamente longo estoura a pilha nativa
+    // (RHP-AUD-001). Cada prefixo consome um nivel, como um aninhamento.
     match cursor.peek().map(|t| &t.kind) {
         Some(TokenKind::Bang) => {
             cursor.next();
             Ok(Expr::Unary {
                 op: UnaryOp::Not,
-                expr: Box::new(parse_unary(cursor)?),
+                expr: Box::new(cursor.nest("operador unario", parse_unary)?),
             })
         }
         Some(TokenKind::Minus) => {
             cursor.next();
             Ok(Expr::Unary {
                 op: UnaryOp::Neg,
-                expr: Box::new(parse_unary(cursor)?),
+                expr: Box::new(cursor.nest("operador unario", parse_unary)?),
             })
         }
         Some(TokenKind::BitNot) => {
             cursor.next();
             Ok(Expr::Unary {
                 op: UnaryOp::BitNot,
-                expr: Box::new(parse_unary(cursor)?),
+                expr: Box::new(cursor.nest("operador unario", parse_unary)?),
             })
         }
         // `+x` e identidade (compativel; sem no dedicado na AST).
         Some(TokenKind::Plus) => {
             cursor.next();
-            parse_unary(cursor)
+            cursor.nest("operador unario", parse_unary)
         }
         // `await expr` (Fase Next-Gen 3): maior precedencia unaria.
         Some(TokenKind::Await) => {
             cursor.next();
             Ok(Expr::Await {
-                expr: Box::new(parse_unary(cursor)?),
+                expr: Box::new(cursor.nest("operador unario", parse_unary)?),
             })
         }
         _ => parse_postfix(cursor),
@@ -2895,15 +2951,22 @@ fn parse_unary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
 
 fn parse_postfix(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
     let mut expr = parse_primary(cursor)?;
+    let mut chain = 0u32;
     loop {
         match cursor.peek().map(|t| &t.kind) {
             Some(TokenKind::LBracket) => {
+                chain += 1;
+                cursor.check_chain(chain, "expressao")?;
                 expr = parse_index_suffix(cursor, expr)?;
             }
             Some(TokenKind::LParen) => {
+                chain += 1;
+                cursor.check_chain(chain, "expressao")?;
                 expr = parse_call_suffix(cursor, expr)?;
             }
             Some(TokenKind::Dot) => {
+                chain += 1;
+                cursor.check_chain(chain, "expressao")?;
                 expr = parse_member_suffix(cursor, expr)?;
             }
             _ => break,
@@ -4253,7 +4316,47 @@ mod tests {
 
     #[test]
     fn accepts_nesting_within_limit() {
-        let src = format!("echo {}1{};", "(".repeat(100), ")".repeat(100));
-        lex_and_parse(&src).expect("100 niveis devem passar");
+        // Margem sob o teto (64): 50 niveis passam (medicao RHP-AUD-001:
+        // ~120 ja estouram 2 MiB em debug; o teto tem folga real).
+        let src = format!("echo {}1{};", "(".repeat(50), ")".repeat(50));
+        lex_and_parse(&src).expect("50 niveis devem passar");
+    }
+
+    /// RHP-AUD-001: cadeias planas aprofundam a AST como aninhamento —
+    /// sem teto, `1+1+...` estourava a pilha nativa (SIGABRT) em vez de
+    /// erro limpo. Todas falham com E1000; nenhuma aborta o processo.
+    #[test]
+    fn rejects_excessive_flat_chains() {
+        let casos: Vec<(String, &str)> = vec![
+            (vec!["1"; 2000].join("+"), "soma longa"),
+            (format!("echo {};", "!".repeat(2000) + "true"), "bangs"),
+            (
+                format!("echo {};", "true ? 1 : ".repeat(500) + "0"),
+                "ternarios",
+            ),
+            (
+                format!("echo {};", vec!["a"; 2000].join(" ?? ")),
+                "coalescencia",
+            ),
+            (format!("echo m{};", ".x".repeat(2000)), "membros"),
+            (format!("echo a{};", "[0]".repeat(2000)), "indices"),
+            (format!("echo f{};", "()".repeat(2000)), "chamadas"),
+            (
+                format!("echo {};", vec!["1"; 200].join(" * ")),
+                "multiplicacao longa",
+            ),
+        ];
+        for (src, o_que) in &casos {
+            let err = lex_and_parse(src).expect_err(&format!("cadeia plana deve falhar: {o_que}"));
+            assert!(
+                err.message.contains("profundidade maxima"),
+                "{o_que}: {}",
+                err.message
+            );
+        }
+        // Dentro do teto, cadeias passam (inclui mistura aninhada).
+        lex_and_parse(&format!("echo {};", vec!["1"; 50].join("+"))).expect("50 elos passam");
+        lex_and_parse("echo true ? 1 : false ? 2 : 3;").expect("ternario curto passa");
+        lex_and_parse("echo a ?? b;").expect("coalescencia curta passa");
     }
 }

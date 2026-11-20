@@ -57,9 +57,10 @@ pub(super) fn call_builtin(
                 updated.push(item.clone());
                 Ok(Value::Array(updated))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`push` exige array, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`push` exige (array, valor), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Pop => match &args[0] {
@@ -125,25 +126,28 @@ pub(super) fn call_builtin(
         },
         Builtin::Contains => match (&args[0], &args[1]) {
             (Value::Str(hay), Value::Str(needle)) => Ok(Value::Bool(hay.contains(needle as &str))),
-            (other, _) => Err(VmError::new(format!(
-                "`contains` exige strings, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`contains` exige (string, string), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::StartsWith => match (&args[0], &args[1]) {
             (Value::Str(hay), Value::Str(prefix)) => {
                 Ok(Value::Bool(hay.starts_with(prefix as &str)))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`starts_with` exige strings, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`starts_with` exige (string, string), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::EndsWith => match (&args[0], &args[1]) {
             (Value::Str(hay), Value::Str(suffix)) => Ok(Value::Bool(hay.ends_with(suffix as &str))),
-            (other, _) => Err(VmError::new(format!(
-                "`ends_with` exige strings, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`ends_with` exige (string, string), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Split => match (&args[0], &args[1]) {
@@ -157,9 +161,10 @@ pub(super) fn call_builtin(
                 };
                 Ok(Value::Array(parts))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`split` exige strings, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`split` exige (string, string), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Join => match (&args[0], &args[1]) {
@@ -178,9 +183,10 @@ pub(super) fn call_builtin(
                 }
                 Ok(Value::Str(parts.join(sep as &str)))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`join` exige (array, string), encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`join` exige (array, string), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Trim => match &args[0] {
@@ -208,9 +214,11 @@ pub(super) fn call_builtin(
             (Value::Str(text), Value::Str(from), Value::Str(to)) => {
                 Ok(Value::Str(text.replace(from as &str, to as &str)))
             }
-            (other, _, _) => Err(VmError::new(format!(
-                "`replace` exige (string, string, string), encontrado {}",
-                type_name(other)
+            (a, b, c) => Err(VmError::new(format!(
+                "`replace` exige (string, string, string), encontrado ({}, {}, {})",
+                type_name(a),
+                type_name(b),
+                type_name(c)
             ))),
         },
         Builtin::Abs => match &args[0] {
@@ -229,9 +237,10 @@ pub(super) fn call_builtin(
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
-            (other, _) => Err(VmError::new(format!(
-                "`min` exige numeros, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`min` exige (numero, numero), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Max => match (&args[0], &args[1]) {
@@ -239,9 +248,10 @@ pub(super) fn call_builtin(
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
-            (other, _) => Err(VmError::new(format!(
-                "`max` exige numeros, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`max` exige (numero, numero), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Sqrt => match &args[0] {
@@ -260,9 +270,10 @@ pub(super) fn call_builtin(
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.powf(*b))),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).powf(*b))),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.powf(*b as f64))),
-            (other, _) => Err(VmError::new(format!(
-                "`pow` exige numeros, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`pow` exige (numero, numero), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Floor => match &args[0] {
@@ -334,16 +345,18 @@ pub(super) fn call_builtin(
                 }
                 Ok(Value::Map(merged))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`merge` exige dois mapas, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`merge` exige (mapa, mapa), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Has => match (&args[0], &args[1]) {
             (Value::Map(entries), Value::Str(key)) => Ok(Value::Bool(entries.contains_key(key))),
-            (other, _) => Err(VmError::new(format!(
-                "`has` exige (mapa, string), encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`has` exige (mapa, string), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Assert => match &args[0] {
@@ -559,9 +572,10 @@ pub(super) fn call_builtin(
                 net.conns.insert(handle, conn);
                 Ok(Value::Int(handle))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`tcp_connect` exige (host, porta), encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`tcp_connect` exige (host, porta), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::TcpSend => match (&args[0], &args[1]) {
@@ -573,9 +587,10 @@ pub(super) fn call_builtin(
                     .map(|n| Value::Int(n as i64))
                     .map_err(VmError::new)
             }
-            (other, _) => Err(VmError::new(format!(
-                "`tcp_send` exige (handle, texto), encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`tcp_send` exige (handle, texto), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::TcpRecv => match (&args[0], &args[1]) {
@@ -597,9 +612,10 @@ pub(super) fn call_builtin(
                     None => Ok(Value::Null),
                 }
             }
-            (other, _) => Err(VmError::new(format!(
-                "`tcp_recv` exige (handle, max), encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`tcp_recv` exige (handle, maximo), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::TcpClose => match &args[0] {
@@ -628,9 +644,10 @@ pub(super) fn call_builtin(
                 cache.conns.insert(handle, conn);
                 Ok(Value::Int(handle))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`redis_open` exige (host, porta), encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`redis_open` exige (host, porta), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::RedisExec => match (&args[0], &args[1]) {
@@ -660,9 +677,10 @@ pub(super) fn call_builtin(
                 let rest: Vec<Value> = words[1..].iter().map(|s| Value::Str(s.clone())).collect();
                 conn.exec(&first, &rest).map_err(VmError::new)
             }
-            (other, _) => Err(VmError::new(format!(
-                "`redis_exec` exige (handle, [comando, ...]), encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`redis_exec` exige (handle, array), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::RedisClose => match &args[0] {
@@ -682,9 +700,10 @@ pub(super) fn call_builtin(
             (Value::Str(template), Value::Map(values)) => {
                 Ok(Value::Str(render_template(template, values)?))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`template` exige (texto, mapa), encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`template` exige (texto, mapa), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         // HOFs com callback (RFC 0005) nunca chegam aqui: o `step` intercepta
@@ -704,9 +723,10 @@ pub(super) fn call_builtin(
             (Value::Int(_), Value::Int(_)) => {
                 Err(VmError::new("`rand_range` exige min <= max".to_string()))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`rand_range` exige (min, max) inteiros, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`rand_range` exige (min, max) inteiros, encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::FsList => match &args[0] {
@@ -732,9 +752,10 @@ pub(super) fn call_builtin(
                 let re = compile_regex(pattern)?;
                 Ok(Value::Bool(re.is_match(haystack)))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`regex_match` exige (texto, padrao) em strings, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`regex_match` exige (texto, padrao) em strings, encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::RegexReplace => match (&args[0], &args[1], &args[2]) {
@@ -758,9 +779,10 @@ pub(super) fn call_builtin(
                         .collect(),
                 ))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`regex_split` exige (texto, padrao) em strings, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`regex_split` exige (texto, padrao) em strings, encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::Sha256 => match &args[0] {
@@ -785,9 +807,10 @@ pub(super) fn call_builtin(
                 mac.update(message.as_bytes());
                 Ok(Value::Str(hex_encode(&mac.finalize().into_bytes())))
             }
-            (other, _) => Err(VmError::new(format!(
-                "`hmac_sha256` exige (chave, mensagem) em strings, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`hmac_sha256` exige (chave, mensagem) em strings, encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::HmacVerify => match (&args[0], &args[1], &args[2]) {
@@ -848,9 +871,10 @@ pub(super) fn call_builtin(
                     ))
                 }
             }
-            (other, _) => Err(VmError::new(format!(
-                "`verify_password` exige (senha, hash) em strings, encontrado {}",
-                type_name(other)
+            (a, b) => Err(VmError::new(format!(
+                "`verify_password` exige (senha, hash) em strings, encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
             ))),
         },
         Builtin::FsRead => match &args[0] {
@@ -889,9 +913,10 @@ pub(super) fn call_builtin(
                         .map_err(|e| VmError::new(format!("`{name}` falhou em `{path}`: {e}")))?;
                     Ok(Value::Int(content.len() as i64))
                 }
-                (other, _) => Err(VmError::new(format!(
-                    "`{name}` exige (caminho, texto), encontrado {}",
-                    type_name(other)
+                (a, b) => Err(VmError::new(format!(
+                    "`{name}` exige (caminho, texto), encontrado ({}, {})",
+                    type_name(a),
+                    type_name(b)
                 ))),
             }
         }

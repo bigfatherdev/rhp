@@ -322,6 +322,10 @@ impl Connection {
     }
 
     fn command(&mut self, byte: u8, body: &[u8]) -> Result<Vec<u8>, String> {
+        // Cada comando reinicia a numeracao em 0 (protocolo MySQL); sem
+        // isso o servidor responde ER_NET_PACKETS_OUT_OF_ORDER (1156)
+        // ja no primeiro comando apos o handshake (RHP-AUD-008).
+        self.seq = 0;
         let mut payload = Vec::with_capacity(body.len() + 1);
         payload.push(byte);
         payload.extend_from_slice(body);
@@ -673,7 +677,12 @@ mod tests {
         assert_eq!(token, &expected[..], "auth invalida");
         // OK de boas-vindas.
         mock_packet(&mut stream, &mut seq, &[0, 0, 0, 2, 0, 0, 0]);
-        while let Some((cmd, _)) = mock_read_opt(&mut stream) {
+        // RHP-AUD-008: cada comando reinicia a numeracao em 0 (protocolo);
+        // sem isso o servidor real responde 1156 ja no primeiro comando.
+        while let Some((cmd, cseq)) = mock_read_opt(&mut stream) {
+            if matches!(cmd.first(), Some(0x01) | Some(0x03)) {
+                assert_eq!(cseq, 0, "comando MySQL deve usar seq 0, veio {cseq}");
+            }
             match cmd.first() {
                 Some(0x01) => break, // COM_QUIT.
                 Some(0x03) => {
