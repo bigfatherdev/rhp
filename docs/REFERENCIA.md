@@ -430,7 +430,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 | `db_open("pg:...")` | Conecta no PostgreSQL (`host`, `port`, `user`, `dbname`; auth `trust`; padroes host 127.0.0.1/porta 5432/user `postgres`/dbname = user). |
 | `db_open("mysql:...")` | Conecta no MySQL (protocolo 4.1 + `mysql_native_password`; chaves `host`, `port` (padrao 127.0.0.1:3306), `user` (padrao `root`), `password`, `dbname`). |
 | `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); `?` posicionais (SQLite/MySQL via escape client-side; PG `$1`... nativo); devolve linhas afetadas (`Int`). Linhas de SELECT sao descartadas. |
-| `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna=>valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB SQLite = erro; tipos PG mapeados por OID, resto vira `Str`; MySQL: numericos=>numero, resto (incl. datas)=>`Str`). |
+| `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna=>valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB SQLite = erro; tipos PG mapeados por OID, resto vira `Str`; MySQL: numericos=>numero, resto (incl. datas)=>`Str`). Nota: SQLite/MySQL nao tem booleano nativo — `true` gravado volta como `1` (`Int`); so o PG round-tripa `Bool`. |
 | `db_close(h)` | Fecha (reuso = erro); devolve `null`. Fim do programa fecha o resto. |
 
 ### Criptografia e hashing (RFCs 0013/0014)

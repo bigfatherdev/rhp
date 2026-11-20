@@ -12,7 +12,7 @@ docker pull bigfatherdev/rhp:latest
 Versão fixada (recomendado para produção):
 
 ```bash
-docker pull bigfatherdev/rhp:0.6.0
+docker pull bigfatherdev/rhp:0.6.1
 ```
 
 ## Executar
@@ -21,7 +21,7 @@ docker pull bigfatherdev/rhp:0.6.0
 
 ```bash
 docker run --rm bigfatherdev/rhp:latest --version
-# rhp 0.6.0
+# rhp 0.6.1
 ```
 
 Programa local (monte o diretório como volume; o `WORKDIR` é `/work`):
@@ -60,12 +60,12 @@ http_serve(8080, "handler", {"host": "0.0.0.0"});
 
 ```bash
 docker run -d --name api --network minha-rede \
-  -v "$PWD:/work" bigfatherdev/rhp:0.6.0 run /work/api.rhp
+  -v "$PWD:/work" bigfatherdev/rhp:0.6.1 run /work/api.rhp
 # outro container na mesma rede:
 docker run --rm --network minha-rede curlimages/curl -s http://api:8080/
 # reverse proxy (nginx) com proxy_pass http://api:8080;
 # port forwarding:
-docker run -d --name api -p 8080:8080 -v "$PWD:/work" bigfatherdev/rhp:0.6.0 run /work/api.rhp
+docker run -d --name api -p 8080:8080 -v "$PWD:/work" bigfatherdev/rhp:0.6.1 run /work/api.rhp
 curl http://127.0.0.1:8080/
 ```
 
@@ -83,7 +83,8 @@ refused" (prova de que o default continua local; exponha com
 | Tag | Significado |
 |---|---|
 | `latest` | `main` atual (sempre com CI verde) |
-| `0.6.0` | Release exata (imutavel) |
+| `0.6.1` | Release exata (imutavel) |
+| `0.6.0` | Release anterior (imutavel) |
 | `0.5.0` | Release anterior (imutavel) |
 | `0.4.0` | Release anterior (imutavel) |
 | `0.3.0` | Release anterior (imutavel) |
@@ -94,7 +95,7 @@ refused" (prova de que o default continua local; exponha com
 | `0` | Ultimo `0.x` |
 
 Tags `X.Y.Z`/`X.Y`/`X` sao geradas automaticamente da tag git
-(`v0.6.0` => `0.6.0`, `0.6`, `0`); `latest` acompanha a `main`.
+(`v0.6.1` => `0.6.1`, `0.6`, `0`); `latest` acompanha a `main`.
 Quando sair a `1.0.0` real, `1.0.0`/`1.0`/`1` passam a existir sem
 mudar o pipeline.
 
@@ -104,11 +105,11 @@ mudar o pipeline.
    `crates/*/Cargo.toml` (mantidos sincronizados).
 2. Crie e envie a tag (o `v` inicial e removido nas tags Docker):
    ```bash
-   git tag v0.6.0 && git push origin v0.6.0
+   git tag v0.6.1 && git push origin v0.6.1
    ```
 3. O workflow `docker-publish` (gatilho: tags `v*`): roda fmt + clippy +
    testes (com Postgres de servico), depois build amd64+arm64 e push
-   (`0.6.0`, `0.6`, `0`; conferir no Docker Hub).
+   (`0.6.1`, `0.6`, `0`; conferir no Docker Hub).
 
 > `latest` acompanha a `main` (qualquer push nela republica `latest`,
 > sempre com CI verde). Versoes fixadas (`0.6.0` etc.) so mudam com a

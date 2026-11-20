@@ -1408,6 +1408,38 @@ fn rhp_run_reports_runtime_type_error() {
 }
 
 #[test]
+fn rhp_run_rejects_deep_chains_cleanly() {
+    // RHP-AUD-001: cadeias planas profundas falham com E1000 (erro limpo),
+    // nunca com abort da pilha nativa.
+    for (name, src) in [
+        ("soma", format!("echo {};\n", vec!["1"; 2000].join("+"))),
+        ("bangs", format!("echo {}true;\n", "!".repeat(2000))),
+        ("membros", format!("echo m{};\n", ".x".repeat(2000))),
+    ] {
+        let output = run_temp_source("deep.rhp", &src);
+        assert!(!output.status.success(), "cadeia {name} deveria falhar");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("profundidade maxima"),
+            "cadeia {name}: obteve: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn rhp_run_reports_both_arg_types() {
+    // RHP-AUD: mensagens de aridade de tipo citam os DOIS argumentos.
+    let output = run_temp_source("tipos.rhp", "echo split(\"a,b\", 1);\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("(string, int)"), "obteve: {stderr}");
+    let output = run_temp_source("tipos2.rhp", "echo has([1], \"a\");\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("(array, string)"), "obteve: {stderr}");
+}
+
+#[test]
 fn rhp_run_error_shows_call_stack() {
     // Etapa 4: stack trace da mais interna para a mais externa; erro no
     // nivel superior nao imprime pilha.

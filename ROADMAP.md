@@ -1,5 +1,13 @@
 # ROADMAP.md — Planejamento e estado (Next Generation + limitacoes cuidadas)
 
+## RHP 0.6.1 — Auditoria full-system (2026-11-20, P0/P1 zerados)
+
+- [x] SIGABRT do parser com cadeias planas → teto 64 + regressão.
+- [x] MySQL inoperante (seq por comando) → funcional + mock asserta seq.
+- [x] 23 mensagens de tipo 2-arg citam ambos os tipos.
+- [x] Fuzz 2500 casos limpo; bench sem regressão; suíte 367/367.
+- [ ] P2 planejado 0.7.0: `&&`/`||`, pertinência em array, `caching_sha2`.
+
 ## RHP 0.6.0 — Engenharia de correcao e robustez (2026-11-20, implementado e validado)
 
 - [x] `return`/`yield` em `try` capturam erro do operando (ordem do compilador corrigida; 8 casos).

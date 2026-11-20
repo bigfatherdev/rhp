@@ -43,11 +43,14 @@ ciclos e arquivos ausentes/grandes demais (> 8 MiB por arquivo) sao erros;
 `import` vale **apenas no nivel superior** do arquivo (dentro de `fn`/bloco
 = erro).
 
-- **Limite de profundidade sintatica: 128 niveis** (expressoes e blocos
-  aninhados; cadeias planas como `1+1+...` ou instrucoes em sequencia nao
+- **Limite de profundidade sintatica: 64 niveis** (expressoes e blocos
+  aninhados, incluindo cadeias planas como `1+1+...`, `a.b.c` ou `!!!x`,
+  que aprofundam a AST do mesmo jeito; instrucoes em sequencia nao
   contam). Acima do limite, erro `profundidade maxima excedida`
-  (protecao contra estouro de pilha — ver ADR 0005). Constantes de bytecode
-  artesanais alem de 128 niveis sao rejeitadas na validacao.
+  (protecao contra estouro de pilha — ver ADR 0005; calibrado por
+  medicao: ~120 niveis ja estouram threads de 2 MiB em debug).
+  Constantes de bytecode artesanais alem de 64 niveis sao rejeitadas na
+  validacao.
 
 ## 2. Instrucoes
 
