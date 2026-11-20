@@ -1,5 +1,13 @@
 # ROADMAP.md — Planejamento e estado (Next Generation + limitacoes cuidadas)
 
+## RHP 0.6.2 — Auditoria independente (2026-11-20, P0/P1 zerados)
+
+- [x] HOF `pending` obsoleto → amarra + descarte no unwind + regressão.
+- [x] Dreno de erro pg/mysql → sync preservado + regressões live/mock.
+- [x] `fs_rename`/`fs_remove`/`fs_mkdir` (83 builtins) + USAGE `build`.
+- [x] Fuzz 3500 limpo; suíte 370/370; bench sem regressão.
+- [ ] P2 planejado 0.7.0 (exige RFC): `&&`/`||`, pertinência, `caching_sha2`.
+
 ## RHP 0.6.1 — Auditoria full-system (2026-11-20, P0/P1 zerados)
 
 - [x] SIGABRT do parser com cadeias planas → teto 64 + regressão.

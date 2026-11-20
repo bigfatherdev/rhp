@@ -2,6 +2,38 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
+## [0.6.2] — 2026-11-20 (Auditoria independente: HOF, dreno DB, FS, diagnósticos)
+
+### Fixed
+
+- HOF com callback que lançava deixava `pending` obsoleto: o próximo
+  `Return` para aquele frame o consumia como "retorno do callback" (erro
+  fantasma com E-code errado ou valor errado silencioso). Amarra
+  `pending_cb` + descarte no `unwind`. Registro:
+  `changes/2026-11-20-fix-hof-stale-pending.md`.
+- Erro no meio de result-set não drenava: pg lia `Z` alheio (sucesso falso
+  + erro atrasado); `db_exec(SELECT)` no mysql dessincronizava a conexão.
+  Dreno limitado até o terminador antes de devolver o erro. Registros:
+  `changes/2026-11-20-fix-db-error-drain.md`.
+- USAGE do `rhp build` dizia `[--check]` mas o 4º argumento é a saída
+  (chegou a criar um arquivo chamado `--check`). Texto corrigido.
+
+### Added
+
+- `fs_rename(de, para)`, `fs_remove(caminho)`, `fs_mkdir(caminho)`
+  (builtins 80–82; 83 no total). Registro:
+  `changes/2026-11-20-feat-fs-lifecycle.md`.
+
+### Changed
+
+- `docs/REFERENCIA.md`: `db_exec(SELECT)` difere por driver (MySQL erra,
+  PG retorna tag); `db_query`: bool só round-tripa no PG.
+
+### Known limitations
+
+- Sem `&&`/`||`, sem pertinência em array, MySQL `caching_sha2_password`
+  (exigem RFC — planejado 0.7.0). Auditoria completa em `audit/0.6.1/`.
+
 ## [0.6.1] — 2026-11-20 (Auditoria full-system: crash do parser, MySQL, diagnósticos)
 
 ### Fixed

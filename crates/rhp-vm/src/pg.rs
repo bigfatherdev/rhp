@@ -226,32 +226,60 @@ impl Connection {
         self.send(b'E', &execute)?;
         self.send(b'S', &[])?;
         // Leitura: colunas, linhas, tag, ate ReadyForQuery.
+        // Erros NAO retornam no meio: registram em `failure` e drenam ate
+        // o `Z` (RHP-AUD-IND-002). Retornar aqui deixaria o `Z` no socket:
+        // o proximo comando leria o `Z` alheio como conclusao propria
+        // (sucesso falso) e o erro apareceria um comando atrasado (ou nunca).
         let mut columns: Vec<(String, u32)> = Vec::new();
         let mut rows: Vec<HashMap<String, PgValue>> = Vec::new();
         let mut affected: i64 = 0;
+        let mut failure: Option<String> = None;
         loop {
+            // Falha de I/O: conexao perdida; sem dreno possivel.
             let (kind, payload) = self.recv()?;
             match kind {
                 // ParseComplete/BindComplete/NoData: reconhecidos, sem efeito.
                 // (`C` e CommandComplete aqui; CloseComplete nao e enviado.)
                 b'1' | b'2' | b'n' => {}
                 b'T' => {
-                    columns = parse_row_description(&payload)?;
+                    if let Err(e) = parse_row_description(&payload).map(|cols| columns = cols) {
+                        failure.get_or_insert(e);
+                    }
                 }
-                b'D' => {
-                    rows.push(parse_data_row(&payload, &columns)?);
-                }
+                b'D' => match parse_data_row(&payload, &columns) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => {
+                        failure.get_or_insert(e);
+                    }
+                },
                 b'C' => {
                     affected = parse_command_tag(&payload);
                 }
-                b'E' => return Err(pg_error(&payload)),
+                b'E' => {
+                    failure.get_or_insert_with(|| pg_error(&payload));
+                }
                 b'N' => {}
                 b'Z' => break,
                 b'I' => {}
                 _ => {}
             }
+            if failure.is_some() {
+                // Drena o resto ate ReadyForQuery (teto contra servidor
+                // patologico; I/O continua falhando alto).
+                for _ in 0..1_000_000 {
+                    match self.recv() {
+                        Ok((b'Z', _)) => break,
+                        Ok(_) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                break;
+            }
         }
-        Ok((affected, rows))
+        match failure {
+            Some(e) => Err(e),
+            None => Ok((affected, rows)),
+        }
     }
 
     /// Encerra com `Terminate` (o `Drop` fecha o socket de qualquer forma).

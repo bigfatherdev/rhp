@@ -17,7 +17,7 @@
 - [Geradores](#8-geradores-rfc-0018)
 - [Concorrência](#9-concorrencia-rfc-0019)
 - [Módulos e pacotes](#10-modulos-e-pacotes)
-- [Biblioteca-padrão (80 builtins)](#11-biblioteca-padrao-80-builtins)
+- [Biblioteca-padrão (83 builtins)](#11-biblioteca-padrao-83-builtins)
 - [Erros e códigos](#12-erros-e-codigos)
 - [CLI](#13-cli)
 - [Exemplo completo](#14-exemplo-completo)
@@ -335,7 +335,7 @@ import {u} from "./c1.rhp";
 - Comentarios `//` de linha e linhas em branco sao preservados pelo
   `rhp fmt` na mesma ordem relativa ao statement.
 
-## 11. Biblioteca-padrao (80 builtins)
+## 11. Biblioteca-padrao (83 builtins)
 
 Aridade checada na compilacao; erros sao `VmError` com mensagem em
 portugues (ver [codigos](#12-erros-e-codigos)).
@@ -405,6 +405,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 |---|---|
 | `fs_read(caminho)` | Conteudo do arquivo (`Str` UTF-8); I/O ou > 8 MiB = erro. |
 | `fs_write(caminho, texto)` / `fs_append(caminho, texto)` | Escreve/anexa; devolve bytes escritos. Relativos resolvem no diretorio atual. |
+| `fs_rename(de, para)` / `fs_remove(caminho)` / `fs_mkdir(caminho)` | Renomeia-move / remove (arquivo ou diretorio vazio) / cria diretorio (com pais); devolvem `Null`; I/O = erro. |
 | `fs_exists(caminho)` | `true` se legivel (qualquer falha = `false`). |
 | `fs_list(dir)` | Nomes de entradas ordenados (`[]` se vazio); inexistente/nao-diretorio = erro. |
 | `argv()` | `Array` de `Str` com os argumentos apos o arquivo. |
@@ -429,7 +430,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 | `db_open(caminho)` | Abre/cria SQLite (`Int` = handle); relativo resolve no cwd; roda com as permissoes do usuario. |
 | `db_open("pg:...")` | Conecta no PostgreSQL (`host`, `port`, `user`, `dbname`; auth `trust`; padroes host 127.0.0.1/porta 5432/user `postgres`/dbname = user). |
 | `db_open("mysql:...")` | Conecta no MySQL (protocolo 4.1 + `mysql_native_password`; chaves `host`, `port` (padrao 127.0.0.1:3306), `user` (padrao `root`), `password`, `dbname`). |
-| `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); `?` posicionais (SQLite/MySQL via escape client-side; PG `$1`... nativo); devolve linhas afetadas (`Int`). Linhas de SELECT sao descartadas. |
+| `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); `?` posicionais (SQLite/MySQL via escape client-side; PG `$1`... nativo); devolve linhas afetadas (`Int`). `SELECT` via `exec`: MySQL devolve erro (use `db_query`); PG devolve a contagem. Linhas de SELECT sao descartadas. |
 | `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna=>valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB SQLite = erro; tipos PG mapeados por OID, resto vira `Str`; MySQL: numericos=>numero, resto (incl. datas)=>`Str`). Nota: SQLite/MySQL nao tem booleano nativo — `true` gravado volta como `1` (`Int`); so o PG round-tripa `Bool`. |
 | `db_close(h)` | Fecha (reuso = erro); devolve `null`. Fim do programa fecha o resto. |
 

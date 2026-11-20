@@ -70,6 +70,11 @@ pub struct Frame {
     /// HOF com callback em voo (RFC 0005): progresso da iteracao enquanto
     /// as ativacoes do callback executam e retornam. `None` no comum.
     pub pending: Option<PendingHof>,
+    /// Indice do frame do callback em voo do HOF acima (`None` = nenhum).
+    /// Amarra o `pending` a ativacao: se o unwinding truncar o callback,
+    /// o `pending` vira obsoleto e e descartado (RHP-AUD-IND-001) em vez
+    /// de ser consumido por um `Return` posterior nao relacionado.
+    pub pending_cb: Option<usize>,
     /// Definicao da funcao desta ativacao (`None` no programa principal).
     pub func: Option<Rc<FuncDef>>,
 }
@@ -369,6 +374,12 @@ pub enum Builtin {
     RedisExec,
     /// `redis_close(h)` — fecha (`Null`; RFC 0020).
     RedisClose,
+    /// `fs_rename(de, para)` — renomeia/move (`Null`; erro limpo).
+    FsRename,
+    /// `fs_remove(caminho)` — remove arquivo ou diretorio vazio (`Null`).
+    FsRemove,
+    /// `fs_mkdir(caminho)` — cria diretorio (inclui pais; `Null`).
+    FsMkdir,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -455,6 +466,9 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "redis_open" => Some(Builtin::RedisOpen),
         "redis_exec" => Some(Builtin::RedisExec),
         "redis_close" => Some(Builtin::RedisClose),
+        "fs_rename" => Some(Builtin::FsRename),
+        "fs_remove" => Some(Builtin::FsRemove),
+        "fs_mkdir" => Some(Builtin::FsMkdir),
         _ => None,
     }
 }
@@ -503,6 +517,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::AwaitRace
         | Builtin::TcpClose
         | Builtin::RedisClose
+        | Builtin::FsRemove
+        | Builtin::FsMkdir
         | Builtin::Sha256 => 1,
         Builtin::Push
         | Builtin::Contains
@@ -532,7 +548,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::TcpRecv
         | Builtin::RedisOpen
         | Builtin::RedisExec
-        | Builtin::AwaitTimeout => 2,
+        | Builtin::AwaitTimeout
+        | Builtin::FsRename => 2,
         Builtin::DbExec
         | Builtin::DbQuery
         | Builtin::HttpServe
@@ -771,6 +788,9 @@ impl BuiltinId {
             77 => Ok(Builtin::AsyncCancelled),
             78 => Ok(Builtin::AwaitAll),
             79 => Ok(Builtin::AwaitRace),
+            80 => Ok(Builtin::FsRename),
+            81 => Ok(Builtin::FsRemove),
+            82 => Ok(Builtin::FsMkdir),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -859,6 +879,9 @@ impl From<Builtin> for BuiltinId {
             Builtin::AsyncCancelled => 77,
             Builtin::AwaitAll => 78,
             Builtin::AwaitRace => 79,
+            Builtin::FsRename => 80,
+            Builtin::FsRemove => 81,
+            Builtin::FsMkdir => 82,
         };
         Self(id)
     }

@@ -384,7 +384,48 @@ impl Connection {
                 Ok(read_lenenc(&reply, &mut pos)? as i64)
             }
             Some(0xFF) => Err(Self::err_text(&reply, "`db_exec`")),
-            _ => Err("`db_exec`: resposta inesperada (use `db_query` para SELECT)".to_string()),
+            // SELECT via `exec`: o servidor mandou o result-set (contagem de
+            // colunas). Drena tudo antes de devolver o erro, senao os
+            // pacotes restantes dessincronizam o proximo comando
+            // (RHP-AUD-IND-003). Falha no dreno = conexao inutilizavel.
+            _ => {
+                // Drena antes de devolver o erro (a conexao segue utilizavel).
+                self.drain_result_set()?;
+                Err("`db_exec`: resposta inesperada (use `db_query` para SELECT)".to_string())
+            }
+        }
+    }
+
+    /// Descarta um result-set pendente (colunas + EOF + linhas ate EOF/ERR).
+    /// Usado quando `exec` recebe SELECT: sem o dreno, o proximo comando
+    /// leria pacotes alheios. Erro aqui significa conexao perdida.
+    fn drain_result_set(&mut self) -> Result<(), String> {
+        let max_pacotes = 1_000_000u32;
+        let mut vistos = 0u32;
+        // Primeira fase: definicoes de coluna ate o EOF (ou ERR).
+        loop {
+            vistos += 1;
+            if vistos > max_pacotes {
+                return Err("`db`: dreno de result-set excedeu o teto".to_string());
+            }
+            let (pacote, _) = self.read_packet().map_err(|e| format!("`db`: {e}"))?;
+            match pacote.first() {
+                Some(0xFF) => return Ok(()),
+                Some(0xFE) if pacote.len() < 9 => break,
+                _ => continue,
+            }
+        }
+        // Segunda fase: linhas ate EOF/ERR.
+        loop {
+            vistos += 1;
+            if vistos > max_pacotes {
+                return Err("`db`: dreno de result-set excedeu o teto".to_string());
+            }
+            let (pacote, _) = self.read_packet().map_err(|e| format!("`db`: {e}"))?;
+            match pacote.first() {
+                Some(0xFE) | Some(0xFF) => return Ok(()),
+                _ => continue,
+            }
         }
     }
 
@@ -753,5 +794,12 @@ mod tests {
         ))
         .expect_err("SQL ruim deve falhar");
         assert!(err.contains("1064"), "obteve: {err}");
+        // RHP-AUD-IND-003: `exec` com SELECT drena o result-set; o proximo
+        // comando nao le pacotes alheios (antes: "lenenc truncado").
+        let out = run_mysql(&format!(
+            "let h = {open};\ntry {{ echo db_exec(h, \"SELECT 1 AS um\", []); }} catch e {{ echo \"erro-ok\"; }}\necho db_query(h, \"SELECT 1 AS um, 'x' AS s\", []);\necho db_close(h);\n"
+        ))
+        .expect("dreno apos exec-select");
+        assert_eq!(out, "erro-ok\n[{s: x, um: 1}]\nnull\n");
     }
 }

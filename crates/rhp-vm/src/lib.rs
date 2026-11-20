@@ -662,6 +662,7 @@ impl Vm {
             scopes: vec![HashMap::new()],
             handlers: Vec::new(),
             pending: None,
+            pending_cb: None,
             pending_gen: None,
             pending_new: None,
             pending_method: None,
@@ -1106,8 +1107,10 @@ impl Vm {
                 self.frames.pop();
                 let caller = self.frames.len() - 1;
                 // Retomada de HOF (RFC 0005): o valor e o retorno do callback;
-                // sem HOF pendente, entrega normal ao chamador.
+                // sem HOF pendente, entrega normal ao chamador. `pending_cb`
+                // morre junto (a amarra expirou com o callback).
                 if let Some(pending) = self.frames[caller].pending.take() {
+                    self.frames[caller].pending_cb = None;
                     self.advance_hof(caller, pending, value)?;
                 } else if closing_super {
                     // `super.metodo()`: o `this` final volta ao `this` do
@@ -1658,6 +1661,7 @@ impl Vm {
             pending_super: false,
             pending_gen: None,
             pending: None,
+            pending_cb: None,
             func: Some(func.def.clone()),
         }
     }
@@ -2630,6 +2634,22 @@ impl Vm {
     /// Inicia `map`/`filter`/`usort` (RFC 0005): valida `(colecao, funcao)`,
     /// guarda o progresso em `pending` e empilha a primeira ativacao do
     /// callback. Array vazio finaliza sem chamar.
+    /// O indice do frame do callback vai para `pending_cb` (amarracao
+    /// anti-obsoleto: ver RHP-AUD-IND-001).
+    fn push_hof_call(
+        &mut self,
+        idx: usize,
+        func: &FuncValue,
+        args: Vec<Value>,
+    ) -> Result<(), VmError> {
+        self.push_call_frame(func.clone(), args)?;
+        self.frames[idx].pending_cb = Some(self.frames.len() - 1);
+        Ok(())
+    }
+
+    /// Inicia `map`/`filter`/`usort` (RFC 0005): valida `(colecao, funcao)`,
+    /// guarda o progresso em `pending` e empilha a primeira ativacao do
+    /// callback. Array vazio finaliza sem chamar.
     fn hof_begin(&mut self, idx: usize, builtin: Builtin, args: Vec<Value>) -> Result<(), VmError> {
         let name = match builtin {
             Builtin::Map => "map",
@@ -2675,7 +2695,7 @@ impl Vm {
                     }
                 };
                 self.frames[idx].pending = Some(pending);
-                self.push_call_frame(func, vec![first])?;
+                self.push_hof_call(idx, &func, vec![first])?;
                 self.frames[idx].ip += 1;
                 Ok(())
             }
@@ -2694,7 +2714,7 @@ impl Vm {
                     i: 1,
                     j: 1,
                 });
-                self.push_call_frame(func, vec![a, b])?;
+                self.push_hof_call(idx, &func, vec![a, b])?;
                 self.frames[idx].ip += 1;
                 Ok(())
             }
@@ -2721,7 +2741,7 @@ impl Vm {
                         next,
                         acc,
                     });
-                    self.push_call_frame(func, vec![arg])
+                    self.push_hof_call(idx, &func, vec![arg])
                 } else {
                     self.push_checked(idx, Value::Array(acc))
                 }
@@ -2751,7 +2771,7 @@ impl Vm {
                         next,
                         acc,
                     });
-                    self.push_call_frame(func, vec![arg])
+                    self.push_hof_call(idx, &func, vec![arg])
                 } else {
                     self.push_checked(idx, Value::Array(acc))
                 }
@@ -2793,7 +2813,7 @@ impl Vm {
                         i,
                         j,
                     });
-                    self.push_call_frame(func, vec![a, b])
+                    self.push_hof_call(idx, &func, vec![a, b])
                 } else {
                     self.push_checked(idx, Value::Array(sorted))
                 }
@@ -2823,6 +2843,18 @@ impl Vm {
                     let frame = &mut self.frames[depth];
                     frame.scopes.truncate(handler.scope_len);
                     frame.stack.clear();
+                }
+                // HOFs obsoletos: `pending` cujo callback foi truncado acima
+                // nunca mais vai avancar — descarta agora, senao um `Return`
+                // posterior nao relacionado o consumiria como retorno do
+                // callback (RHP-AUD-IND-001: erro fantasma / valor errado).
+                // `pending` com callback vivo (`cb <= depth`) e preservado:
+                // o callback retomara e avancara normalmente.
+                for frame in self.frames.iter_mut().take(depth + 1) {
+                    if frame.pending_cb.is_some_and(|cb| cb > depth) {
+                        frame.pending = None;
+                        frame.pending_cb = None;
+                    }
                 }
                 // `push_checked` aplica `max_collection_len` ao erro.
                 self.push_checked(depth, value)?;
@@ -3550,6 +3582,33 @@ mod tests {
             run_src("try { echo map([1], fn (x) { throw \"boom\"; }); } catch e { echo e; }")
                 .expect("ok"),
             "boom\n"
+        );
+    }
+
+    #[test]
+    fn runs_hof_throw_does_not_leak_stale_pending() {
+        // RHP-AUD-IND-001: `pending` do HOF cujo callback falhou era
+        // consumido por um `Return` posterior nao relacionado (erro
+        // fantasma ou valor errado). O `unwind` agora descarta pendings
+        // cujo callback foi truncado.
+        assert_eq!(
+            run_src("try { echo usort([3, 1, 2], fn (a, b) { throw \"x\"; }); } catch e { echo \"pegou\"; } fn f() { try { throw \"fundo\"; } catch e { return \"n:\" + e; } } echo f();").expect("ok"),
+            "pegou\nn:fundo\n"
+        );
+        // Variante com `map` + retorno de array (antes: resultado errado).
+        assert_eq!(
+            run_src("try { echo map([1], fn (x) { throw \"x\"; }); } catch e { echo \"pegou\"; } fn f() { return [7]; } echo f();").expect("ok"),
+            "pegou\n[7]\n"
+        );
+        // Variante com `filter` + chamada aninhada apos a captura.
+        assert_eq!(
+            run_src("try { echo filter([1], fn (x) { throw \"x\"; }); } catch e { echo \"pegou\"; } fn g() { return 1; } fn f() { return g() + 1; } echo f();").expect("ok"),
+            "pegou\n2\n"
+        );
+        // HOF normal apos falha anterior segue funcionando (sem resto).
+        assert_eq!(
+            run_src("try { echo map([1], fn (x) { throw \"x\"; }); } catch e { echo \"pegou\"; } echo map([1, 2], fn (x) { return x * 2; });").expect("ok"),
+            "pegou\n[2, 4]\n"
         );
     }
 

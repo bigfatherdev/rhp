@@ -747,6 +747,47 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+        Builtin::FsRename => match (&args[0], &args[1]) {
+            (Value::Str(from), Value::Str(to)) => {
+                std::fs::rename(from, to).map_err(|e| {
+                    VmError::new(format!("`fs_rename` `{from}` -> `{to}` falhou: {e}"))
+                })?;
+                Ok(Value::Null)
+            }
+            (a, b) => Err(VmError::new(format!(
+                "`fs_rename` exige (origem, destino), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
+            ))),
+        },
+        Builtin::FsRemove => match &args[0] {
+            Value::Str(path) => {
+                let meta = std::fs::symlink_metadata(path)
+                    .map_err(|e| VmError::new(format!("`fs_remove` falhou em `{path}`: {e}")))?;
+                if meta.is_dir() {
+                    std::fs::remove_dir(path)
+                } else {
+                    std::fs::remove_file(path)
+                }
+                .map_err(|e| VmError::new(format!("`fs_remove` falhou em `{path}`: {e}")))?;
+                Ok(Value::Null)
+            }
+            other => Err(VmError::new(format!(
+                "`fs_remove` exige caminho (string), encontrado {}",
+                type_name(other)
+            ))),
+        },
+        Builtin::FsMkdir => match &args[0] {
+            Value::Str(path) => {
+                std::fs::create_dir_all(path)
+                    .map_err(|e| VmError::new(format!("`fs_mkdir` falhou em `{path}`: {e}")))?;
+                Ok(Value::Null)
+            }
+            other => Err(VmError::new(format!(
+                "`fs_mkdir` exige caminho (string), encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::RegexMatch => match (&args[0], &args[1]) {
             (Value::Str(haystack), Value::Str(pattern)) => {
                 let re = compile_regex(pattern)?;

@@ -235,6 +235,21 @@ fn rhp_run_postgres_end_to_end() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // RHP-AUD-IND-002: erro drena ate ReadyForQuery — o proximo comando na
+    // mesma conexao nao le resposta alheia (antes: sucesso falso + erro
+    // um comando atrasado).
+    let output = run_temp_source(
+        "pg_sync.rhp",
+        &format!(
+            "let h = db_open(\"{pg}\");\ntry {{ echo db_exec(h, \"INSERT INTO t VALUES (1, 'x', true, 1.0, 2.0)\", []); }} catch e {{ echo \"erro-ok\"; }}\necho db_query(h, \"SELECT 1 AS um\", []);\necho db_close(h);\n"
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "postgres dessincronizou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"erro-ok\n[{um: 1}]\nnull\n");
 }
 
 #[test]
