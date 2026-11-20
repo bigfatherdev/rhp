@@ -1,0 +1,348 @@
+// RHP Web — framework web oficial (Fase Next-Gen 7).
+//
+// Camada sobre `http_serve`: roteamento, middlewares, req/res, seguranca,
+// templates e JSON. Sem dependencias externas.
+//
+// Uso (vendorizado via `rhp pkg`; ver `docs/WEB.md`):
+//   rhp pkg add rhp_web <caminho-do-repo>/framework/web.rhp
+//   import { web_get, web_json, web_despachar } from "pacotes/rhp_web/web.rhp";
+//   web_get("/", fn(req) { return web_text("RHP Web"); });
+//   fn handler(req) { return web_despachar(req); }
+//   http_serve(8080, "handler", {});
+//
+// Semantica:
+// - Rotas: metodo + padrao (`/users/:id`, `*` nao suportado em v1).
+// - Primeiro match vence (ordem de registro). Sem match = 404; metodo
+//   existente em outro padrao = 405 (com `Allow`).
+// - Middlewares globais (`web_use`) rodam antes da rota; qualquer um pode
+//   curto-circuitar devolvendo resposta (mapa/str). `null` = continua.
+// - Respostas: `str` (200 text/plain) ou mapa `{status?, cabecalhos?, corpo?}`.
+// - Seguranca: cabecalhos padrao, teto de payload (1 MiB), sem stack traces
+//   (o `http_serve` ja converte erro em 500 opaco).
+export let __web_routes = [];
+export let __web_middlewares = [];
+// Trie de rotas (item router-trie): mesma semantica do linear
+// (primeiro match global vence; `Allow` identico), sem o `split` por rota.
+// No: {estaticos: [{seg, no}], param: null|no, rotas: [indices]}.
+// `rotas` guarda indices em ordem de registro (varias rotas/metodos podem
+// terminar no mesmo no).
+export let __web_trie = null;
+
+fn web_trie_no() {
+  return {estaticos: {}, param: null, rotas: []};
+}
+
+// Insere o padrao (recursivo funcional: devolve o no atualizado, pois
+// valores sao por copia e a atribuicao e de um nivel so).
+// `estaticos` e MAPA (busca O(1); a ordem nao importa porque a selecao
+// final e pelo indice global da rota, nao pela ordem de visitacao).
+fn web_trie_inserir(no, segs, i, indice) {
+  if i == len(segs) {
+    no["rotas"] = push(no["rotas"], indice);
+    return no;
+  }
+  let s = segs[i];
+  if starts_with(s, ":") {
+    let filho = no["param"];
+    if filho == null {
+      filho = web_trie_no();
+    }
+    no["param"] = web_trie_inserir(filho, segs, i + 1, indice);
+    return no;
+  }
+  let filhos = no["estaticos"];
+  if has(filhos, s) {
+    let item = filhos[s];
+    filhos[s] = web_trie_inserir(item, segs, i + 1, indice);
+  } else {
+    filhos[s] = web_trie_inserir(web_trie_no(), segs, i + 1, indice);
+  }
+  no["estaticos"] = filhos;
+  return no;
+}
+
+// Coleta TODOS os (indice, pares) que casam o caminho (item router-trie).
+// Custo: nos alcancaveis (poda por prefixo estatico), nao todas as rotas.
+// A ordem global e restaurada depois (menor indice vence), igual ao linear.
+fn web_trie_casar_tudo(no, segs, i, pares, out) {
+  if i == len(segs) {
+    let j = 0;
+    while j < len(no["rotas"]) {
+      out = push(out, {idx: no["rotas"][j], pares: pares});
+      j = j + 1;
+    }
+    return out;
+  }
+  let s = segs[i];
+  let filhos = no["estaticos"];
+  if has(filhos, s) {
+    out = web_trie_casar_tudo(filhos[s], segs, i + 1, pares, out);
+  }
+  if no["param"] != null {
+    out = web_trie_casar_tudo(no["param"], segs, i + 1, push(pares, {pos: i, val: s}), out);
+  }
+  return out;
+}
+
+// Liga nomes de params do padrao aos valores posicionais capturados.
+fn web_trie_params(padrao, pares) {
+  let params = {};
+  let segs = split(padrao, "/");
+  let i = 0;
+  while i < len(segs) {
+    let p = segs[i];
+    if starts_with(p, ":") {
+      let nome = split(p, ":")[1];
+      let k = 0;
+      while k < len(pares) {
+        if pares[k]["pos"] == i {
+          params[nome] = pares[k]["val"];
+        }
+        k = k + 1;
+      }
+    }
+    i = i + 1;
+  }
+  return params;
+}
+
+// --- Respostas --------------------------------------------------------
+export fn web_text(corpo) {
+  return {status: 200, cabecalhos: {"content-type": "text/plain; charset=utf-8"}, corpo: corpo};
+}
+
+export fn web_json(valor) {
+  return {status: 200, cabecalhos: {"content-type": "application/json; charset=utf-8"}, corpo: json_stringify(valor)};
+}
+
+export fn web_html(corpo) {
+  return {status: 200, cabecalhos: {"content-type": "text/html; charset=utf-8"}, corpo: corpo};
+}
+
+export fn web_redirect(destino) {
+  return {status: 302, cabecalhos: {location: destino}, corpo: ""};
+}
+
+export fn web_not_found() {
+  return {status: 404, cabecalhos: {"content-type": "text/plain; charset=utf-8"}, corpo: "nao encontrado"};
+}
+
+export fn web_erro(msg) {
+  return {status: 500, cabecalhos: {"content-type": "text/plain; charset=utf-8"}, corpo: msg};
+}
+
+// --- Rotas ------------------------------------------------------------
+fn web_registrar(metodo, padrao, handler) {
+  let indice = len(__web_routes);
+  __web_routes = push(__web_routes, {metodo: metodo, padrao: padrao, handler: handler});
+  if __web_trie == null {
+    __web_trie = web_trie_no();
+  }
+  __web_trie = web_trie_inserir(__web_trie, split(padrao, "/"), 0, indice);
+  return null;
+}
+
+export fn web_get(padrao, handler) {
+  return web_registrar("GET", padrao, handler);
+}
+
+export fn web_post(padrao, handler) {
+  return web_registrar("POST", padrao, handler);
+}
+
+export fn web_put(padrao, handler) {
+  return web_registrar("PUT", padrao, handler);
+}
+
+export fn web_patch(padrao, handler) {
+  return web_registrar("PATCH", padrao, handler);
+}
+
+export fn web_delete(padrao, handler) {
+  return web_registrar("DELETE", padrao, handler);
+}
+
+export fn web_head(padrao, handler) {
+  return web_registrar("HEAD", padrao, handler);
+}
+
+export fn web_options(padrao, handler) {
+  return web_registrar("OPTIONS", padrao, handler);
+}
+
+export fn web_use(mw) {
+  __web_middlewares = push(__web_middlewares, mw);
+  return null;
+}
+
+// --- Casamento de rotas -----------------------------------------------
+// Padrao: `/users/:id` casa `/users/42` com params `{id: "42"}`.
+// Retorna mapa de params ou `null` (sem match).
+export fn web_casar(padrao, caminho) {
+  let segs_p = split(padrao, "/");
+  let segs_c = split(caminho, "/");
+  if len(segs_p) != len(segs_c) {
+    return null;
+  }
+  let params = {};
+  let i = 0;
+  while i < len(segs_p) {
+    let p = segs_p[i];
+    let c = segs_c[i];
+    if len(p) > 0 {
+      if starts_with(p, ":") {
+        let nome = split(p, ":")[1];
+        params[nome] = c;
+      } else {
+        if p != c {
+          return null;
+        }
+      }
+    } else {
+      if c != p {
+        return null;
+      }
+    }
+    i = i + 1;
+  }
+  return params;
+}
+
+// --- Seguranca --------------------------------------------------------
+export fn web_logger(req) {
+  echo req["metodo"] + " " + req["caminho"];
+  return null;
+}
+
+export fn web_seguranca(req) {
+  // Teto de payload: recusa corpos gigantes antes da rota.
+  let corpo = req["corpo"];
+  if corpo != null {
+    if len(corpo) > 1048576 {
+      return {status: 413, corpo: "payload muito grande"};
+    }
+  }
+  return null;
+}
+
+// --- Despacho (handler do `http_serve`) --------------------------------
+export fn web_despachar(req) {
+  // Middlewares globais.
+  let i = 0;
+  while i < len(__web_middlewares) {
+    let mw = __web_middlewares[i];
+    let r = mw(req);
+    if r != null {
+      return web_finalizar(r);
+    }
+    i = i + 1;
+  }
+  // Roteamento por trie (item router-trie): candidatos por padrao, em
+  // ordem global de registro (primeiro match vence, igual ao linear).
+  // Custo por request: poda por prefixo estatico, nao split por rota.
+  let metodo = req["metodo"];
+  let caminho = req["caminho"];
+  let cands = [];
+  if __web_trie != null {
+    cands = web_trie_casar_tudo(__web_trie, split(caminho, "/"), 0, [], []);
+  }
+  // Ordena candidatos pelo indice global (insertion sort; poucos casos).
+  let ordenados = [];
+  let n = 0;
+  while n < len(cands) {
+    let c = cands[n];
+    let m = len(ordenados);
+    while m > 0 {
+      if ordenados[m - 1]["idx"] <= c["idx"] {
+        break;
+      }
+      m = m - 1;
+    }
+    // Insere em `m` (desloca o resto; arrays sao por valor).
+    let antes = [];
+    let depois = [];
+    let k = 0;
+    while k < len(ordenados) {
+      if k < m {
+        antes = push(antes, ordenados[k]);
+      } else {
+        depois = push(depois, ordenados[k]);
+      }
+      k = k + 1;
+    }
+    ordenados = push(antes, c);
+    let q = 0;
+    while q < len(depois) {
+      ordenados = push(ordenados, depois[q]);
+      q = q + 1;
+    }
+    n = n + 1;
+  }
+  // So rotas com padrao casado sao avaliadas (metodo + `Allow` na ordem).
+  let permitir = [];
+  let j = 0;
+  while j < len(ordenados) {
+    let rota = __web_routes[ordenados[j]["idx"]];
+    let params = web_trie_params(rota["padrao"], ordenados[j]["pares"]);
+    if rota["metodo"] == metodo {
+      // Enriquece a requisicao com params (copia por valor).
+      let req2 = merge(req, {params: params});
+      let handler = rota["handler"];
+      let resp = handler(req2);
+      return web_finalizar(resp);
+    }
+    permitir = push(permitir, rota["metodo"]);
+    j = j + 1;
+  }
+  if len(permitir) > 0 {
+    return {status: 405, cabecalhos: {allow: join(permitir, ", ")}, corpo: "metodo nao permitido"};
+  }
+  return web_not_found();
+}
+
+fn web_finalizar(resp) {
+  // Normaliza `str` para 200; completa cabecalhos de seguranca.
+  if type(resp) == "string" {
+    resp = web_text(resp);
+  }
+  let cab = resp["cabecalhos"];
+  if cab == null {
+    cab = {};
+  }
+  if !has(cab, "x-content-type-options") {
+    cab["x-content-type-options"] = "nosniff";
+  }
+  if !has(cab, "x-frame-options") {
+    cab["x-frame-options"] = "DENY";
+  }
+  resp["cabecalhos"] = cab;
+  return resp;
+}
+
+// --- Templates ----------------------------------------------------------
+// `web_render(texto, valores)`: interpola `{{chave}}` com escape HTML
+// (via `template()`); `web_layout(layout, slot, valores)`: injeta o corpo
+// renderizado em `{{conteudo}}` do layout.
+export fn web_render(texto, valores) {
+  return template(texto, valores);
+}
+
+export fn web_layout(layout, conteudo, valores) {
+  let corpo = template(conteudo, valores);
+  let todos = merge(valores, {conteudo: corpo});
+  // `conteudo` ja escapado acima; o layout escapa de novo — para HTML real,
+  // monte o layout com `template()` em duas etapas no app. v1: simples.
+  return template(layout, todos);
+}
+// --- Servidor ------------------------------------------------------------
+// O `http_serve` exige o NOME de uma `fn` global do modulo de entrada
+// (nao-manglada). Como este framework vive em modulo importado (nomes
+// manglados), o app deve declarar seu proprio handler no entry:
+//
+//   import { web_despachar } from "../framework/web.rhp";
+//   fn handler(req) { return web_despachar(req); }
+//   http_serve(8080, "handler", {});
+//
+// Ou com opcoes (rate limiting etc.):
+//
+//   http_serve(8080, "handler", { max_conexoes: 128, limite_taxa: 100 });

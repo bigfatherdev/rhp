@@ -1,0 +1,132 @@
+// Teste diferencial do router trie (item router-trie).
+// Compara `web_despachar` (trie) com uma implementacao linear de referencia
+// (copia do algoritmo anterior) sobre a mesma tabela de rotas e os mesmos
+// handlers: status, corpo e `Allow` devem coincidir em todos os casos,
+// incluindo armadilhas de ordem (estatica apos `:param`).
+import {web_get, web_post, web_json, web_text, web_despachar, web_casar} from "web.rhp";
+
+// Handlers compartilhados pelos dois caminhos (mesmas funcoes, mesmo corpo).
+fn h_root(req) {
+  return web_text("R0");
+}
+fn h_uid(req) {
+  return web_json({rota: "R1", id: req["params"]["id"]});
+}
+fn h_uid_post(req) {
+  return web_json({rota: "R2"});
+}
+fn h_novo(req) {
+  return web_text("R3-estatico");
+}
+fn h_abz(req) {
+  return web_text("R4");
+}
+fn h_axc(req) {
+  return web_json({rota: "R5", x: req["params"]["x"]});
+}
+fn h_abc(req) {
+  return web_text("R6");
+}
+fn h_som(req) {
+  return web_text("R7");
+}
+
+// Registro no framework (ordem importa! estatica depois de `:param`).
+web_get("/", h_root);
+web_get("/users/:id", h_uid);
+web_post("/users/:id", h_uid_post);
+web_get("/users/novo", h_novo);
+web_get("/a/b/z", h_abz);
+web_get("/a/:x/c", h_axc);
+web_get("/a/b/c", h_abc);
+web_get("/somesmo", h_som);
+web_post("/somesmo", h_som);
+
+// Tabela espelho (mesma ordem) para o caminho de referencia.
+let rotas_ref = [{metodo: "GET", padrao: "/", handler: h_root}, {metodo: "GET", padrao: "/users/:id", handler: h_uid}, {metodo: "POST", padrao: "/users/:id", handler: h_uid_post}, {metodo: "GET", padrao: "/users/novo", handler: h_novo}, {metodo: "GET", padrao: "/a/b/z", handler: h_abz}, {metodo: "GET", padrao: "/a/:x/c", handler: h_axc}, {metodo: "GET", padrao: "/a/b/c", handler: h_abc}, {metodo: "GET", padrao: "/somesmo", handler: h_som}, {metodo: "POST", padrao: "/somesmo", handler: h_som}];
+
+// Referencia linear: copia fiel do algoritmo anterior a trie.
+fn ref_finalizar(resp) {
+  if type(resp) == "string" {
+    resp = {status: 200, cabecalhos: {"content-type": "text/plain; charset=utf-8"}, corpo: resp};
+  }
+  return resp;
+}
+
+fn ref_despachar(req) {
+  let metodo = req["metodo"];
+  let caminho = req["caminho"];
+  let permitir = [];
+  let j = 0;
+  while j < len(rotas_ref) {
+    let rota = rotas_ref[j];
+    let params = web_casar(rota["padrao"], caminho);
+    if params != null {
+      if rota["metodo"] == metodo {
+        let req2 = merge(req, {params: params});
+        let handler = rota["handler"];
+        return ref_finalizar(handler(req2));
+      } else {
+        permitir = push(permitir, rota["metodo"]);
+      }
+    }
+    j = j + 1;
+  }
+  if len(permitir) > 0 {
+    return {status: 405, cabecalhos: {allow: join(permitir, ", ")}, corpo: "metodo nao permitido"};
+  }
+  return {status: 404, cabecalhos: {"content-type": "text/plain; charset=utf-8"}, corpo: "nao encontrado"};
+}
+
+fn mkreq(metodo, caminho) {
+  return {metodo: metodo, caminho: caminho, query: {}, cabecalhos: {}, cookies: {}, corpo: ""};
+}
+
+fn confere(metodo, caminho) {
+  let req = mkreq(metodo, caminho);
+  let a = web_despachar(req);
+  let b = ref_despachar(req);
+  assert(a["status"] == b["status"]);
+  assert(a["corpo"] == b["corpo"]);
+  if a["status"] == 405 {
+    assert(a["cabecalhos"]["allow"] == b["cabecalhos"]["allow"]);
+  }
+  return a;
+}
+
+// Casos: estaticas, params, ordem (estatica apos param), 404/405, raiz,
+// profundidade divergente, metodos cruzados com mesmo padrao.
+confere("GET", "/");
+confere("GET", "/users/42");
+confere("POST", "/users/42");
+confere("GET", "/users/novo");
+confere("PUT", "/users/1");
+confere("GET", "/a/b/z");
+confere("GET", "/a/q/c");
+confere("GET", "/a/b/c");
+confere("GET", "/nope");
+confere("POST", "/somesmo");
+confere("GET", "/somesmo");
+confere("DELETE", "/somesmo");
+confere("GET", "/a/b");
+confere("GET", "/users/1/extra");
+confere("GET", "/a/");
+
+// web_casar unitario segue valido (usado pela referencia e por apps).
+assert(web_casar("/users/:id", "/users/7")["id"] == "7");
+assert(web_casar("/a", "/b") == null);
+assert(web_casar("/a", "/a/b") == null);
+
+// Absolutos (ordem de registro vence, nao especificidade):
+// `/users/novo` casa o `:id` (registrado antes do estatico).
+let r_novo = web_despachar(mkreq("GET", "/users/novo"));
+assert(r_novo["corpo"] == "{\"id\":\"novo\",\"rota\":\"R1\"}");
+// `/a/b/c` casa `/a/:x/c` (antes do estatico `/a/b/c`).
+let r_abc = web_despachar(mkreq("GET", "/a/b/c"));
+assert(r_abc["corpo"] == "{\"rota\":\"R5\",\"x\":\"b\"}");
+// 405 agrega metodos na ordem de registro (com repeticao, como o linear).
+let r_405 = web_despachar(mkreq("PUT", "/somesmo"));
+assert(r_405["status"] == 405);
+assert(r_405["cabecalhos"]["allow"] == "GET, POST");
+
+echo "web trie diferencial: ok";

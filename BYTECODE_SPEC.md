@@ -1,4 +1,4 @@
-# BYTECODE_SPEC.md — Formato e semantica do bytecode (Fases 3–6 implementadas)
+# BYTECODE_SPEC.md — Formato e semantica do bytecode (Next Generation)
 
 ## 1. Modelo
 
@@ -6,14 +6,27 @@
 pub enum Value { Null, Bool(bool), Int(i64), Float(f64), Str(String),
                  Array(Vec<Value>), Map(HashMap<String, Value>), Func(FuncValue) }
 pub struct FuncValue { pub def: Rc<FuncDef>, pub env: HashMap<String, Value> }
-pub struct FuncDef { pub name: String, pub params: Vec<String>, pub defaults: Vec<Option<Value>>, pub variadic: Option<String>, pub body: Chunk }
+pub struct FuncDef {
+    pub name: String,
+    pub params: Vec<String>,
+    pub defaults: Vec<Option<Value>>,
+    pub variadic: Option<String>,
+    pub body: Chunk,
+    pub is_generator: bool,
+    pub is_async: bool,              // Next Generation: chamada gera tarefa
+    pub native_id: Option<String>,   // Next Generation: "ext::func" (sem frame)
+}
+pub struct ClassDef {
+    pub name: String,
+    pub parent: Option<String>,      // Next Generation: pai p/ `super`/catch
+    pub methods: HashMap<String, FuncValue>,
+}
 pub struct Chunk {
     pub constants: Vec<Value>, // pool indexado por u32
     pub names: Vec<String>,    // pool de nomes de variaveis/funcoes
     pub funcs: Vec<FuncDef>,   // tabela de funcoes definidas no chunk
     pub code: Vec<Op>,
 }
-pub enum Builtin { Len, Push, Pop, Keys, Str, Int, Float, Type, Assert, HttpGet } // ids 0..=9
 ```
 
 Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
@@ -59,6 +72,11 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
   e empilha ativacoes; o `Return` retoma (`advance_hof`). |
 | `StrictEq` | `pop` 2 valores; empilha `Bool` (igualdade estrita: mesmo tipo;
   `Int`/`Float` comparam numericamente). Usado pelo `match` (RFC 0008). |
+| `BuildClassEx(nome, pai, n)` | Como `BuildClass`, com pai (Next Generation): `Value::Class { parent: Some(pai) }`. Metodos ja achatados pelo compilador. |
+| `IsInstanceOf(nome)` | `pop` valor; empilha `Bool` (instancia da classe ou subclasse via `parent`; Next Generation, excecoes tipadas). |
+| `Await` | `pop` valor; handle de tarefa = join (erros propagam), senao identidade (Next Generation, async). |
+| `CallSuper(campo, desc)` | Metodo do pai com `this` atual; write-back no `this` do chamador (`pending_super`). Erro sem pai/metodo. |
+| `LoadNative(nome)` | Registra funcoes da extensao estatica como globais (`FuncDef.native_id`; Next Generation). Erro se desconhecida/ABI/colisao/dupla carga. |
 
 ## 3. Compilacao (Marco 2 + Fases 3–4)
 
@@ -88,9 +106,11 @@ Limites: `u32::MAX` entradas por pool/tabela (erro de compilacao acima).
   (escopo + vinculo de `V`/descarte + `C` + `F`) ou, sem `catch`,
   `F` + `Rethrow`. `finally` duplicado por caminho (neutro na pilha).
 - `break`/`continue` = desenrolha escopos ate a base do laco + `Jump`
-  (saida/inicio ou incremento); fora de laco = erro de compilacao. `return` fora de funcao = erro.
+  (saida/inicio ou incremento); fora de laco = erro de compilacao. `return fora de funcao = erro.
   Cruzando `try` com `finally`, `break`/`continue`/`return` emitem antes
-  `TryEnd` + copia do `finally` (do mais interno para fora).
+  `TryEnd` + copia do `finally` (do mais interno para fora). Excecao:
+  o operando de `return e;`/`yield e;` e compilado ANTES dessas saidas
+  (0.6.0): erros da avaliacao pertencem ao `try` e alcançam o `catch`.
 - Ternario = cond + `JumpIfFalse->else` + ramo + `Jump->fim` + ramo-senão.
 - `a ?? b` = `a` + `Dup` + `JumpIfNotNull->fim` + `Pop` + `b` (avalia uma vez).
 - `fn` = corpo compilado em `Compiler` aninhado + epilogo

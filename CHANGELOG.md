@@ -2,6 +2,190 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
+## [0.6.0] — 2026-11-20 (Correcao, robustez do runtime e evolucao do HTTP)
+
+### Fixed
+
+- `return e;` (e `yield e;`) dentro de `try`: o operando agora e avaliado
+  ANTES de fechar o handler/`finally` — erros da avaliacao (`return
+  json_parse(s);`, `return unknown_fn();`) sao "erro em B" e alcançam o
+  `catch` ativo em vez de escapar para o topo. Causa raiz: ordem de
+  emissao no compilador (`TryEnd` antes do operando). Inclui `finally`
+  rodando depois, com o valor ja calculado (semantica padrao).
+  Registros: `changes/2026-11-20-fix-return-try-operando.md`.
+- `http_serve` com bind fixo em `127.0.0.1`: nova opt `host` (IP literal
+  v4/v6; `"0.0.0.0"` = todas IPv4; default segue local). Erro claro em
+  bind falho (porta em uso, interface inexistente). Outros nomes sao rejeitados.
+  Registro: `changes/2026-11-20-feat-http-host-bind.md`.
+- Requests malformados agora devolvem 400 (`requisicao invalida`) em vez
+  de 500: sem status-line, `Content-Length` invalido, corpo incompleto,
+  cabecalhos acima de 64 KiB, `Transfer-Encoding` desconhecido.
+  `reason()` cobria 400/429 como "Desconhecido" — corrigido (+ 408/413/
+  422/502/504).
+  Registro: `changes/2026-11-20-fix-http-protocolo.md`.
+- Falha de `accept` nao encerra mais o servidor silenciosamente (log +
+  nova tentativa com recuo).
+  Registro: `changes/2026-11-20-fix-http-protocolo.md`.
+- Percent-decode operava em `char` (UTF-8 virava mojibake latin1):
+  agora decodifica em bytes (`%C3%A9` => "é").
+  Registro: `changes/2026-11-20-fix-http-protocolo.md`.
+
+### Added
+
+- Handler como valor: `http_serve(8080, handler, {})` (resolve `fn` do
+  topo; equivale a string). Closures/aninhadas: erro claro em vez de
+  comportamento indefinido. Divergencia doc-vs-runtime reconciliada
+  (docs atualizadas; sintaxe inline `fn req => ...` continua nao
+  suportada — limitacao registrada).
+  Registro: `changes/2026-11-20-feat-http-handler-valor.md`.
+- Opts `max_passos` (default 10M instrucoes/request; 0 = sem limite) e
+  `max_heap_bytes` (default 0 = sem limite): handler em loop eterno vira
+  500 e o servidor segue (antes: worker presa para sempre).
+- Corpo `Transfer-Encoding: chunked` suportado (RFC 9112 §7.1; precede
+  `Content-Length`; malformado = 400). `"localhost"` como `host` vira
+  `127.0.0.1`. Registro: `changes/2026-11-20-feat-http-chunked-localhost.md`.
+  Registro: `changes/2026-11-20-feat-http-limites-handler.md`.
+- Guarda anti-reentrada: `http_serve` dentro do handler vira erro claro
+  (500) em vez de hang. `http_serve` indireto via topo replay tambem
+  coberto. Registro: `changes/2026-11-20-feat-http-limites-handler.md`.
+- Prazo total de leitura por request (cabecalhos + corpo, 30 s):
+  gotejamento lento nao prende conexao indefinidamente.
+  Registro: `changes/2026-11-20-fix-http-protocolo.md`.
+- `docs/WEB.md`: secao `http_serve(porta, handler, opts)` completa +
+  aviso de seguranca do `0.0.0.0`; `docs/DOCKER.md`: bind em container +
+  topologia validada; `docs/REFERENCIA.md`: linha do `http_serve` e
+  semantica de `return`-em-`try`; `LANGUAGE_SPEC.md`/`BYTECODE_SPEC.md`:
+  ordem de avaliacao do operando normatizada.
+
+### Improved
+
+- Diagnosticos: erros novos do `http_serve` mapeiam para E3000 generico
+  (sem ajuda enganosa de E3001); budget de instrucoes segue E3010.
+- Suite HTTP: 9 testes novos de integracao (bind, host invalido, porta
+  ocupada, handler-valor, 400s, 64 KiB, UTF-8, loop limitado, aninhado,
+  concorrencia 8x) + 1 teste de regressao da VM com os 8 casos do
+  `return`-em-`try` + 2 unitarios (`host`, percent-decode).
+- Benchmarks: baseline 0.6.0 registrado (harness `bench_rhp`, release);
+  caminhos medidos nao foram tocados — variacao observada e ruido de
+  CPU compartilhada (ex.: `fib(20)` 96→78 ms entre runs).
+
+### Security
+
+- Default de bind segue `127.0.0.1` (decisao consciente e documentada);
+  `0.0.0.0` e opt-in com aviso (firewall, nao expor sem autenticacao).
+- Limites por request: corpo 1 MiB, cabecalhos 64 KiB, prazo total 30 s,
+  orcamento de instrucoes do handler — entradas maliciosas nao prendem
+  worker nem estouram memoria sem teto.
+- Auditoria `unwrap`/`expect` em producao: invariantes checadas
+  (`http_fetch` redirect com `location` verificada); sem panics novos.
+- Prova Docker real: servidor 0.0.0.0 em container alcancado por IP
+  interno de outro container + nginx reverso separado + port forwarding;
+  controle negativo (bind local = connection refused entre containers).
+
+### Compatibility
+
+- Compativel com 0.5.0: programas validos seguem validos. Unica mudanca
+  observavel: (1) `return e;` com `finally` agora avalia `e` antes do
+  `finally` (semantica padrao; antes avaliava depois); (2) handlers em
+  loop eterno passam a falhar com 500 apos `max_passos` (antes: hang);
+  (3) requests malformados passam a 400 (antes: 500); (4) `Accept` com
+  erro transiente nao para o servidor. Nenhuma sintaxe removida; nenhum
+  codigo de erro existente alterado; `host` default preserva o bind.
+
+### Known limitations
+
+- Handler inline/closure nao suportado (use nome string ou `fn` do topo
+  como valor); sem keep-alive; resposta `corpo` so `Str` (sem binario);
+  trailers de `chunked` descartados; sem HTTPS no `serve`
+  (terminar TLS no proxy); worker recompila o topo por request
+  (idempotencia exigida; efeitos nao-idempotentes no topo desaconselhados).
+
+## [0.5.0] — 2026-11-19 (Limitações cuidadas: bounds, metodos async, RFC 0030, trie do router)
+
+### Added
+
+- Bounds de generics (RFC 0029): `<T: Classe|Interface>` com checagem em
+  compilacao no uso (`new`/`call` com type args); aridade e nao-generica
+  com args validadas; apagamento mantido (zero custo em runtime).
+  Registros: `changes/2026-11-19-feat-generics-bounds.md`.
+- Metodos `async` com snapshot: `async fn` em classe/trait; `obj.m()`,
+  destacada e `super.m()` geram tarefa sobre copia do `this` (sem
+  write-back). Instancias cruzam a fronteira com a classe (envelope
+  `__rhp_instancia__`); mapas com a chave reservada sao rejeitados.
+  Registro: `changes/2026-11-19-feat-async-metodos.md`.
+- Combinadores e controle async (RFC 0030, nucleo): `await_timeout(h, s)`,
+  `async_cancel(h)`, `async_cancelled()`, `await_all([...])`,
+  `await_race([...])` (builtins 75–79). Tarefas comunicam por canal +
+  flag atomica; thread destacada. Pool segue adiado (documentado).
+  Registro: `changes/2026-11-19-feat-async-combinadores.md`.
+- Router do RHP Web com trie ordenada (primeiro match global vence;
+  `Allow` identico, provado por teste diferencial): ~7x no pior caso
+  medido (100 rotas, build dev). Registro:
+  `changes/2026-11-19-perf-web-trie.md`.
+- Guia `docs/ASYNC.md` (modelo, fronteira, padroes); referencia com 80
+  builtins. Registro: `changes/2026-11-19-docs-async-arquitetura.md`.
+
+### Changed
+
+- `Expr::{Call,New}` encaixotados (`CallData`/`NewData` com `type_args`);
+  `sizeof(Expr)` reduzido (guarda de profundidade preservado).
+- Worker async executa definicoes de topo (ja em 0.4.0); joins agora via
+  canal (mesmas mensagens de erro); retorno instancia decodifica (antes
+  degradava em mapa no `join`).
+- Conflito de nomes de closure resolvido (`{closure:N}` deterministicos).
+
+## [0.4.0] — 2026-11-19 (Next Generation: heranca, namespaces, async, tipadas, generics, extensoes, web + itens 1–4)
+
+### Added
+
+- Tarefas async com captura e codigo compartilhado (item 1): worker executa
+  definicoes de topo (funcoes, classes, `import native`); captura transporta
+  valores planos; closures com nomes unicos (`{closure:N}`); `async` aninhado;
+  instancia como argumento agora e erro claro (antes degradava em mapa).
+  Registros: `changes/2026-11-19-feat-async-captura-estado.md`.
+- RHP Web via `rhp pkg` (item 2): `rhp pkg add rhp_web <repo>/framework`
+  vendoriza em `pacotes/rhp_web/` com `rhp.lock`; guia em `docs/WEB.md`.
+  Registro: `changes/2026-11-19-feat-pkg-framework-web.md`.
+- RFCs proposta (item 3): 0028 (`[autoload]` + `use function`), 0029
+  (bounds `<T: X>`), 0030 (cancel/timeout/`all`/`race`). Registro:
+  `changes/2026-11-19-docs-rfcs-fase3.md`.
+
+- Heranca simples (`extends`, `super` com write-back), interfaces
+  (`interface`, `implements` com verificacao de aridade) e traits (`trait`,
+  `use`, precedencia propria > trait > pai, conflito sem override = erro).
+  RFC 0021. Registro: `changes/2026-11-19-feat-next-generation.md`.
+- Namespaces (`namespace`, `A\B`) e autoload (`import A\B [as C]`, PSR-4
+  `A/B.rhp` confinado a arvore). RFC 0022.
+- `async fn` + `await` sobre tarefas isoladas (args posicionais, erros
+  propagados; funcoes autocontidas). RFC 0023.
+- Excecoes tipadas (`catch Tipo [var]`, hierarquia por `parent`, ordem
+  primeiro-match, `finally`). RFC 0024.
+- Generics por apagamento (`class C<T>`, `fn f<T>`, `new C<int>`, `T` sem
+  checagem; `<` binario preservado). RFC 0025.
+- Extensoes nativas estaticas (`import native "demo"`, ABI 1, `demo_eco`/
+  `demo_soma`/`demo_len`). RFC 0026.
+- RHP Web (`framework/web.rhp`: rotas, `:params`, middlewares, `web_json`/
+  `web_text`/`web_redirect`, 404/405, seguranca, templates; exemplo
+  `framework/exemplo_api.rhp`). RFC 0027.
+- Testes de integracao `nextgen_*` (10 casos) + gramatica VSCode com novas
+  palavras-chave.
+
+### Changed
+
+- Worker `http_serve`: executa todo o topo por request exceto a chamada
+  `http_serve` (antes: so `fn`s). Topo deve ser idempotente; permite rotas
+  e estado do framework. Programas so com `fn`s + `http_serve` comportam-se
+  igual.
+- `FuncDef` com `is_async`/`native_id`; `ClassDef` com `parent`; novos ops
+  (`BuildClassEx`, `IsInstanceOf`, `Await`, `CallSuper`, `LoadNative`).
+
+### Fixed
+
+- Desambiguacao de `<` binario vs generics (`i < n` nao vira tipo).
+- Linker: nomes qualificados globais (sem rename) + alias `as` para autoload.
+- Framework `web_casar`: deteccao de `:param` via `starts_with` (indexacao
+  de string nao suportada).
+
 ## [0.3.0] — 2026-11-18 (Segurança: auditoria 20 CVEs + base Docker `trixie`)
 
 ### Changed

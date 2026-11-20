@@ -43,6 +43,20 @@ pub enum TokenKind {
     Class,
     /// `new` (RFC 0017, Etapa 5).
     New,
+    /// Heranca / abstracao (Fase Next-Gen 1).
+    Extends,
+    Implements,
+    Interface,
+    Trait,
+    Use,
+    Super,
+    /// Concorrencia moderna (Fase Next-Gen 3).
+    Async,
+    Await,
+    /// Modulos / namespaces (Fase Next-Gen 2).
+    Namespace,
+    /// Extensoes nativas (Fase Next-Gen 6): `import native "...";`.
+    Native,
     Import,
     True,
     False,
@@ -84,6 +98,8 @@ pub enum TokenKind {
     Ellipsis,
     /// `.` (acesso a membro, RFC 0017). `..` continua erro lexico.
     Dot,
+    /// `\` separador de namespace (`App\Controllers`; Fase Next-Gen 2).
+    Backslash,
     LParen,
     RParen,
     LBrace,
@@ -377,6 +393,11 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             '"' => {
                 tokens.push(lex_string(&mut chars, &mut line, &mut col)?);
             }
+            '\\' => {
+                tokens.push(Token::new(TokenKind::Backslash, line, col));
+                chars.next();
+                col += 1;
+            }
             c if c.is_ascii_digit() => {
                 tokens.push(lex_number(&mut chars, &mut line, &mut col)?);
             }
@@ -643,6 +664,16 @@ fn lex_ident_or_keyword(
         "static" => TokenKind::Static,
         "class" => TokenKind::Class,
         "new" => TokenKind::New,
+        "extends" => TokenKind::Extends,
+        "implements" => TokenKind::Implements,
+        "interface" => TokenKind::Interface,
+        "trait" => TokenKind::Trait,
+        "use" => TokenKind::Use,
+        "super" => TokenKind::Super,
+        "async" => TokenKind::Async,
+        "await" => TokenKind::Await,
+        "namespace" => TokenKind::Namespace,
+        "native" => TokenKind::Native,
         "import" => TokenKind::Import,
         "true" => TokenKind::True,
         "false" => TokenKind::False,

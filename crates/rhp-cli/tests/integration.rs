@@ -330,6 +330,7 @@ fn rhp_run_time_builtins() {
 struct ServerChild {
     child: Option<std::process::Child>,
     port: u16,
+    announce: String,
 }
 
 impl ServerChild {
@@ -362,6 +363,7 @@ impl ServerChild {
         Self {
             child: Some(child),
             port,
+            announce: first,
         }
     }
 
@@ -415,6 +417,24 @@ impl ServerChild {
         stream
             .write_all(request.as_bytes())
             .expect("enviar request");
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).expect("ler resposta");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Roundtrip de bytes crus (para requests que nao sao UTF-8 válido
+    /// como texto ou que fecham o envio antes do corpo).
+    fn roundtrip_bytes(port: u16, request: &[u8], shutdown_write: bool) -> String {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("conectar no servidor");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        stream.write_all(request).expect("enviar request");
+        if shutdown_write {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
         let mut out = Vec::new();
         stream.read_to_end(&mut out).expect("ler resposta");
         String::from_utf8_lossy(&out).into_owned()
@@ -641,6 +661,241 @@ fn rhp_run_http_serve_rejeita_handler_desconhecido() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn rhp_run_http_serve_host_bind() {
+    // Bind em todas as interfaces: anuncio mostra 0.0.0.0 e 127.0.0.1 alcanca.
+    let server = ServerChild::spawn(
+        "srvhost.rhp",
+        "fn app(req) {\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"host\": \"0.0.0.0\", \"max_requisicoes\": 1});\n",
+    );
+    assert!(
+        server.announce.contains("0.0.0.0"),
+        "anuncio={}",
+        server.announce
+    );
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("ok"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+    // Bind default continua local.
+    let server = ServerChild::spawn(
+        "srvhost2.rhp",
+        "fn app(req) {\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 1});\n",
+    );
+    assert!(
+        server.announce.contains("127.0.0.1"),
+        "anuncio={}",
+        server.announce
+    );
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_rejeita_host_invalido() {
+    for host in ["999.1.1.1", "", "example.com", "0.0.0.0/0"] {
+        let output = run_temp_source(
+            "srvhostbad.rhp",
+            &format!("fn app(req) {{\n  return \"x\";\n}}\nhttp_serve(0, \"app\", {{\"host\": \"{host}\"}});\n"),
+        );
+        assert!(!output.status.success(), "host aceito: {host}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("`host` invalido"),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // `localhost` e apelido de 127.0.0.1 (anuncio prova).
+    let server = ServerChild::spawn(
+        "srvlocal.rhp",
+        "fn app(req) {\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"host\": \"localhost\", \"max_requisicoes\": 1});\n",
+    );
+    assert!(
+        server.announce.contains("127.0.0.1"),
+        "anuncio={}",
+        server.announce
+    );
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_porta_ocupada() {
+    let ocupada = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local deve passar");
+    let porta = ocupada.local_addr().expect("addr").port();
+    let output = run_temp_source(
+        "srvbusy.rhp",
+        &format!("fn app(req) {{\n  return \"x\";\n}}\nhttp_serve({porta}, \"app\", {{}});\n"),
+    );
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(err.contains("bind"), "stderr={err}");
+    assert!(err.contains(&porta.to_string()), "stderr={err}");
+    drop(ocupada);
+}
+
+#[test]
+fn rhp_run_http_serve_handler_como_valor() {
+    // Nome de funcao como valor (sem string) resolve no topo.
+    let server = ServerChild::spawn(
+        "srvval.rhp",
+        "fn app(req) {\n  return \"via-valor\";\n}\nhttp_serve(0, app, {\"max_requisicoes\": 1});\n",
+    );
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("via-valor"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+    // Closure nao tem entrada no topo: erro claro, sem hang.
+    let output = run_temp_source(
+        "srvclo.rhp",
+        "let h = fn (req) => \"x\";\nhttp_serve(0, h, {});\n",
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nivel superior"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_http_serve_400s_e_sobrevive() {
+    let server = ServerChild::spawn(
+        "srv400.rhp",
+        "fn app(req) {\n  if req[\"caminho\"] == \"/eco\" {\n    return req[\"corpo\"];\n  }\n  return \"ok\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 7});\n",
+    );
+    // Sem status-line valida.
+    let r = ServerChild::roundtrip_bytes(server.port, b"GARBAGE\r\n\r\n", false);
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // `Transfer-Encoding: chunked` funciona (corpo remontado e ecoado).
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /eco HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nola, \r\n6\r\nmundo!\r\n0\r\n\r\n",
+        false,
+    );
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("ola, mundo!"), "obteve: {r}");
+    // Chunk com tamanho invalido = 400.
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /eco HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nZZ\r\nxx\r\n0\r\n\r\n",
+        false,
+    );
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // Chunk truncado (declara 5, envia 2 e fecha envio) = 400.
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /eco HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nab",
+        true,
+    );
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // Corpo incompleto (declara 100, envia 5 e fecha envio).
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /x HTTP/1.0\r\nHost: x\r\nContent-Length: 100\r\nConnection: close\r\n\r\ncurto",
+        true,
+    );
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // Content-Length invalido.
+    let r = ServerChild::roundtrip_bytes(
+        server.port,
+        b"POST /x HTTP/1.0\r\nHost: x\r\nContent-Length: muitos\r\nConnection: close\r\n\r\n",
+        false,
+    );
+    assert!(r.contains("400 Bad Request"), "obteve: {r}");
+    // Servidor segue atendendo apos os 400s.
+    let r = server.get("/");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("ok"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_cabecalhos_grandes_e_utf8() {
+    let server = ServerChild::spawn(
+        "srvbig.rhp",
+        "fn app(req) {\n  return req[\"query\"][\"nome\"];\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 2});\n",
+    );
+    // Cabecalhos acima do teto (64 KiB) viram 400.
+    let grande = format!(
+        "GET / HTTP/1.0\r\nHost: x\r\nX-Lixo: {}\r\nConnection: close\r\n\r\n",
+        "a".repeat(70 * 1024)
+    );
+    let r = ServerChild::roundtrip_bytes(server.port, grande.as_bytes(), false);
+    assert!(
+        r.contains("400 Bad Request"),
+        "obteve: {}",
+        &r[..r.len().min(60)]
+    );
+    // Query UTF-8 percent-encoded decodifica em bytes (nao latin1).
+    let r = server.get("/q?nome=caf%C3%A9");
+    assert!(r.contains("200 OK"), "obteve: {r}");
+    assert!(r.ends_with("café"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_handler_loop_limitado() {
+    // Handler em loop eterno: orcamento de passos vira 500; servidor segue.
+    let server = ServerChild::spawn(
+        "srvloop.rhp",
+        "fn app(req) {\n  while true {\n  }\n  return \"nunca\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 2, \"max_passos\": 200000});\n",
+    );
+    let r = server.get("/loop");
+    assert!(r.contains("500 Internal Server Error"), "obteve: {r}");
+    assert!(r.ends_with("erro interno"), "obteve: {r}");
+    // Servidor segue vivo (nao atingiu `max_requisicoes`): o Drop mata o filho.
+}
+
+#[test]
+fn rhp_run_http_serve_aninhado_rejeitado() {
+    // `http_serve` dentro do handler: erro claro (500), sem hang, segue.
+    let server = ServerChild::spawn(
+        "srvnest.rhp",
+        "fn app(req) {\n  http_serve(9999, \"app\", {});\n  return \"x\";\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 2});\n",
+    );
+    let r = server.get("/a");
+    assert!(r.contains("500 Internal Server Error"), "obteve: {r}");
+    let r = server.get("/b");
+    assert!(r.contains("500 Internal Server Error"), "obteve: {r}");
+    let out = server.wait();
+    assert!(out.status.success());
+}
+
+#[test]
+fn rhp_run_http_serve_conexoes_concorrentes() {
+    // 8 clientes simultaneos: todos 200 (thread por conexao).
+    let server = ServerChild::spawn(
+        "srvconc.rhp",
+        "fn app(req) {\n  return \"ok\" + req[\"query\"][\"n\"];\n}\nhttp_serve(0, \"app\", {\"max_requisicoes\": 8});\n",
+    );
+    let port = server.port;
+    let mut alvos = Vec::new();
+    for n in 0..8 {
+        alvos.push(std::thread::spawn(move || {
+            ServerChild::roundtrip(
+                port,
+                &format!("GET /?n={n} HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n"),
+            )
+        }));
+    }
+    for (n, alvo) in alvos.into_iter().enumerate() {
+        let r = alvo.join().expect("thread do cliente");
+        assert!(r.contains("200 OK"), "cliente {n}: {r}");
+        assert!(r.ends_with(&format!("ok{n}")), "cliente {n}: {r}");
+    }
+    let out = server.wait();
+    assert!(out.status.success());
 }
 
 #[test]
@@ -1681,4 +1936,495 @@ fn rhp_run_all_examples_succeed() {
         }
     }
     assert!(count >= 1, "nenhum exemplo encontrado em examples/");
+}
+
+// --- Next Generation (Fases 1-6) -------------------------------------------
+
+#[test]
+fn nextgen_heranca_basica_e_override() {
+    let output = run_temp_source(
+        "ng_heranca.rhp",
+        "class Animal {\n  fn novo(n) { this[\"nome\"] = n; }\n  fn falar() { return \"Som\"; }\n}\nclass Cachorro extends Animal {\n  fn falar() { return \"Au au\"; }\n}\nlet c = new Cachorro(\"Rex\");\necho c[\"nome\"];\necho c.falar();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"Rex\nAu au\n");
+}
+
+#[test]
+fn nextgen_heranca_rejeita_pai_desconhecido_e_ciclo() {
+    let output = run_temp_source(
+        "ng_pai.rhp",
+        "class B extends A { fn novo() { this[\"x\"] = 1; } }\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("desconhecida"), "obteve: {stderr}");
+    let output = run_temp_source(
+        "ng_ciclo.rhp",
+        "class A extends A { fn novo() { this[\"x\"] = 1; } }\n",
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn nextgen_super_chama_pai_com_writeback() {
+    let output = run_temp_source(
+        "ng_super.rhp",
+        "class Base {\n  fn novo() { this[\"n\"] = 1; }\n  fn inc() { this[\"n\"] = this[\"n\"] + 1; return this[\"n\"]; }\n}\nclass Filha extends Base {\n  fn novo() { this[\"n\"] = 10; }\n  fn inc2() { return super.inc() + 100; }\n}\nlet f = new Filha();\necho f.inc2();\necho f[\"n\"];\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"111\n11\n");
+}
+
+#[test]
+fn nextgen_interface_verificada_e_trait_composta() {
+    let output = run_temp_source(
+        "ng_iface.rhp",
+        "interface Logger { fn log(mensagem); }\nclass ConsoleLogger implements Logger {\n  fn novo() { this[\"x\"] = 0; }\n  fn log(m) { echo m; }\n}\nlet l = new ConsoleLogger();\nl.log(\"ola\");\ntrait T { fn ola() { return \"trait\"; } }\nclass P { use T; fn novo() { this[\"x\"] = 1; } }\nlet p = new P();\necho p.ola();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ola\ntrait\n");
+    // Interface nao implementada = erro de compilacao.
+    let output = run_temp_source(
+        "ng_iface_bad.rhp",
+        "interface L { fn log(m); }\nclass C implements L {\n  fn novo() { this[\"x\"] = 0; }\n}\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nao implementa"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_trait_conflito_exige_override() {
+    let output = run_temp_source(
+        "ng_trait_conf.rhp",
+        "trait A { fn m() { return 1; } }\ntrait B { fn m() { return 2; } }\nclass C { use A, B; fn novo() { this[\"x\"] = 0; } }\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conflito de trait"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_excecao_tipada_por_hierarquia() {
+    let output = run_temp_source(
+        "ng_catch.rhp",
+        "class ValidationException {\n  fn novo(m) { this[\"m\"] = m; }\n  fn message() { return this[\"m\"]; }\n}\nclass DatabaseException {\n  fn novo(m) { this[\"m\"] = m; }\n}\ntry {\n  throw new ValidationException(\"email invalido\");\n} catch ValidationException e {\n  echo e.message();\n} catch DatabaseException e {\n  echo \"banco\";\n}\ntry {\n  throw new DatabaseException(\"x\");\n} catch ValidationException e {\n  echo \"errado\";\n} catch DatabaseException e {\n  echo \"banco\";\n}\ntry {\n  echo json_parse(\"{oops}\");\n} catch e {\n  echo \"generico\";\n}\necho \"fim\";\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"email invalido\nbanco\ngenerico\nfim\n");
+}
+
+#[test]
+fn nextgen_generics_apagados() {
+    let output = run_temp_source(
+        "ng_gen.rhp",
+        "class Caixa<T> {\n  fn novo(v) { this[\"v\"] = v; }\n  fn obter() { return this[\"v\"]; }\n}\nlet c = new Caixa<int>(100);\necho c.obter();\nfn primeiro<T>(items) { return items[0]; }\necho primeiro<int>([7, 8]);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"100\n7\n");
+}
+
+#[test]
+fn nextgen_async_await_concorrente() {
+    let output = run_temp_source(
+        "ng_async.rhp",
+        "async fn buscarA() { sleep(0.2); return \"A\"; }\nasync fn buscarB() { return 42; }\nlet a = buscarA();\nlet b = buscarB();\necho await a;\necho await b;\necho \"fim\";\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"A\n42\nfim\n");
+}
+
+#[test]
+fn nextgen_extensao_nativa_demo() {
+    let output = run_temp_source(
+        "ng_ext.rhp",
+        "import native \"demo\";\necho demo_eco(\"RHP\");\necho demo_soma(20, 22);\necho demo_len([1, 2, 3]);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"RHP\n42\n3\n");
+    let output = run_temp_source("ng_ext_bad.rhp", "import native \"inexistente\";\n");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn nextgen_namespace_e_autoload() {
+    // Autoload: namespace -> diretorio relativo ao programa.
+    let dir = std::env::temp_dir().join(format!("rhp-test-ns-{}", std::process::id()));
+    let appdir = dir.join("App").join("Controllers");
+    std::fs::create_dir_all(&appdir).expect("mkdir");
+    std::fs::write(
+        appdir.join("UsuarioController.rhp"),
+        "class App\\Controllers\\UsuarioController {\n  fn novo() { this[\"x\"] = 1; }\n  fn index() { return \"Usuarios\"; }\n}\n",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("main.rhp"),
+        "import App\\Controllers\\UsuarioController;\nlet c = new App\\Controllers\\UsuarioController();\necho c.index();\n",
+    )
+    .expect("write");
+    let output = run_file(&dir.join("main.rhp"));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"Usuarios\n");
+    // Alias.
+    std::fs::write(
+        dir.join("main2.rhp"),
+        "import App\\Controllers\\UsuarioController as Ctrl;\nlet c = new Ctrl();\necho c.index();\n",
+    )
+    .expect("write");
+    let output = run_file(&dir.join("main2.rhp"));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"Usuarios\n");
+}
+
+#[test]
+fn nextgen_async_captura_ambiente() {
+    // Closure async captura local plano; irmaos nao interferem.
+    let output = run_temp_source(
+        "ng_async_cap.rhp",
+        "fn monta() {\n  let base = 40;\n  let f = async fn(x) { return base + x; };\n  let g = async fn(x) { return base * x; };\n  echo await f(2);\n  echo await g(2);\n}\nmonta();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"42\n80\n");
+}
+
+#[test]
+fn nextgen_async_enxerga_funcoes_e_classes() {
+    // Tarefa chama outra funcao de topo e usa classe definida no programa.
+    let output = run_temp_source(
+        "ng_async_code.rhp",
+        "fn dobra(x) { return x * 2; }\nclass Ponto {\n  fn novo(x) { this[\"x\"] = x; }\n  fn get() { return this[\"x\"]; }\n}\nasync fn cria(v) {\n  let p = new Ponto(v);\n  return dobra(p.get());\n}\necho await cria(21);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"42\n");
+}
+
+#[test]
+fn nextgen_async_instancia_com_classe() {
+    // Instancia atravessa COM a classe (item metodos-async): sem corromper.
+    let output = run_temp_source(
+        "ng_async_inst.rhp",
+        "class Ponto {\n  fn novo(x) { this[\"x\"] = x; }\n  fn get() { return this[\"x\"]; }\n}\nasync fn dobra(p) { return p.get() * 2; }\nlet p = new Ponto(21);\necho await dobra(p);\necho p.get();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"42\n21\n");
+}
+
+#[test]
+fn nextgen_async_metodo_snapshot() {
+    // Metodo async roda sobre snapshot: leitura ok, sem write-back.
+    let output = run_temp_source(
+        "ng_async_metodo.rhp",
+        "class Contador {\n  fn novo() { this[\"n\"] = 10; }\n  async fn soma(x) { return this[\"n\"] + x; }\n  fn get() { return this[\"n\"]; }\n}\nlet c = new Contador();\nlet f = c.soma;\necho await c.soma(5);\necho await f(1);\necho c.get();\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"15\n11\n10\n");
+}
+
+#[test]
+fn nextgen_async_rejeita_nao_plano_e_reservado() {
+    // Funcao como argumento segue rejeitada (nao serializavel).
+    let output = run_temp_source(
+        "ng_async_func.rhp",
+        "async fn usa(f) { return 1; }\nfn g(x) { return x; }\necho await usa(g);\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nao transporta funcao"), "obteve: {stderr}");
+    // Chave reservada do envelope nao passa (evita ambiguidade).
+    let output = run_temp_source(
+        "ng_async_tag.rhp",
+        "async fn f(x) { return x; }\nlet m = {__rhp_instancia__: 1};\necho await f(m);\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("chave reservada"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_async_aninhado() {
+    // Tarefa gera outra tarefa (worker com programa-fonte).
+    let output = run_temp_source(
+        "ng_async_nest.rhp",
+        "async fn interna(x) { return x * 10; }\nasync fn externa(y) {\n  let h = interna(y);\n  return await h;\n}\necho await externa(4);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"40\n");
+}
+
+#[test]
+fn nextgen_framework_via_pkg() {
+    // RHP Web distribuido como pacote v0 (vendorizado em `pacotes/`).
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let dir = std::env::temp_dir().join(format!("rhp-test-pkgweb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("projdir");
+    let run = |args: &[&str]| {
+        std::process::Command::new(rhp_bin)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .expect("rhp pkg")
+    };
+    assert!(run(&["init"]).status.success());
+    let origem = workspace_root().join("framework");
+    let origem = origem.to_string_lossy().into_owned();
+    let out = run(&["pkg", "add", "rhp_web", origem.as_str()]);
+    assert!(
+        out.status.success(),
+        "pkg add falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.join("pacotes/rhp_web/web.rhp").is_file());
+    assert!(dir.join("rhp.lock").is_file());
+    let out = run(&["pkg", "install", "--check"]);
+    assert!(
+        out.status.success(),
+        "pkg install --check falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        dir.join("main.rhp"),
+        "import { web_get, web_json, web_despachar } from \"pacotes/rhp_web/web.rhp\";\nweb_get(\"/users/:id\", fn(req) { return web_json({ id: req[\"params\"][\"id\"] }); });\nfn handler(req) { return web_despachar(req); }\nlet req = {metodo: \"GET\", caminho: \"/users/7\", query: {}, cabecalhos: {}, cookies: {}, corpo: \"\"};\necho handler(req)[\"corpo\"];\n",
+    )
+    .expect("write main");
+    let output = run_file(&dir.join("main.rhp"));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"{\"id\":\"7\"}\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nextgen_generic_bounds() {
+    // Bound de classe satisfeito executa; violado falha em compilacao.
+    let output = run_temp_source(
+        "ng_bound_ok.rhp",
+        "class Entidade {\n  fn novo() { this[\"id\"] = 1; }\n  fn id() { return this[\"id\"]; }\n}\nclass Usuario extends Entidade {\n  fn novo() { this[\"id\"] = 2; }\n}\nclass Repo<T: Entidade> {\n  fn novo() { this[\"x\"] = 0; }\n  fn descrever(v: T) { return v.id(); }\n}\nlet r = new Repo<Usuario>();\necho \"ok\";\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ok\n");
+    let output = run_temp_source(
+        "ng_bound_bad.rhp",
+        "class Entidade {\n  fn novo() { this[\"id\"] = 1; }\n}\nclass Outra {\n  fn novo() { this[\"x\"] = 0; }\n}\nclass Repo<T: Entidade> {\n  fn novo() { this[\"x\"] = 0; }\n}\nlet r = new Repo<Outra>();\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nao satisfaz `T: Entidade`"),
+        "obteve: {stderr}"
+    );
+    // Bound de interface via funcao generica.
+    let output = run_temp_source(
+        "ng_bound_iface.rhp",
+        "interface Salva { fn salvar(); }\nclass Mem implements Salva {\n  fn novo() { this[\"x\"] = 0; }\n  fn salvar() { echo \"salvo\"; }\n}\nfn guarda<T: Salva>(v) { v.salvar(); }\nguarda<Mem>(new Mem());\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"salvo\n");
+    // Parametro de tipo visivel adia a checagem (instanciacao concreta roda).
+    let output = run_temp_source(
+        "ng_bound_defer.rhp",
+        "class Caixa<T> {\n  fn novo(v) { this[\"v\"] = v; }\n  fn obter() { return this[\"v\"]; }\n}\nfn embrulha<T>(x) {\n  let c = new Caixa<T>(x);\n  return c.obter();\n}\necho embrulha(99);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"99\n");
+}
+
+#[test]
+fn nextgen_async_metodo_trait_e_super() {
+    // Trait com metodo async + super async (snapshot, sem write-back).
+    let output = run_temp_source(
+        "ng_async_trait_super.rhp",
+        "trait Saudacao {\n  async fn ola(nome) { return \"ola \" + nome; }\n}\nclass Pessoa {\n  use Saudacao;\n  fn novo() { this[\"x\"] = 0; }\n}\nlet p = new Pessoa();\necho await p.ola(\"Rex\");\nclass Base {\n  fn novo() { this[\"x\"] = 1; }\n  async fn quem() { return \"base\"; }\n}\nclass Filha extends Base {\n  fn novo() { this[\"x\"] = 2; }\n  async fn quem2() { return await super.quem() + \"!\"; }\n}\nlet d = new Filha();\necho await d.quem2();\necho d[\"x\"];\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ola Rex\nbase!\n2\n");
+}
+
+#[test]
+fn nextgen_await_timeout() {
+    // Timeout dispara e a tarefa segue juntavel depois.
+    let output = run_temp_source(
+        "ng_timeout.rhp",
+        "async fn lenta() { sleep(1); return \"devagar\"; }\nasync fn rapida() { return \"ligeira\"; }\nlet h = lenta();\ntry {\n  echo await_timeout(h, 0.2);\n} catch e {\n  echo \"timeout ok\";\n}\necho await h;\necho await_timeout(rapida(), 5);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"timeout ok\ndevagar\nligeira\n");
+    // Timeout 0 em tarefa ja concluida devolve na hora (sem erro).
+    let output = run_temp_source(
+        "ng_timeout_zero.rhp",
+        "async fn rapida() { return 42; }\nlet h = rapida();\nsleep(1);\necho await_timeout(h, 0);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"42\n");
+    // Handle invalido e segundos invalidos: erro claro.
+    let output = run_temp_source("ng_timeout_bad.rhp", "echo await_timeout(999, 1);\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalido ou ja consumido"),
+        "obteve: {stderr}"
+    );
+    let output = run_temp_source(
+        "ng_timeout_neg.rhp",
+        "async fn f() { return 1; }\nlet h = f();\necho await_timeout(h, -1);\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("segundos >= 0"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_async_cancel() {
+    // Cancelamento cooperativo: a tarefa sonda e desiste.
+    let output = run_temp_source(
+        "ng_cancel.rhp",
+        "async fn trabalho() {\n  let i = 0;\n  while i < 100000000 {\n    if async_cancelled() { return \"cancelado\"; }\n    i = i + 1;\n  }\n  return \"ok\";\n}\nlet h = trabalho();\nasync_cancel(h);\necho await h;\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"cancelado\n");
+    // Fora de tarefa, nunca cancelado; handle invalido = erro.
+    let output = run_temp_source(
+        "ng_cancel_main.rhp",
+        "echo async_cancelled();\nasync_cancel(999);\n",
+    );
+    assert!(!output.status.success());
+    let out = run_temp_source("ng_cancelled_main.rhp", "echo async_cancelled();\n");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"false\n");
+}
+
+#[test]
+fn nextgen_await_all_race() {
+    // all: junta em ordem; race: primeiro pronto vence.
+    let output = run_temp_source(
+        "ng_all_race.rhp",
+        "async fn a() { sleep(0.3); return \"A\"; }\nasync fn b() { return \"B\"; }\nasync fn c() { sleep(0.1); return \"C\"; }\necho await_all([a(), b(), c()]);\necho await_race([a(), b(), c()]);\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"[A, B, C]\nB\n");
+    // all com falha: propaga (tarefa que falhou e consumida, resto segue).
+    let output = run_temp_source(
+        "ng_all_fail.rhp",
+        "async fn boom() { throw \"x\"; }\ntry {\n  echo await_all([boom()]);\n} catch e {\n  echo \"all falhou ok\";\n}\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"all falhou ok\n");
+    // race vazio e nao-array: erro claro.
+    let output = run_temp_source("ng_race_empty.rhp", "echo await_race([]);\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ao menos 1 tarefa"), "obteve: {stderr}");
+}
+
+#[test]
+fn nextgen_framework_trie_test_suite() {
+    // `rhp test framework/`: diferencial trie-vs-linear + comportamento.
+    let out = Command::new(env!("CARGO_BIN_EXE_rhp"))
+        .args([
+            "test",
+            &workspace_root().join("framework").to_string_lossy(),
+        ])
+        .output()
+        .expect("rhp test framework");
+    assert!(
+        out.status.success(),
+        "web_trie_test deveria passar: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

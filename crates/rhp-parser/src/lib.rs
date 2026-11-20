@@ -189,10 +189,10 @@ pub enum Stmt {
     /// `try BLOCO (catch VAR? BLOCO)? (finally BLOCO)?` (RFC 0001).
     /// Ao menos um de `catch`/`finally` e obrigatorio (checado no parse).
     /// `catch` presente com corpo vazio (`catch e { }`) consome o erro.
+    /// Fase Next-Gen 4: multiplos `catch Tipo? VAR? BLOCO` (captura tipada).
     Try {
         body: Vec<StmtNode>,
-        catch_var: Option<String>,
-        catch_body: Option<Vec<StmtNode>>,
+        catches: Vec<CatchClause>,
         finally_body: Option<Vec<StmtNode>>,
     },
     /// `throw EXPR;` — lanca o valor como erro (RFC 0001).
@@ -212,6 +212,12 @@ pub enum Stmt {
         /// Anotacao de retorno (`: int`; RFC 0016). Checada em runtime.
         return_ann: Option<TypeTag>,
         body: Vec<StmtNode>,
+        /// `async fn` (Fase Next-Gen 3): execucao em tarefa.
+        #[allow(dead_code)]
+        is_async: bool,
+        /// Parametros de tipo (`fn f<T>`; Fase Next-Gen 5, apagamento).
+        #[allow(dead_code)]
+        generic_params: Vec<GenericParam>,
     },
     Return {
         expr: Option<Expr>,
@@ -239,9 +245,45 @@ pub enum Stmt {
         def: Box<StmtNode>,
     },
     /// `class Nome { fn m() {} ... }` (RFC 0017, Etapa 5). Sem heranca.
+    /// Fase Next-Gen 1: `extends`, `implements`, `use` (traits), generics.
     ClassDef {
         name: String,
+        /// Classe pai (`extends Base`), unico (sem heranca multipla).
+        parent: Option<String>,
+        /// Interfaces implementadas (`implements A, B`).
+        interfaces: Vec<String>,
+        /// Traits compostas (`use T1, T2;` dentro do corpo).
+        uses: Vec<String>,
+        /// Parametros de tipo (`class Caixa<T>`; apagamento).
+        generic_params: Vec<GenericParam>,
         methods: Vec<ClassMethod>,
+    },
+    /// `interface Nome { fn m(params); ... }` (Fase Next-Gen 1): contrato.
+    /// Somente assinaturas (sem corpo).
+    InterfaceDef {
+        name: String,
+        /// Parametros de tipo (`interface Repo<T>`; apagamento).
+        generic_params: Vec<GenericParam>,
+        methods: Vec<InterfaceMethod>,
+    },
+    /// `trait Nome { fn m() { ... } }` (Fase Next-Gen 1): reutilizacao.
+    TraitDef {
+        name: String,
+        methods: Vec<ClassMethod>,
+    },
+    /// `namespace App\Controllers;` (Fase Next-Gen 2): prefixo do arquivo.
+    Namespace {
+        name: String,
+    },
+    /// `import App\Controllers\Foo;` ou `import App\Foo as Bar;`
+    /// (Fase Next-Gen 2): resolve via autoload (mapeamento namespace->dir).
+    ImportQualified {
+        path: String,
+        alias: Option<String>,
+    },
+    /// `import native "ext";` (Fase Next-Gen 6): carrega extensao estatica.
+    ImportNative {
+        name: String,
     },
     Block(Vec<StmtNode>),
     ExprStmt {
@@ -257,6 +299,28 @@ pub struct ClassMethod {
     pub params: Vec<Param>,
     pub variadic: Option<String>,
     pub return_ann: Option<TypeTag>,
+    pub body: Vec<StmtNode>,
+    /// `async fn` como metodo (item metodos-async): a chamada gera tarefa
+    /// (snapshot do `this`, sem write-back). Traits aceitam igual.
+    pub is_async: bool,
+}
+
+/// Assinatura de metodo de interface (sem corpo; Fase Next-Gen 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceMethod {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub variadic: Option<String>,
+    pub return_ann: Option<TypeTag>,
+}
+
+/// Clausula `catch` (Fase Next-Gen 4): `catch Tipo? var? Bloco`.
+/// Sem tipo = captura tudo (compativel com RFC 0001).
+/// Com tipo = captura instancias da classe/tipo ou subclasses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchClause {
+    pub type_name: Option<String>,
+    pub var: Option<String>,
     pub body: Vec<StmtNode>,
 }
 
@@ -397,14 +461,12 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    Call {
-        name: String,
-        args: Vec<CallArg>,
-    },
+    Call(Box<CallData>),
     /// Chamada de callee arbitrario: `f()(1)`, `(fn(x) { x })(2)`,
     /// `arr[0](x)`. `f(x)` direto continua `Call` (precedencia de builtins
-    /// preservada byte a byte). `Box` no callee para nao inflar `sizeof(Expr)`
-    /// (o guarda de profundidade assume frames enxutos; ver MAX_PARSE_DEPTH).
+    /// preservada byte a byte). `Box` no callee e no payload para nao
+    /// inflar `sizeof(Expr)` (o guarda de profundidade assume frames
+    /// enxutos; ver MAX_PARSE_DEPTH).
     CallValue {
         callee: Box<Expr>,
         args: Vec<CallArg>,
@@ -428,9 +490,14 @@ pub enum Expr {
     },
     /// Instanciacao: `new Nome(args)` (RFC 0017). `args` aceita as formas
     /// de chamada (posicional, nomeado, spread); a classe vem de `Ident`.
-    New {
-        class: Box<Expr>,
-        args: Vec<CallArg>,
+    /// Fase Next-Gen 5 / item bounds: `new Caixa<Sub>` guarda os argumentos
+    /// de tipo (checagem de aridade/bounds em compilacao; apagados no runtime).
+    New(Box<NewData>),
+    /// `super` (Fase Next-Gen 1): classe pai no metodo (`super.falar()`).
+    Super,
+    /// `await expr` (Fase Next-Gen 3): suspende ate a tarefa/futuro concluir.
+    Await {
+        expr: Box<Expr>,
     },
 }
 
@@ -439,6 +506,35 @@ pub enum Expr {
 pub struct MatchArm {
     pub cond: Option<Expr>,
     pub value: Expr,
+}
+
+/// Chamada direta `nome<Args...>(...)`: payload encaixotado para manter
+/// `sizeof(Expr)` enxuto (ver `MAX_PARSE_DEPTH`). `type_args` e validado
+/// sintaticamente no parse e checado (aridade/bounds, RFC 0029) na
+/// compilacao; apagado no bytecode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallData {
+    pub name: String,
+    pub type_args: Vec<String>,
+    pub args: Vec<CallArg>,
+}
+
+/// Instanciacao `new Nome<Args...>(...)`: idem (checagem em compilacao,
+/// apagamento no runtime).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewData {
+    pub class: Box<Expr>,
+    pub type_args: Vec<String>,
+    pub args: Vec<CallArg>,
+}
+
+/// Parametro de tipo (`T` ou `T: Bound`; item bounds, RFC 0029).
+/// `bound` e o nome qualificado da classe/interface exigida (`None` = sem
+/// restricao). Validado na definicao (deve existir); verificado no uso.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenericParam {
+    pub name: String,
+    pub bound: Option<String>,
 }
 
 /// Corpo de closure, sempre heap-alocado (ver `Expr::Closure`).
@@ -450,6 +546,8 @@ pub struct ClosureData {
     /// Anotacao de retorno (`: int`; RFC 0016). Checada em runtime.
     pub return_ann: Option<TypeTag>,
     pub body: Vec<StmtNode>,
+    /// `async fn` como valor (Fase Next-Gen 3).
+    pub is_async: bool,
 }
 
 /// Operador binario.
@@ -750,8 +848,12 @@ fn parse_stmt_inner(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         TokenKind::Try => parse_try(cursor),
         TokenKind::Throw => parse_throw(cursor),
         TokenKind::Yield => parse_yield(cursor),
-        TokenKind::Fn => parse_fn_def(cursor),
+        TokenKind::Fn => parse_fn_def(cursor, false),
+        TokenKind::Async => parse_async_or_await_stmt(cursor),
         TokenKind::Class => parse_class_def(cursor),
+        TokenKind::Interface => parse_interface_def(cursor),
+        TokenKind::Trait => parse_trait_def(cursor),
+        TokenKind::Namespace => parse_namespace(cursor),
         TokenKind::Return => parse_return(cursor),
         TokenKind::Import => parse_import(cursor),
         TokenKind::Export => parse_export(cursor),
@@ -874,34 +976,315 @@ fn parse_let(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 }
 
 /// Anotacao de tipo apos `:` (`x: int`; RFC 0016). `None` = ausente.
+/// Fase Next-Gen 5: nomes genericos (`T`) sao apagados (sem checagem);
+/// `array<T>` / `mapa<K,V>` sao apagados para o tipo base.
 fn parse_type_ann(cursor: &mut Cursor<'_>) -> Result<Option<TypeTag>, ParseError> {
     if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) {
         return Ok(None);
     }
     cursor.next();
+    parse_type_ann_after_colon(cursor)
+}
+
+/// Nucleo de `parse_type_ann` apos consumir `:` (reuso em params genericos).
+fn parse_type_ann_after_colon(cursor: &mut Cursor<'_>) -> Result<Option<TypeTag>, ParseError> {
     let tok = cursor.next().ok_or_else(|| {
         let (line, col) = cursor.end_pos();
         ParseError::new("esperado tipo apos `:` (int, string, ...)", line, col)
     })?;
-    match &tok.kind {
-        TokenKind::Ident(name) => TypeTag::parse(name).map_or_else(
-            || {
-                Err(ParseError::new(
+    let base: Option<TypeTag> = match &tok.kind {
+        TokenKind::Ident(name) => match TypeTag::parse(name) {
+            Some(tag) => Some(tag),
+            None => {
+                // Generico (`T`, `K`, `V`, ...): apagamento, sem checagem.
+                // Aceita identificador simples como parametro de tipo.
+                if is_generic_name(name) {
+                    // Consome eventual `<...>` apos generico? Nao ha; retorna None.
+                    return Ok(None);
+                }
+                return Err(ParseError::new(
                     format!("tipo desconhecido `{name}` (use int, float, string, bool, array, mapa, null, funcao)"),
                     tok.line,
                     tok.col,
-                ))
-            },
-            |tag| Ok(Some(tag)),
-        ),
+                ));
+            }
+        },
         // `null` e palavra-chave (nao `Ident`); tipo valido.
-        TokenKind::Null => Ok(Some(TypeTag::Null)),
-        other => Err(ParseError::new(
-            format!("esperado tipo apos `:`, encontrado {}", describe(other)),
-            tok.line,
-            tok.col,
-        )),
+        TokenKind::Null => Some(TypeTag::Null),
+        other => {
+            return Err(ParseError::new(
+                format!("esperado tipo apos `:`, encontrado {}", describe(other)),
+                tok.line,
+                tok.col,
+            ));
+        }
+    };
+    // Apagamento de parametrizacao: `array<T>`, `mapa<K,V>`, `Classe<T>`.
+    // Se `<` segue, consome `< ident (, ident)* >` e ignora.
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Lt)) {
+        cursor.next();
+        // Consome ate `>` (inclui `>>` como dois `>`).
+        let mut depth = 1u32;
+        while depth > 0 {
+            match cursor.next() {
+                Some(t) => match &t.kind {
+                    TokenKind::Lt => depth += 1,
+                    TokenKind::Gt => depth -= 1,
+                    TokenKind::Shr => {
+                        if depth >= 2 {
+                            depth -= 2;
+                        } else {
+                            depth = 0;
+                        }
+                    }
+                    TokenKind::Ident(_) | TokenKind::Comma => {}
+                    TokenKind::Null | TokenKind::IntLiteral(_) | TokenKind::StringLiteral(_) => {}
+                    _ => {
+                        // Permite `>>` dividido? O lexer emite `Shr`; tratado acima.
+                        // Qualquer outro token dentro de `<...>` e ignorado se for
+                        // parte de nome qualificado; senao erro suave: continua.
+                    }
+                },
+                None => {
+                    let (line, col) = cursor.end_pos();
+                    return Err(ParseError::new(
+                        "esperado `>` apos argumentos de tipo".to_string(),
+                        line,
+                        col,
+                    ));
+                }
+            }
+        }
     }
+    Ok(base)
+}
+
+/// Nome de parametro de tipo (`T`, `K`, `V`, `TResult`, ...): comeca com
+/// maiuscula (convencao) ou e letra unica maiuscula. Usado para apagamento.
+fn is_generic_name(name: &str) -> bool {
+    matches!(name.chars().next(), Some(c) if c.is_uppercase())
+}
+
+/// Parametros de tipo `<T, U: Bound>` apos nome de fn/classe (item bounds).
+/// Retorna lista vazia se nao houver `<`. Nao consome `<` de comparacao:
+/// so trata como generics se apos `<` vier `Ident` e eventualmente `,`/`>`.
+#[inline(never)]
+fn parse_generic_params_opt(cursor: &mut Cursor<'_>) -> Result<Vec<GenericParam>, ParseError> {
+    if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Lt)) {
+        return Ok(Vec::new());
+    }
+    // Lookahead: `< Ident` (ou `< Ident,`)? Senao, nao e generics (e `<` binario).
+    let is_generic = matches!(
+        cursor.peek_at(1).map(|t| &t.kind),
+        Some(TokenKind::Ident(_))
+    );
+    if !is_generic {
+        return Ok(Vec::new());
+    }
+    cursor.next(); // `<`
+    let mut params = Vec::new();
+    loop {
+        let name = expect_ident(cursor)?;
+        if !is_generic_name(&name) && name.chars().next().is_some_and(|c| c.is_lowercase()) {
+            // Permite minusculas tambem (ex.: `<t>`)? Exige maiuscula por convencao,
+            // mas aceita qualquer ident para nao quebrar: valida duplicata abaixo.
+        }
+        // Bound opcional: `T: ClasseOuInterface` (item bounds, RFC 0029).
+        // `:` aqui nao e ternario (contexto de lista de tipos).
+        let bound = if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Colon)) {
+            cursor.next(); // `:`
+            Some(parse_qualified_name(cursor)?)
+        } else {
+            None
+        };
+        if params.iter().any(|p: &GenericParam| p.name == name) {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                format!("parametro de tipo duplicado `{name}`"),
+                line,
+                col,
+            ));
+        }
+        params.push(GenericParam { name, bound });
+        match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::Comma) => {
+                cursor.next();
+            }
+            Some(TokenKind::Gt) => {
+                cursor.next();
+                break;
+            }
+            _ => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `,` ou `>` em parametros de tipo".to_string(),
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    Ok(params)
+}
+
+/// `true` se daqui (`<`) ha `< T (, T)* > (` (tipos + chamada).
+/// Varredura sem consumir (via `peek_at`); `>>` (`Shr`) conta como dois `>`.
+/// Evita confundir `i < n` (comparacao) com `f<T>(x)` (generics apagados).
+fn looks_like_type_args_call(cursor: &Cursor<'_>) -> bool {
+    // peek_at(0) = `<` (garantido pelo chamador).
+    let mut i = 1usize;
+    // Primeiro tipo.
+    match cursor.peek_at(i).map(|t| &t.kind) {
+        Some(TokenKind::Ident(_)) | Some(TokenKind::Null) => i += 1,
+        _ => return false,
+    }
+    loop {
+        match cursor.peek_at(i).map(|t| &t.kind) {
+            Some(TokenKind::Comma) => {
+                i += 1;
+                match cursor.peek_at(i).map(|t| &t.kind) {
+                    Some(TokenKind::Ident(_)) | Some(TokenKind::Null) => i += 1,
+                    _ => return false,
+                }
+            }
+            Some(TokenKind::Gt) => {
+                i += 1;
+                break;
+            }
+            Some(TokenKind::Shr) => {
+                // `>>`: fecha um nivel (suficiente para o padrao simples);
+                // padroes aninhados complexos sao tratados no consumo real.
+                i += 1;
+                break;
+            }
+            // Aninhado `array<T>`: pula `<...>` interno de forma simples.
+            Some(TokenKind::Lt) => {
+                let mut depth = 1usize;
+                i += 1;
+                while depth > 0 {
+                    match cursor.peek_at(i).map(|t| &t.kind) {
+                        Some(TokenKind::Lt) => depth += 1,
+                        Some(TokenKind::Gt) => depth -= 1,
+                        Some(TokenKind::Shr) => {
+                            depth = depth.saturating_sub(2);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Some(_) => {}
+                        None => return false,
+                    }
+                    i += 1;
+                    if i > 64 {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+        if i > 64 {
+            return false;
+        }
+    }
+    matches!(cursor.peek_at(i).map(|t| &t.kind), Some(TokenKind::LParen))
+}
+
+/// Argumentos de tipo `<int, string>` em uso (`new Caixa<int>`, `f<int>()`).
+/// Apagados em runtime; valida apenas a forma (idents/`null` separados por `,`).
+#[inline(never)]
+fn parse_type_args_opt(cursor: &mut Cursor<'_>) -> Result<Vec<String>, ParseError> {
+    if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Lt)) {
+        return Ok(Vec::new());
+    }
+    let is_generic_use = matches!(
+        cursor.peek_at(1).map(|t| &t.kind),
+        Some(TokenKind::Ident(_)) | Some(TokenKind::Null)
+    );
+    if !is_generic_use {
+        return Ok(Vec::new());
+    }
+    // Desambiguacao `<` binario vs generics (Fase Next-Gen 5): so trata como
+    // argumentos de tipo se houver `< T (, T)* > (` adiante (colado ou nao).
+    // Ex.: `i < n` (comparacao) nao tem `>` nem `(`; `f<T>(x)` tem.
+    if !looks_like_type_args_call(cursor) {
+        return Ok(Vec::new());
+    }
+    cursor.next(); // `<`
+    let mut args = Vec::new();
+    loop {
+        let tok = cursor.next().ok_or_else(|| {
+            let (line, col) = cursor.end_pos();
+            ParseError::new("esperado tipo em argumentos de tipo".to_string(), line, col)
+        })?;
+        let arg = match &tok.kind {
+            TokenKind::Ident(s) => s.clone(),
+            TokenKind::Null => "null".to_string(),
+            _ => {
+                return Err(ParseError::new(
+                    format!("esperado tipo, encontrado {}", describe(&tok.kind)),
+                    tok.line,
+                    tok.col,
+                ));
+            }
+        };
+        // Apagamento aninhado: `array<T>` -> consome `<...>` interno.
+        if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Lt)) {
+            cursor.next();
+            let mut depth = 1u32;
+            while depth > 0 {
+                match cursor.next() {
+                    Some(t) => match &t.kind {
+                        TokenKind::Lt => depth += 1,
+                        TokenKind::Gt => depth -= 1,
+                        TokenKind::Shr => {
+                            depth = depth.saturating_sub(2);
+                        }
+                        _ => {}
+                    },
+                    None => {
+                        let (line, col) = cursor.end_pos();
+                        return Err(ParseError::new(
+                            "esperado `>` apos argumentos de tipo".to_string(),
+                            line,
+                            col,
+                        ));
+                    }
+                }
+            }
+        }
+        args.push(arg);
+        match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::Comma) => {
+                cursor.next();
+            }
+            Some(TokenKind::Gt) => {
+                cursor.next();
+                break;
+            }
+            _ => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `,` ou `>` em argumentos de tipo".to_string(),
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    Ok(args)
+}
+
+/// Nome qualificado `A\B\C` (Fase Next-Gen 2): `Ident (Backslash Ident)*`.
+#[inline(never)]
+fn parse_qualified_name(cursor: &mut Cursor<'_>) -> Result<String, ParseError> {
+    let mut name = expect_ident(cursor)?;
+    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Backslash)) {
+        cursor.next();
+        let part = expect_ident(cursor)?;
+        name.push('\\');
+        name.push_str(&part);
+    }
+    Ok(name)
 }
 
 fn parse_destructure_target(cursor: &mut Cursor<'_>) -> Result<DestructureTarget, ParseError> {
@@ -1370,22 +1753,86 @@ fn parse_yield(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
 fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
     let body = parse_block(cursor)?;
-    let mut catch_var = None;
-    let mut catch_body: Option<Vec<StmtNode>> = None;
-    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Catch)) {
+    let mut catches = Vec::new();
+    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Catch)) {
         cursor.next();
-        // `catch` com ou sem variavel: `catch e { }` ou `catch { }`.
-        if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBrace)) {
-            catch_var = Some(expect_ident(cursor)?);
-        }
-        catch_body = Some(parse_block(cursor)?);
+        // Formas: `catch { }`, `catch e { }`, `catch Tipo e { }`, `catch Tipo { }`.
+        // Heuristica: se proximo e `{`, sem tipo nem var; se Ident seguido de `{`,
+        // e var (legado) ou tipo sem var; se dois Idents, tipo + var.
+        let (type_name, var) = match cursor.peek().map(|t| &t.kind) {
+            Some(TokenKind::LBrace) => (None, None),
+            _ => {
+                // Tenta ler primeiro identificador (pode ser tipo ou var).
+                let first = match cursor.peek() {
+                    Some(t) => match &t.kind {
+                        TokenKind::Ident(s) => s.clone(),
+                        _ => {
+                            let (line, col) = cursor.end_pos();
+                            return Err(ParseError::new(
+                                "esperado tipo, variavel ou `{` apos `catch`".to_string(),
+                                line,
+                                col,
+                            ));
+                        }
+                    },
+                    None => {
+                        let (line, col) = cursor.end_pos();
+                        return Err(ParseError::new(
+                            "esperado bloco apos `catch`, encontrado fim de arquivo".to_string(),
+                            line,
+                            col,
+                        ));
+                    }
+                };
+                // Olha adiante: Ident Ident => tipo + var.
+                // Checa se apos o primeiro vem outro Ident (tipo + var) ou `{` direto.
+                // peek_at(1) e o token apos o primeiro Ident.
+                let second_is_ident = matches!(
+                    cursor.peek_at(1).map(|t| &t.kind),
+                    Some(TokenKind::Ident(_))
+                );
+                if second_is_ident {
+                    // Consome tipo e var (qualificados com `\`).
+                    let tname = parse_qualified_name(cursor)?;
+                    let vname = expect_ident(cursor)?;
+                    (Some(tname), Some(vname))
+                } else {
+                    // Um unico Ident: compativel com legado (`catch e`).
+                    // Se for nome de classe conhecido? Sem tabela aqui: trata como var
+                    // quando o bloco segue, exceto se explicitamente dois idents.
+                    // Para `catch Tipo { }` sem var, o usuario escreve `catch Tipo _`?
+                    // Nao: aceitamos tipo sem var quando o ident comeca com maiuscula
+                    // E o proximo e `{`? Ambiguo com var minuscula. Regra: se o ident
+                    // comeca com maiuscula e o bloco segue, trata como TIPO sem var
+                    // (convencao RHP/Java); senao, var legada.
+                    let _ = first;
+                    let nm = parse_qualified_name(cursor)?;
+                    let is_upper = nm
+                        .rsplit('\\')
+                        .next()
+                        .and_then(|s| s.chars().next())
+                        .is_some_and(|c| c.is_uppercase());
+                    if is_upper {
+                        (Some(nm), None)
+                    } else {
+                        (None, Some(nm))
+                    }
+                }
+            }
+        };
+        let catch_body = parse_block(cursor)?;
+        catches.push(CatchClause {
+            type_name,
+            var,
+            body: catch_body,
+        });
     }
     let mut finally_body = None;
     if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Finally)) {
         cursor.next();
         finally_body = Some(parse_block(cursor)?);
     }
-    if catch_body.is_none() && finally_body.is_none() {
+    if catches.is_empty() && finally_body.is_none() {
         let (line, col) = cursor.end_pos();
         return Err(ParseError::new(
             "`try` exige ao menos `catch` ou `finally`",
@@ -1396,8 +1843,7 @@ fn parse_try(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     // `catch` vazio (`catch e { }`) e valido: consome o erro e segue.
     Ok(Stmt::Try {
         body,
-        catch_var,
-        catch_body,
+        catches,
         finally_body,
     })
 }
@@ -1420,6 +1866,7 @@ fn parse_fn_body(
             variadic,
             return_ann,
             body: vec![StmtNode::from(Stmt::Return { expr: Some(value) })],
+            is_async: false,
         })));
     }
     let body = parse_block(cursor)?;
@@ -1428,12 +1875,14 @@ fn parse_fn_body(
         variadic,
         return_ann,
         body,
+        is_async: false,
     })))
 }
 
-fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+fn parse_fn_def(cursor: &mut Cursor<'_>, is_async: bool) -> Result<Stmt, ParseError> {
     cursor.next();
     let name = expect_ident(cursor)?;
+    let generic_params = parse_generic_params_opt(cursor)?;
     let (params, variadic) = parse_params_list(cursor, "apos nome da funcao")?;
     let return_ann = parse_type_ann(cursor)?;
     let body = parse_block(cursor)?;
@@ -1443,19 +1892,141 @@ fn parse_fn_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
         variadic,
         return_ann,
         body,
+        is_async,
+        generic_params,
     })
 }
 
-/// `class Nome { fn m(params) { } ... }` (RFC 0017, Etapa 5).
-/// So metodos `fn` no corpo (qualquer outra coisa = erro claro);
-/// metodo duplicado = erro (checado aqui, com posicao).
-fn parse_class_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+/// `async fn ...` como statement; `async` fora disso e erro claro.
+/// (Fase Next-Gen 3). `await` como statement so via expressao.
+fn parse_async_or_await_stmt(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    // `async fn` => definicao assincrona; senao erro (evita `async` solto).
+    if matches!(cursor.peek_at(1).map(|t| &t.kind), Some(TokenKind::Fn)) {
+        cursor.next(); // `async`
+        return parse_fn_def(cursor, true);
+    }
+    let tok = cursor.peek().cloned().expect("peek garantiu `async`");
+    Err(ParseError::new(
+        "esperado `fn` apos `async` (use `async fn nome() { }`)".to_string(),
+        tok.line,
+        tok.col,
+    ))
+}
+
+/// `namespace A\B;` (Fase Next-Gen 2): prefixo do arquivo, nivel superior.
+fn parse_namespace(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     cursor.next();
-    let name = expect_ident(cursor)?;
+    let name = parse_qualified_name(cursor)?;
+    expect_semicolon(cursor)?;
+    Ok(Stmt::Namespace { name })
+}
+
+/// `interface Nome<T> { fn m(params); ... }` (Fase Next-Gen 1).
+fn parse_interface_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let name = parse_qualified_name(cursor)?;
+    let generic_params = parse_generic_params_opt(cursor)?;
     expect_token(
         cursor,
         &TokenKind::LBrace,
-        "esperado `{` apos nome da classe",
+        "esperado `{` apos nome da interface",
+    )?;
+    let mut methods = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        match cursor.peek().map(|t| &t.kind) {
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `}` ou assinatura, encontrado fim de arquivo",
+                    line,
+                    col,
+                ));
+            }
+            Some(TokenKind::RBrace) => {
+                cursor.next();
+                break;
+            }
+            Some(TokenKind::Fn) => {
+                cursor.next();
+                let mname = expect_ident(cursor)?;
+                if !seen.insert(mname.clone()) {
+                    let (line, col) = cursor.end_pos();
+                    return Err(ParseError::new(
+                        format!("metodo duplicado `{mname}` na interface `{name}`"),
+                        line,
+                        col,
+                    ));
+                }
+                let (params, variadic) = parse_params_list(cursor, "apos nome do metodo")?;
+                let return_ann = parse_type_ann(cursor)?;
+                expect_semicolon(cursor)?;
+                methods.push(InterfaceMethod {
+                    name: mname,
+                    params,
+                    variadic,
+                    return_ann,
+                });
+            }
+            Some(other) => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    format!(
+                        "no corpo da interface so `fn` (encontrado {})",
+                        describe(other)
+                    ),
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    Ok(Stmt::InterfaceDef {
+        name,
+        generic_params,
+        methods,
+    })
+}
+
+/// Corpo de metodo `fn` ou `async fn` em classe/trait (o `fn` ja consumido;
+/// para `async fn`, o chamador consome `async` + `fn` antes).
+/// `lugar` descreve o dono para erros (ex.: "na classe `Foo`").
+fn parse_method_def(
+    cursor: &mut Cursor<'_>,
+    seen: &mut std::collections::HashSet<String>,
+    lugar: &str,
+    is_async: bool,
+) -> Result<ClassMethod, ParseError> {
+    let mname = expect_ident(cursor)?;
+    if !seen.insert(mname.clone()) {
+        let (line, col) = cursor.end_pos();
+        return Err(ParseError::new(
+            format!("metodo duplicado `{mname}` {lugar}"),
+            line,
+            col,
+        ));
+    }
+    let (params, variadic) = parse_params_list(cursor, "apos nome do metodo")?;
+    let return_ann = parse_type_ann(cursor)?;
+    let body = parse_block(cursor)?;
+    Ok(ClassMethod {
+        name: mname,
+        params,
+        variadic,
+        return_ann,
+        body,
+        is_async,
+    })
+}
+
+/// `trait Nome { fn m() { } ... }` (Fase Next-Gen 1).
+fn parse_trait_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let name = parse_qualified_name(cursor)?;
+    expect_token(
+        cursor,
+        &TokenKind::LBrace,
+        "esperado `{` apos nome do trait",
     )?;
     let mut methods = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1475,31 +2046,22 @@ fn parse_class_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
             }
             Some(TokenKind::Fn) => {
                 cursor.next();
-                let mname = expect_ident(cursor)?;
-                if !seen.insert(mname.clone()) {
-                    let (line, col) = cursor.end_pos();
-                    return Err(ParseError::new(
-                        format!("metodo duplicado `{mname}` na classe `{name}`"),
-                        line,
-                        col,
-                    ));
-                }
-                let (params, variadic) = parse_params_list(cursor, "apos nome do metodo")?;
-                let return_ann = parse_type_ann(cursor)?;
-                let body = parse_block(cursor)?;
-                methods.push(ClassMethod {
-                    name: mname,
-                    params,
-                    variadic,
-                    return_ann,
-                    body,
-                });
+                let lugar = format!("no trait `{name}`");
+                methods.push(parse_method_def(cursor, &mut seen, &lugar, false)?);
+            }
+            Some(TokenKind::Async)
+                if matches!(cursor.peek_at(1).map(|t| &t.kind), Some(TokenKind::Fn)) =>
+            {
+                cursor.next(); // `async`
+                cursor.next(); // `fn`
+                let lugar = format!("no trait `{name}`");
+                methods.push(parse_method_def(cursor, &mut seen, &lugar, true)?);
             }
             Some(other) => {
                 let (line, col) = cursor.end_pos();
                 return Err(ParseError::new(
                     format!(
-                        "no corpo da classe so `fn` (encontrado {})",
+                        "no corpo do trait so `fn` ou `async fn` (encontrado {})",
                         describe(other)
                     ),
                     line,
@@ -1508,7 +2070,123 @@ fn parse_class_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
             }
         }
     }
-    Ok(Stmt::ClassDef { name, methods })
+    Ok(Stmt::TraitDef { name, methods })
+}
+
+/// `class Nome { fn m(params) { } ... }` (RFC 0017, Etapa 5).
+/// Fase Next-Gen 1: `class Nome<T> extends Pai implements I1, I2 { use T1; fn ... }`.
+/// So metodos `fn` e `use Trait;` no corpo; metodo duplicado = erro.
+fn parse_class_def(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
+    cursor.next();
+    let name = parse_qualified_name(cursor)?;
+    let generic_params = parse_generic_params_opt(cursor)?;
+    // `extends Pai` (opcional, unico).
+    let mut parent = None;
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Extends)) {
+        cursor.next();
+        parent = Some(parse_qualified_name(cursor)?);
+    }
+    // `implements I1, I2` (opcional).
+    let mut interfaces = Vec::new();
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Implements)) {
+        cursor.next();
+        loop {
+            interfaces.push(parse_qualified_name(cursor)?);
+            if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
+                cursor.next();
+                continue;
+            }
+            break;
+        }
+        if interfaces.is_empty() {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                "esperado ao menos uma interface apos `implements`".to_string(),
+                line,
+                col,
+            ));
+        }
+    }
+    expect_token(
+        cursor,
+        &TokenKind::LBrace,
+        "esperado `{` apos nome da classe",
+    )?;
+    let mut methods = Vec::new();
+    let mut uses = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        match cursor.peek().map(|t| &t.kind) {
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado `}` ou metodo, encontrado fim de arquivo",
+                    line,
+                    col,
+                ));
+            }
+            Some(TokenKind::RBrace) => {
+                cursor.next();
+                break;
+            }
+            Some(TokenKind::Use) => {
+                cursor.next();
+                // `use Trait;` ou `use T1, T2;`
+                loop {
+                    uses.push(parse_qualified_name(cursor)?);
+                    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Comma)) {
+                        cursor.next();
+                        continue;
+                    }
+                    break;
+                }
+                expect_semicolon(cursor)?;
+            }
+            Some(TokenKind::Fn) => {
+                cursor.next();
+                let lugar = format!("na classe `{name}`");
+                methods.push(parse_method_def(cursor, &mut seen, &lugar, false)?);
+            }
+            Some(TokenKind::Async)
+                if matches!(cursor.peek_at(1).map(|t| &t.kind), Some(TokenKind::Fn)) =>
+            {
+                cursor.next(); // `async`
+                cursor.next(); // `fn`
+                let lugar = format!("na classe `{name}`");
+                methods.push(parse_method_def(cursor, &mut seen, &lugar, true)?);
+            }
+            Some(other) => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    format!(
+                        "no corpo da classe so `fn`, `async fn` ou `use` (encontrado {})",
+                        describe(other)
+                    ),
+                    line,
+                    col,
+                ));
+            }
+        }
+    }
+    // Validacao hierarquica basica: sem auto-heranca.
+    if let Some(p) = parent.as_ref() {
+        if p == &name {
+            let (line, col) = cursor.end_pos();
+            return Err(ParseError::new(
+                format!("classe `{name}` nao pode herdar de si mesma"),
+                line,
+                col,
+            ));
+        }
+    }
+    Ok(Stmt::ClassDef {
+        name,
+        parent,
+        interfaces,
+        uses,
+        generic_params,
+        methods,
+    })
 }
 
 /// Lista de parametros `(a, b = expr, ...rest)`: `(` ja deve ser o proximo.
@@ -1664,6 +2342,52 @@ fn parse_import(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     // Seletivo: `import { a, b as c } from "mod.rhp";`.
     if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LBrace)) {
         return parse_import_names(cursor);
+    }
+    // Nativa: `import native "ext";` (Fase Next-Gen 6).
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Native)) {
+        cursor.next();
+        let name = match cursor.next() {
+            Some(t) => match &t.kind {
+                TokenKind::StringLiteral(s) => s.clone(),
+                TokenKind::Ident(s) => s.clone(),
+                other => {
+                    return Err(ParseError::new(
+                        format!(
+                            "esperado nome da extensao apos `native`, encontrado {}",
+                            describe(other)
+                        ),
+                        t.line,
+                        t.col,
+                    ));
+                }
+            },
+            None => {
+                let (line, col) = cursor.end_pos();
+                return Err(ParseError::new(
+                    "esperado nome da extensao apos `native`".to_string(),
+                    line,
+                    col,
+                ));
+            }
+        };
+        expect_semicolon(cursor)?;
+        return Ok(Stmt::ImportNative { name });
+    }
+    // Qualificado por namespace: `import A\B\C;` ou `import A\B as C;`
+    // (Fase Next-Gen 2). Distingue de string pelo primeiro token ser Ident.
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+        let path = parse_qualified_name(cursor)?;
+        // Alias opcional: `as Nome` (contextual).
+        let mut alias = None;
+        let is_as =
+            matches!(cursor.peek(), Some(t) if matches!(&t.kind, TokenKind::Ident(w) if w == "as"));
+        if is_as {
+            cursor.next();
+            alias = Some(parse_qualified_name(cursor)?);
+        }
+        // `import A\B from "x"` nao existe; qualificado termina com `;`.
+        expect_semicolon(cursor)?;
+        return Ok(Stmt::ImportQualified { path, alias });
     }
     let path = match cursor.next() {
         Some(t) => match &t.kind {
@@ -1893,9 +2617,13 @@ fn parse_export(cursor: &mut Cursor<'_>) -> Result<Stmt, ParseError> {
     // So `fn`/`let`/`const` no nivel em que o `export` aparece (o loader
     // rejeita fora do nivel superior, como faz com `import`).
     let def = match cursor.peek().map(|t| &t.kind) {
-        Some(TokenKind::Fn) => parse_fn_def(cursor)?,
+        Some(TokenKind::Fn) => parse_fn_def(cursor, false)?,
+        Some(TokenKind::Async) => parse_async_or_await_stmt(cursor)?,
         Some(TokenKind::Let) => parse_let(cursor)?,
         Some(TokenKind::Const) => parse_const(cursor)?,
+        Some(TokenKind::Class) => parse_class_def(cursor)?,
+        Some(TokenKind::Interface) => parse_interface_def(cursor)?,
+        Some(TokenKind::Trait) => parse_trait_def(cursor)?,
         _ => {
             return Err(ParseError::new(
                 "`export` so admite `fn`, `let` ou `const`",
@@ -2154,6 +2882,13 @@ fn parse_unary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
             cursor.next();
             parse_unary(cursor)
         }
+        // `await expr` (Fase Next-Gen 3): maior precedencia unaria.
+        Some(TokenKind::Await) => {
+            cursor.next();
+            Ok(Expr::Await {
+                expr: Box::new(parse_unary(cursor)?),
+            })
+        }
         _ => parse_postfix(cursor),
     }
 }
@@ -2217,12 +2952,121 @@ fn parse_call_suffix(cursor: &mut Cursor<'_>, callee: Expr) -> Result<Expr, Pars
     let args = parse_call_args(cursor)?;
     Ok(match callee {
         // `f(x)` direto preserva o caminho classico (builtins).
-        Expr::Var(name) => Expr::Call { name, args },
+        Expr::Var(name) => Expr::Call(Box::new(CallData {
+            name,
+            type_args: Vec::new(),
+            args,
+        })),
         callee => Expr::CallValue {
             callee: Box::new(callee),
             args,
         },
     })
+}
+
+/// `Ident` qualificado ou chamada `f<T>(...)` (fora do caminho quente).
+#[inline(never)]
+fn parse_ident_or_call(cursor: &mut Cursor<'_>, first: String) -> Result<Expr, ParseError> {
+    let mut name = first;
+    while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Backslash)) {
+        cursor.next();
+        name.push('\\');
+        name.push_str(&expect_ident(cursor)?);
+    }
+    // Argumentos de tipo `f<T>(...)`: guardados para checagem (item bounds).
+    let type_args = parse_type_args_opt(cursor)?;
+    if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
+        let args = parse_call_args(cursor)?;
+        Ok(Expr::Call(Box::new(CallData {
+            name,
+            type_args,
+            args,
+        })))
+    } else {
+        Ok(Expr::Var(name))
+    }
+}
+
+/// `async fn (...) { }` como valor (fora do caminho quente).
+#[inline(never)]
+fn parse_async_closure(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    match cursor.peek().map(|t| &t.kind) {
+        Some(TokenKind::Fn) => {
+            cursor.next();
+            let (params, variadic) =
+                parse_params_list(cursor, "apos `fn` (funcao anonima usa `fn (args) { }`)")?;
+            let return_ann = parse_type_ann(cursor)?;
+            if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::FatArrow)) {
+                cursor.next();
+                let value = parse_expr(cursor)?;
+                return Ok(Expr::Closure(Box::new(ClosureData {
+                    params,
+                    variadic,
+                    return_ann,
+                    body: vec![StmtNode::from(Stmt::Return { expr: Some(value) })],
+                    is_async: true,
+                })));
+            }
+            let body = parse_block(cursor)?;
+            Ok(Expr::Closure(Box::new(ClosureData {
+                params,
+                variadic,
+                return_ann,
+                body,
+                is_async: true,
+            })))
+        }
+        _ => {
+            let (line, col) = cursor.end_pos();
+            Err(ParseError::new(
+                "esperado `fn` apos `async` em expressao".to_string(),
+                line,
+                col,
+            ))
+        }
+    }
+}
+
+/// `new Nome<T>(args)` (fora do caminho quente).
+#[inline(never)]
+fn parse_new_expr(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
+    let tok = cursor.next().ok_or_else(|| {
+        let (line, col) = cursor.end_pos();
+        ParseError::new("esperado nome da classe apos `new`", line, col)
+    })?;
+    match &tok.kind {
+        TokenKind::Ident(first) => {
+            let mut name = first.clone();
+            while matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::Backslash)) {
+                cursor.next();
+                name.push('\\');
+                name.push_str(&expect_ident(cursor)?);
+            }
+            // Argumentos de tipo `new Caixa<T>(...)`: guardados (item bounds).
+            let type_args = parse_type_args_opt(cursor)?;
+            if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
+                return Err(ParseError::new(
+                    "esperado `(` apos nome da classe".to_string(),
+                    tok.line,
+                    tok.col,
+                ));
+            }
+            let args = parse_call_args(cursor)?;
+            Ok(Expr::New(Box::new(NewData {
+                class: Box::new(Expr::Var(name)),
+                type_args,
+                args,
+            })))
+        }
+        other => Err(ParseError::new(
+            format!(
+                "esperado nome da classe apos `new`, encontrado {}",
+                describe(other)
+            ),
+            tok.line,
+            tok.col,
+        )),
+    }
 }
 
 fn parse_primary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
@@ -2239,54 +3083,27 @@ fn parse_primary(cursor: &mut Cursor<'_>) -> Result<Expr, ParseError> {
         TokenKind::Null => Ok(Expr::Null),
         TokenKind::LBracket => parse_array(cursor),
         TokenKind::LBrace => parse_map(cursor),
-        TokenKind::Ident(name) => {
-            let name = name.clone();
-            if matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
-                let args = parse_call_args(cursor)?;
-                Ok(Expr::Call { name, args })
-            } else {
-                Ok(Expr::Var(name))
-            }
+        TokenKind::Ident(name) => parse_ident_or_call(cursor, name.clone()),
+        TokenKind::Async => parse_async_closure(cursor),
+        TokenKind::Super => Ok(Expr::Super),
+        TokenKind::Await => {
+            // `await` em posicao primaria (ex.: `await f()` sem unario previo).
+            Ok(Expr::Await {
+                expr: Box::new(parse_unary(cursor)?),
+            })
         }
         TokenKind::Fn => {
             // `tok` ja consumiu `fn`; `(` vem a seguir ou e erro claro.
             let (params, variadic) =
                 parse_params_list(cursor, "apos `fn` (funcao anonima usa `fn (args) { }`)")?;
-            parse_fn_body(cursor, params, variadic)
-        }
-        TokenKind::New => {
-            // `new Nome(args)`: a classe e sempre um nome simples (sem
-            // `new expr()` arbitrario; regra unica, RFC 0017).
-            let tok = cursor.next().ok_or_else(|| {
-                let (line, col) = cursor.end_pos();
-                ParseError::new("esperado nome da classe apos `new`", line, col)
-            })?;
-            match &tok.kind {
-                TokenKind::Ident(name) => {
-                    let name = name.clone();
-                    if !matches!(cursor.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
-                        return Err(ParseError::new(
-                            "esperado `(` apos nome da classe".to_string(),
-                            tok.line,
-                            tok.col,
-                        ));
-                    }
-                    let args = parse_call_args(cursor)?;
-                    Ok(Expr::New {
-                        class: Box::new(Expr::Var(name)),
-                        args,
-                    })
-                }
-                other => Err(ParseError::new(
-                    format!(
-                        "esperado nome da classe apos `new`, encontrado {}",
-                        describe(other)
-                    ),
-                    tok.line,
-                    tok.col,
-                )),
+            let mut closure = parse_fn_body(cursor, params, variadic)?;
+            // `parse_fn_body` cria `is_async: false`; mantem aqui.
+            if let Expr::Closure(data) = &mut closure {
+                data.is_async = false;
             }
+            Ok(closure)
         }
+        TokenKind::New => parse_new_expr(cursor),
         TokenKind::Match => parse_match(cursor),
         TokenKind::LParen => {
             let expr = parse_expr(cursor)?;
@@ -2436,6 +3253,17 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Import => "`import`".to_string(),
         TokenKind::Class => "`class`".to_string(),
         TokenKind::New => "`new`".to_string(),
+        TokenKind::Extends => "`extends`".to_string(),
+        TokenKind::Implements => "`implements`".to_string(),
+        TokenKind::Interface => "`interface`".to_string(),
+        TokenKind::Trait => "`trait`".to_string(),
+        TokenKind::Use => "`use`".to_string(),
+        TokenKind::Super => "`super`".to_string(),
+        TokenKind::Async => "`async`".to_string(),
+        TokenKind::Await => "`await`".to_string(),
+        TokenKind::Namespace => "`namespace`".to_string(),
+        TokenKind::Native => "`native`".to_string(),
+        TokenKind::Backslash => "`\\`".to_string(),
         TokenKind::Dot => "`.`".to_string(),
         TokenKind::True | TokenKind::False => "booleano".to_string(),
         TokenKind::Null => "`null`".to_string(),
@@ -2729,6 +3557,8 @@ mod tests {
                 body: vec![StmtNode::from(Stmt::Return {
                     expr: Some(Expr::Var("a".to_string())),
                 })],
+                is_async: false,
+                generic_params: vec![],
             }]
         );
         // Closure aceita a mesma forma.
@@ -2765,14 +3595,15 @@ mod tests {
         assert_eq!(
             program.statements,
             vec![Stmt::Echo {
-                expr: Expr::Call {
+                expr: Expr::Call(Box::new(CallData {
                     name: "f".to_string(),
+                    type_args: vec![],
                     args: vec![
                         CallArg::Pos(Expr::Int(1)),
                         CallArg::Named("x".to_string(), Expr::Int(2)),
                         CallArg::Spread(Expr::Var("r".to_string())),
                     ],
-                }
+                }))
             }]
         );
         // Ternario com `:` nao vira nomeado; `:` apos nao-Var e erro.
@@ -2790,6 +3621,80 @@ mod tests {
         );
         let err = lex_and_parse("echo f(x: 1, x: 2);").expect_err("deve falhar");
         assert!(err.to_string().contains("duplicado"), "obteve: {err}");
+    }
+
+    #[test]
+    fn parses_generic_bounds_and_type_args() {
+        // Bounds: `T`, `U: Base`, qualificado `V: App\Base`.
+        let program = lex_and_parse("fn f<T, U: Base, V: App\\Modelo>() { return 1; }")
+            .expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::FnDef { generic_params, .. } => {
+                assert_eq!(generic_params.len(), 3);
+                assert_eq!(generic_params[0].name, "T");
+                assert_eq!(generic_params[0].bound, None);
+                assert_eq!(generic_params[1].name, "U");
+                assert_eq!(generic_params[1].bound.as_deref(), Some("Base"));
+                assert_eq!(generic_params[2].name, "V");
+                assert_eq!(generic_params[2].bound.as_deref(), Some("App\\Modelo"));
+            }
+            other => panic!("esperado FnDef, obteve {other:?}"),
+        }
+        // Type args preservados em chamada e `new`.
+        let program = lex_and_parse("echo f<int, string>(1);").expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::Echo {
+                expr: Expr::Call(data),
+            } => {
+                assert_eq!(data.name, "f");
+                assert_eq!(data.type_args, vec!["int", "string"]);
+            }
+            other => panic!("esperado Call, obteve {other:?}"),
+        }
+        let program = lex_and_parse("let c = new Caixa<Usuario>(1);").expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::Let {
+                init: Some(Expr::New(data)),
+                ..
+            } => {
+                assert_eq!(data.type_args, vec!["Usuario"]);
+            }
+            other => panic!("esperado New, obteve {other:?}"),
+        }
+        // Duplicata de parametro de tipo = erro.
+        let err = lex_and_parse("fn f<T, T>() { }").expect_err("deve falhar");
+        assert!(err.to_string().contains("duplicado"), "obteve: {err}");
+        // `<` binario continua comparacao (nao vira generics).
+        lex_and_parse("echo a < b;").expect("comparacao deve passar");
+        lex_and_parse("for let i = 0; i < n; i = i + 1 { echo i; }")
+            .expect("for com `<` deve passar");
+    }
+
+    #[test]
+    fn parses_async_methods() {
+        // Metodos `async fn` em classe e trait (item metodos-async).
+        let program = lex_and_parse(
+            "class A { fn novo() { this[\"x\"] = 0; } async fn busca(id) { return id; } }",
+        )
+        .expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::ClassDef { methods, .. } => {
+                assert_eq!(methods.len(), 2);
+                assert!(!methods[0].is_async);
+                assert!(methods[1].is_async);
+                assert_eq!(methods[1].name, "busca");
+            }
+            other => panic!("esperado ClassDef, obteve {other:?}"),
+        }
+        let program =
+            lex_and_parse("trait T { async fn m() { return 1; } }").expect("parse deve passar");
+        match &program.statements[0].stmt {
+            Stmt::TraitDef { methods, .. } => {
+                assert_eq!(methods.len(), 1);
+                assert!(methods[0].is_async);
+            }
+            other => panic!("esperado TraitDef, obteve {other:?}"),
+        }
     }
 
     #[test]
@@ -2812,6 +3717,8 @@ mod tests {
                         expr: Some(Expr::Var("n".to_string())),
                     }),
                 ],
+                is_async: false,
+                generic_params: vec![],
             }]
         );
         // Init obrigatorio.
@@ -2996,7 +3903,7 @@ mod tests {
         assert!(matches!(
             program.statements[0].stmt,
             Stmt::Echo {
-                expr: Expr::Call { .. }
+                expr: Expr::Call(_)
             }
         ));
         // Chamada encadeada e por indice: `CallValue`.
@@ -3130,10 +4037,13 @@ mod tests {
             vec![
                 Stmt::Try {
                     body: vec![StmtNode::from(Stmt::Echo { expr: Expr::Int(1) })],
-                    catch_var: Some("e".to_string()),
-                    catch_body: Some(vec![StmtNode::from(Stmt::Echo {
-                        expr: Expr::Var("e".to_string()),
-                    })]),
+                    catches: vec![CatchClause {
+                        type_name: None,
+                        var: Some("e".to_string()),
+                        body: vec![StmtNode::from(Stmt::Echo {
+                            expr: Expr::Var("e".to_string()),
+                        })],
+                    }],
                     finally_body: Some(vec![StmtNode::from(Stmt::Echo { expr: Expr::Int(2) })]),
                 },
                 Stmt::Throw {
@@ -3147,7 +4057,6 @@ mod tests {
         assert!(matches!(
             program.statements[0].stmt,
             Stmt::Try {
-                catch_var: None,
                 finally_body: None,
                 ..
             }
@@ -3157,7 +4066,6 @@ mod tests {
         assert!(matches!(
             program.statements[0].stmt,
             Stmt::Try {
-                catch_var: None,
                 finally_body: Some(_),
                 ..
             }

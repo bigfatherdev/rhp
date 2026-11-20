@@ -1,0 +1,27 @@
+// Exemplo RHP Web: API REST minima (Fase Next-Gen 7).
+//
+//   rhp run framework/exemplo_api.rhp
+// Para servir HTTP, desmarque a ultima linha (`http_serve`).
+import {web_get, web_post, web_use, web_json, web_text, web_logger, web_seguranca, web_despachar} from "web.rhp";
+
+web_use(web_logger);
+web_use(web_seguranca);
+
+web_get("/", fn (req) {
+  return web_text("RHP Web");
+});
+
+web_get("/users/:id", fn (req) {
+  return web_json({id: req["params"]["id"]});
+});
+
+web_post("/users", fn (req) {
+  return {status: 201, cabecalhos: {"content-type": "application/json"}, corpo: json_stringify({criado: true})};
+});
+
+fn handler(req) {
+  return web_despachar(req);
+}
+
+echo "rotas ok";
+// http_serve(8080, "handler", {});

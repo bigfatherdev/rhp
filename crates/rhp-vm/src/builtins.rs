@@ -32,7 +32,14 @@ pub(super) fn call_builtin(
 ) -> Result<Value, VmError> {
     match builtin {
         // Interceptados no `step_inner` (precisam da VM inteira).
-        Builtin::Next | Builtin::AsyncSpawn | Builtin::AsyncJoin => Err(VmError::new(
+        Builtin::Next
+        | Builtin::AsyncSpawn
+        | Builtin::AsyncJoin
+        | Builtin::AwaitTimeout
+        | Builtin::AsyncCancel
+        | Builtin::AsyncCancelled
+        | Builtin::AwaitAll
+        | Builtin::AwaitRace => Err(VmError::new(
             "interno: builtin de controle fora do protocolo de resume".to_string(),
         )),
         Builtin::Len => match &args[0] {

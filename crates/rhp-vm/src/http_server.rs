@@ -12,7 +12,7 @@
 
 use rhp_bytecode::{compile, Value};
 use rhp_parser::Program as AstProgram;
-use rhp_parser::{CallArg, Expr, Program, Stmt, StmtNode};
+use rhp_parser::{CallArg, CallData, Expr, Program, Stmt, StmtNode};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -32,25 +32,45 @@ const MAX_HEADERS: usize = 64 * 1024;
 const MAX_CONNS_HARD: u64 = 1024;
 /// Teto de IPs rastreados no rate limit (eviccao grosseira: limpa tudo).
 const MAX_TRACKED_IPS: usize = 4096;
+/// Orcamento padrao de instrucoes por request no handler (0.6.0: antes
+/// ilimitado — handler em loop eterno ocupava a worker para sempre).
+const DEFAULT_MAX_PASSOS: u64 = 10_000_000;
 
 /// Opcoes de `http_serve` (tudo opcional).
 #[derive(Debug, Clone)]
 pub struct ServeOpts {
+    /// Interface de escuta ("127.0.0.1" padrao; "0.0.0.0" = todas IPv4;
+    /// IP literal v4/v6 especifico; "localhost" = 127.0.0.1). Outros nomes
+    /// sao rejeitados (sem DNS no caminho do bind).
+    pub host: String,
     pub max_conexoes: u64,
     /// 0 = servir para sempre; N = servir N requests e retornar.
     pub max_requisicoes: u64,
     /// Teto de requests/segundo por IP (0 = sem limite).
     pub limite_taxa: u64,
+    /// Teto de instrucoes da VM por request (0 = sem limite).
+    pub max_passos: u64,
+    /// Teto de heap da VM por request em bytes (0 = sem limite).
+    pub max_heap_bytes: u64,
 }
 
 impl Default for ServeOpts {
     fn default() -> Self {
         Self {
+            host: "127.0.0.1".to_string(),
             max_conexoes: 32,
             max_requisicoes: 0,
             limite_taxa: 0,
+            max_passos: DEFAULT_MAX_PASSOS,
+            max_heap_bytes: 0,
         }
     }
+}
+
+// `true` dentro da worker thread de um request: `http_serve` aninhado
+// (no handler) seria um bloqueio eterno — vira erro claro em vez de hang.
+std::thread_local! {
+    static EM_HANDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Decisao de rate limit (janela fixa de 1 s por IP; `agora` em segundos).
@@ -114,9 +134,26 @@ pub(super) fn serve_builtin(
     };
     let handler = match &args[1] {
         Value::Str(name) => name.clone(),
+        Value::Func(func) => {
+            // Valor de funcao resolve pelo nome no topo (equivale a string).
+            // Exige `fn <nome>` no nivel superior: closures/aninhadas nao
+            // tem entrada no programa sintetico (limitacao documentada).
+            let name = func.def.name.clone();
+            let no_topo = program.as_ref().is_some_and(|p| {
+                p.statements
+                    .iter()
+                    .any(|node| matches!(&node.stmt, Stmt::FnDef { name: n, .. } if n == &name))
+            });
+            if name.is_empty() || !no_topo {
+                return Err(VmError::new(format!(
+                    "`http_serve`: handler como valor so aceita `fn {name}` no nivel superior (closures nao suportadas; use o nome como string)"
+                )));
+            }
+            name
+        }
         other => {
             return Err(VmError::new(format!(
-                "`http_serve`: handler exige string (nome de `fn`), encontrado {}",
+                "`http_serve`: handler exige string (nome de `fn`) ou valor de funcao, encontrado {}",
                 type_name(other)
             )));
         }
@@ -135,11 +172,41 @@ pub(super) fn serve_builtin(
     serve(port, &handler, &opts, &program)
 }
 
-/// Valida o mapa de `opts` (`max_conexoes`, `max_requisicoes`, `limite_taxa`).
+/// Resolve `host` de escuta: IP literal ou `localhost` (= 127.0.0.1).
+/// Nomes arbitrarios sao rejeitados (sem DNS no caminho do bind).
+fn resolve_host(host: &str) -> Result<std::net::IpAddr, String> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+    host.parse::<std::net::IpAddr>().map_err(|_| {
+        format!("use IP literal ou \"localhost\" (ex.: \"127.0.0.1\", \"0.0.0.0\"), encontrado `{host}`")
+    })
+}
+
+/// Valida o mapa de `opts` (`host`, `max_conexoes`, `max_requisicoes`,
+/// `limite_taxa`, `max_passos`, `max_heap_bytes`).
 fn parse_serve_opts(opts: &HashMap<String, Value>) -> Result<ServeOpts, VmError> {
     let mut parsed = ServeOpts::default();
     for (key, value) in opts {
         match key.as_str() {
+            "host" => match value {
+                Value::Str(h)
+                    if h.eq_ignore_ascii_case("localhost")
+                        || h.parse::<std::net::IpAddr>().is_ok() =>
+                {
+                    parsed.host = if h.eq_ignore_ascii_case("localhost") {
+                        "127.0.0.1".to_string()
+                    } else {
+                        h.clone()
+                    };
+                }
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_serve`: `host` invalido (use IP literal ou \"localhost\"), encontrado {}",
+                        type_name(other)
+                    )));
+                }
+            },
             "max_conexoes" => match value {
                 Value::Int(n) if (1..=MAX_CONNS_HARD as i64).contains(n) => {
                     parsed.max_conexoes = *n as u64;
@@ -173,9 +240,31 @@ fn parse_serve_opts(opts: &HashMap<String, Value>) -> Result<ServeOpts, VmError>
                     )));
                 }
             },
+            "max_passos" => match value {
+                Value::Int(n) if *n >= 0 => {
+                    parsed.max_passos = *n as u64;
+                }
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_serve`: `max_passos` exige >= 0 (0 = sem limite), encontrado {}",
+                        type_name(other)
+                    )));
+                }
+            },
+            "max_heap_bytes" => match value {
+                Value::Int(n) if *n >= 0 => {
+                    parsed.max_heap_bytes = *n as u64;
+                }
+                other => {
+                    return Err(VmError::new(format!(
+                        "`http_serve`: `max_heap_bytes` exige >= 0 (0 = sem limite), encontrado {}",
+                        type_name(other)
+                    )));
+                }
+            },
             unknown => {
                 return Err(VmError::new(format!(
-                    "`http_serve`: opcao desconhecida `{unknown}` (use `max_conexoes`, `max_requisicoes`, `limite_taxa`)"
+                    "`http_serve`: opcao desconhecida `{unknown}` (use `host`, `max_conexoes`, `max_requisicoes`, `limite_taxa`, `max_passos`, `max_heap_bytes`)"
                 )));
             }
         }
@@ -203,10 +292,25 @@ pub fn serve(
             "`http_serve`: nome do handler vazio".to_string(),
         ));
     }
+    if EM_HANDLER.get() {
+        return Err(VmError::new(
+            "`http_serve`: nao pode ser chamado dentro de um handler (bloquearia para sempre)"
+                .to_string(),
+        ));
+    }
     // Falha rapida: handler precisa existir e o programa precisa compilar.
     preflight(program, handler)?;
-    let listener = TcpListener::bind(("127.0.0.1", port as u16))
-        .map_err(|e| VmError::new(format!("`http_serve`: bind na porta {port}: {e}")))?;
+    let host = resolve_host(&opts.host).map_err(|dica| {
+        VmError::new(format!(
+            "`http_serve`: `host` invalido ({dica}): `{}`",
+            opts.host
+        ))
+    })?;
+    let listener = TcpListener::bind((host, port as u16)).map_err(|e| {
+        VmError::new(format!(
+            "`http_serve`: bind em {host}:{port} falhou: {e} (porta em uso? permissao? interface inexistente?)"
+        ))
+    })?;
     listener
         .set_nonblocking(true)
         .map_err(|e| VmError::new(format!("`http_serve`: nonblock: {e}")))?;
@@ -237,7 +341,13 @@ pub fn serve(
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            Err(_) => break,
+            Err(e) => {
+                // Erro transiente (ex.: EMFILE): registra, recua e continua.
+                // Parar aqui silenciosamente fingiria conclusao normal.
+                eprintln!("rhp: accept falhou ({e}); tentando de novo");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
         };
         if ctl.ativas.load(Ordering::SeqCst) >= opts.max_conexoes as usize {
             let _ = respond_503(&stream);
@@ -266,8 +376,16 @@ pub fn serve(
         let worker_ctl = Arc::clone(&ctl);
         let worker_program = Arc::clone(program);
         let worker_handler = handler.to_string();
+        let worker_limites = super::VmLimits {
+            max_steps: (opts.max_passos > 0).then_some(opts.max_passos),
+            max_stack_depth: None,
+            max_collection_len: None,
+            max_heap_bytes: (opts.max_heap_bytes > 0).then_some(opts.max_heap_bytes),
+        };
         std::thread::spawn(move || {
-            if let Some(code) = handle_one(stream, &worker_handler, &worker_program) {
+            if let Some(code) =
+                handle_one(stream, &worker_handler, &worker_program, &worker_limites)
+            {
                 *worker_ctl.exit_code.lock().expect("lock envenenado") = Some(code);
                 worker_ctl.done.store(true, Ordering::SeqCst);
             }
@@ -327,7 +445,11 @@ fn preflight(program: &AstProgram, handler: &str) -> Result<(), VmError> {
     Ok(())
 }
 
-/// Programa sintetico por request: todas as `fn` de topo + chamada.
+/// Programa sintetico por request: todo o topo (definicoes + estado) + chamada.
+/// Fase Next-Gen 7: inclui `let`/`const`/`class`/`import native`/`namespace`
+/// e chamadas de registro (ex.: `web_get(...)`), nao so `fn` — o worker
+/// reconstrói o estado executando o topo uma vez por request (idempotente).
+/// A chamada `http_serve(...)` e filtrada (senao o worker serviria de novo).
 fn synthetic_program(
     program: &AstProgram,
     handler: &str,
@@ -336,7 +458,7 @@ fn synthetic_program(
     let mut statements: Vec<StmtNode> = program
         .statements
         .iter()
-        .filter(|node| matches!(&node.stmt, Stmt::FnDef { .. }))
+        .filter(|node| !is_serve_stmt(&node.stmt))
         .cloned()
         .collect();
     statements.push(StmtNode {
@@ -344,16 +466,76 @@ fn synthetic_program(
         trailing: None,
         blank_before: false,
         stmt: Stmt::ExprStmt {
-            expr: Expr::Call {
+            expr: Expr::Call(Box::new(CallData {
                 name: handler.to_string(),
+                type_args: Vec::new(),
                 args: vec![CallArg::Pos(expr_from_value(request)?)],
-            },
+            })),
         },
     });
     Ok(Program {
         statements,
         trailing_comments: Vec::new(),
     })
+}
+
+/// `true` se o statement e (ou contem no topo) uma chamada `http_serve`
+/// — filtrado do programa sintetico do worker (evita re-servir).
+fn is_serve_stmt(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::ExprStmt { expr } => expr_calls_serve(expr),
+        Stmt::Let { init: Some(e), .. }
+        | Stmt::Const { init: e, .. }
+        | Stmt::Return { expr: Some(e) }
+        | Stmt::Throw { expr: e } => expr_calls_serve(e),
+        _ => false,
+    }
+}
+
+/// Procura `http_serve(...)` na expressao (direta ou aninhada em chamada).
+fn expr_calls_serve(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(data) => data.name == "http_serve",
+        Expr::CallValue { callee, args } => {
+            expr_calls_serve(callee) || args.iter().any(|a| expr_calls_serve(a.value()))
+        }
+        Expr::Binary { left, right, .. } => expr_calls_serve(left) || expr_calls_serve(right),
+        Expr::Unary { expr, .. } | Expr::Await { expr } => expr_calls_serve(expr),
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_calls_serve(cond) || expr_calls_serve(then_branch) || expr_calls_serve(else_branch)
+        }
+        Expr::Array(items) => items.iter().any(expr_calls_serve),
+        Expr::Map(entries) => entries.iter().any(|(_, v)| expr_calls_serve(v)),
+        Expr::Index { base, index } => expr_calls_serve(base) || expr_calls_serve(index),
+        Expr::Member { obj, .. } => expr_calls_serve(obj),
+        Expr::New(data) => {
+            expr_calls_serve(&data.class) || data.args.iter().any(|a| expr_calls_serve(a.value()))
+        }
+        Expr::Match { subject, arms } => {
+            expr_calls_serve(subject)
+                || arms.iter().any(|a| {
+                    a.cond.as_ref().is_some_and(expr_calls_serve) || expr_calls_serve(&a.value)
+                })
+        }
+        Expr::Closure(data) => data.body.iter().any(|n| stmt_calls_serve(&n.stmt)),
+        _ => false,
+    }
+}
+
+/// Procura `http_serve` em statements aninhados (corpos de `if`/`for`/etc.).
+/// Conservador: qualquer bloco com a chamada marca o statement pai.
+fn stmt_calls_serve(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::ExprStmt { expr } | Stmt::Throw { expr } | Stmt::Echo { expr } => {
+            expr_calls_serve(expr)
+        }
+        Stmt::Let { init: Some(e), .. } | Stmt::Const { init: e, .. } => expr_calls_serve(e),
+        _ => false,
+    }
 }
 
 /// Valor RHP => literal AST (request; `Func` nao atravessa).
@@ -382,8 +564,14 @@ fn expr_from_value(value: &Value) -> Result<Expr, String> {
 }
 
 /// Atende UMA conexao: parse, handler, resposta (500 sem vazar detalhe).
-/// Devolve `Some(codigo)` se `exit()` foi chamado no handler.
-fn handle_one(mut stream: TcpStream, handler: &str, program: &Arc<AstProgram>) -> Option<i32> {
+/// Erros de protocolo (request malformado) viram 400. Devolve `Some(codigo)`
+/// se `exit()` foi chamado no handler.
+fn handle_one(
+    mut stream: TcpStream,
+    handler: &str,
+    program: &Arc<AstProgram>,
+    limites: &super::VmLimits,
+) -> Option<i32> {
     stream
         .set_read_timeout(Some(Duration::from_secs(IO_TIMEOUT_SECS)))
         .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_SECS))))
@@ -392,11 +580,11 @@ fn handle_one(mut stream: TcpStream, handler: &str, program: &Arc<AstProgram>) -
         Ok(request) => request,
         Err(message) => {
             eprintln!("rhp: request invalido: {message}");
-            let _ = respond_500(&stream);
+            let _ = respond_400(&stream);
             return None;
         }
     };
-    match run_handler(&request, handler, program) {
+    match run_handler(&request, handler, program, limites) {
         Ok(response) => {
             if let Err(message) = write_response(&stream, &response) {
                 eprintln!("rhp: responder falhou: {message}");
@@ -418,6 +606,22 @@ enum HandlerFail {
     Fail(String),
 }
 
+/// RAII da guarda anti-reentrada (`EM_HANDLER`).
+struct GuardaHandler;
+
+impl GuardaHandler {
+    fn armar() -> Self {
+        EM_HANDLER.set(true);
+        GuardaHandler
+    }
+}
+
+impl Drop for GuardaHandler {
+    fn drop(&mut self) {
+        EM_HANDLER.set(false);
+    }
+}
+
 /// Request HTTP parseado.
 struct HttpRequest {
     method: String,
@@ -429,9 +633,15 @@ struct HttpRequest {
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
+    // Prazo total da leitura (cabecalhos + corpo): o timeout por `read`
+    // sozinho permite gotejamento indefinido (slowloris).
+    let prazo = std::time::Instant::now() + Duration::from_secs(IO_TIMEOUT_SECS);
     let mut raw: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
+        if std::time::Instant::now() > prazo {
+            return Err("tempo esgotado lendo request".to_string());
+        }
         let n = stream
             .read(&mut chunk)
             .map_err(|e| format!("ler request: {e}"))?;
@@ -450,6 +660,12 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| "request sem cabecalhos".to_string())?;
+    if header_end > MAX_HEADERS {
+        return Err(format!(
+            "cabecalhos grandes demais ({} bytes; teto {MAX_HEADERS})",
+            header_end
+        ));
+    }
     let header = String::from_utf8_lossy(&raw[..header_end]).into_owned();
     let mut lines = header.lines();
     let status_line = lines.next().ok_or_else(|| "request vazio".to_string())?;
@@ -481,27 +697,42 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
             entry.push_str(value.trim());
         }
     }
-    let mut body = raw[header_end + 4..].to_vec();
-    let want: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if want > MAX_BODY {
-        return Err("corpo grande demais".to_string());
-    }
-    while body.len() < want {
-        let n = stream
-            .read(&mut chunk)
-            .map_err(|e| format!("ler corpo: {e}"))?;
-        if n == 0 {
-            break;
+    let mut corpo = LeitorCorpo {
+        buf: raw[header_end + 4..].to_vec(),
+        pos: 0,
+        stream,
+        prazo,
+    };
+    // `Transfer-Encoding: chunked` tem precedencia sobre `Content-Length`
+    // (RFC 9112 §6.3); outras codificacoes sao rejeitadas.
+    let chunked = headers.get("transfer-encoding").is_some_and(|te| {
+        te.split(',')
+            .any(|v| v.trim().eq_ignore_ascii_case("chunked"))
+    });
+    if let Some(te) = headers.get("transfer-encoding") {
+        if !chunked
+            && te.split(',').any(|v| {
+                let v = v.trim().to_lowercase();
+                !v.is_empty() && v != "identity"
+            })
+        {
+            return Err(format!("transfer-encoding nao suportado: `{te}`"));
         }
-        body.extend_from_slice(&chunk[..n]);
-        if body.len() > MAX_BODY {
+    }
+    let body: Vec<u8> = if chunked {
+        corpo.ler_chunked()?
+    } else {
+        let want: usize = match headers.get("content-length") {
+            None => 0,
+            Some(v) => v.parse::<usize>().map_err(|_| {
+                format!("Content-Length invalido: `{v}` (esperado numero de bytes >= 0)")
+            })?,
+        };
+        if want > MAX_BODY {
             return Err("corpo grande demais".to_string());
         }
-    }
-    body.truncate(want.min(body.len()));
+        corpo.ler_fixo(want, "corpo")?
+    };
     let body = String::from_utf8(body).map_err(|_| "corpo nao UTF-8".to_string())?;
     let cookies = parse_cookies(headers.get("cookie").map(String::as_str).unwrap_or(""));
     Ok(HttpRequest {
@@ -512,6 +743,147 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         cookies,
         body,
     })
+}
+
+/// Leitor do corpo com o que ja chegou bufferizado + socket, sob prazo.
+/// Tudo limitado por `MAX_BODY` (DoS por memoria contido).
+struct LeitorCorpo<'a> {
+    buf: Vec<u8>,
+    pos: usize,
+    stream: &'a mut TcpStream,
+    prazo: std::time::Instant,
+}
+
+impl LeitorCorpo<'_> {
+    /// Completa `out` ate `want` bytes (corpo `Content-Length`).
+    fn ler_fixo(&mut self, want: usize, rotulo: &str) -> Result<Vec<u8>, String> {
+        let mut out: Vec<u8> = Vec::new();
+        self.encher(&mut out, want, rotulo)?;
+        if out.len() < want {
+            return Err(format!(
+                "{rotulo} incompleto (Content-Length: {want}; recebidos: {})",
+                out.len()
+            ));
+        }
+        out.truncate(want);
+        Ok(out)
+    }
+
+    /// Corpo `chunked` (RFC 9112 §7.1): `tamanho-hex[CRLF]dados[CRLF]...0[CRLF]trailers[CRLF]`.
+    fn ler_chunked(&mut self) -> Result<Vec<u8>, String> {
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let linha = self.ler_linha()?;
+            let tamanho_txt = linha.split(|b| *b == b';').next().unwrap_or(&[]);
+            let tamanho_txt = String::from_utf8_lossy(tamanho_txt).trim().to_string();
+            let size = usize::from_str_radix(&tamanho_txt, 16)
+                .map_err(|_| format!("tamanho de chunk invalido: `{tamanho_txt}`"))?;
+            if out.len().saturating_add(size) > MAX_BODY {
+                return Err("corpo grande demais".to_string());
+            }
+            if size == 0 {
+                // Trailers: descarta ate a linha vazia (teto: 32 linhas).
+                for _ in 0..32 {
+                    if self.ler_linha()?.is_empty() {
+                        break;
+                    }
+                }
+                break;
+            }
+            let alvo = out.len() + size;
+            self.encher(&mut out, alvo, "chunk")?;
+            if out.len() < alvo {
+                return Err("chunk incompleto (EOF)".to_string());
+            }
+            let fim = self.ler_bytes(2)?;
+            if fim != b"\r\n" {
+                return Err("chunk malformado (esperado CRLF apos dados)".to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Acrescenta bytes ate `out` ter `want` (ou EOF/erro/prazo).
+    fn encher(&mut self, out: &mut Vec<u8>, want: usize, rotulo: &str) -> Result<(), String> {
+        // Compacta o ja consumido (senao `buf` cresce sem limite).
+        if self.pos > 65536 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        let mut chunk = [0u8; 4096];
+        while out.len() < want {
+            while self.pos < self.buf.len() && out.len() < want {
+                out.push(self.buf[self.pos]);
+                self.pos += 1;
+            }
+            if out.len() >= want {
+                break;
+            }
+            if std::time::Instant::now() > self.prazo {
+                return Err(format!("tempo esgotado lendo {rotulo}"));
+            }
+            let n = self
+                .stream
+                .read(&mut chunk)
+                .map_err(|e| format!("ler {rotulo}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+            if self.buf.len() > MAX_BODY + 65536 {
+                return Err(format!("{rotulo} grande demais"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Le exatamente `n` bytes (ou erro se EOF antes).
+    fn ler_bytes(&mut self, n: usize) -> Result<Vec<u8>, String> {
+        let mut tmp: Vec<u8> = Vec::new();
+        self.encher(&mut tmp, n, "chunk")?;
+        if tmp.len() < n {
+            return Err("chunk incompleto (EOF)".to_string());
+        }
+        Ok(tmp)
+    }
+
+    /// Lê uma linha terminada em `\n` (sem o terminador; sem o `\r`).
+    /// Teto de 16 KiB por linha; EOF antes do `\n` = erro.
+    fn ler_linha(&mut self) -> Result<Vec<u8>, String> {
+        const TETO_LINHA: usize = 16 * 1024;
+        let mut linha: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            while self.pos < self.buf.len() {
+                let b = self.buf[self.pos];
+                self.pos += 1;
+                if b == b'\n' {
+                    if linha.last() == Some(&b'\r') {
+                        linha.pop();
+                    }
+                    return Ok(linha);
+                }
+                linha.push(b);
+                if linha.len() > TETO_LINHA {
+                    return Err("linha do chunk grande demais".to_string());
+                }
+            }
+            if std::time::Instant::now() > self.prazo {
+                return Err("tempo esgotado lendo chunk".to_string());
+            }
+            let n = self
+                .stream
+                .read(&mut chunk)
+                .map_err(|e| format!("ler chunk: {e}"))?;
+            if n == 0 {
+                return Err("chunk incompleto (EOF)".to_string());
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+            if self.buf.len() > MAX_BODY + 65536 {
+                return Err("chunk grande demais".to_string());
+            }
+        }
+    }
 }
 
 /// Parseia `Cookie: a=1; b="x y"` (nomes/valores aparados; um par de
@@ -538,26 +910,28 @@ fn parse_cookies(header: &str) -> HashMap<String, String> {
 }
 
 /// Decodifica `%XX` e `+` (query); invalido = mantem literal.
+/// Opera em bytes e so converte no fim (`from_utf8_lossy`): `%C3%A9`
+/// vira "é", nao dois escalares latinos.
 fn percent_decode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((h * 16 + l) as char);
+                out.push(h * 16 + l);
                 i += 3;
                 continue;
             }
         }
         if bytes[i] == b'+' {
-            out.push(' ');
+            out.push(b' ');
         } else {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
         }
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex_val(byte: u8) -> Option<u8> {
@@ -592,6 +966,7 @@ fn run_handler(
     request: &HttpRequest,
     handler: &str,
     program: &Arc<AstProgram>,
+    limites: &super::VmLimits,
 ) -> Result<HttpResponse, HandlerFail> {
     let mut entries: HashMap<String, Value> = HashMap::new();
     entries.insert("metodo".to_string(), Value::Str(request.method.clone()));
@@ -630,8 +1005,11 @@ fn run_handler(
     let req = Value::Map(entries);
     let chunk = compile_handler_call(program, handler, &req).map_err(HandlerFail::Fail)?;
     let mut vm = Vm::new();
+    vm.set_limits(limites.clone());
     // Programa-fonte para `async_spawn` dentro de handlers.
     vm.set_program(Arc::clone(program));
+    // Guarda anti-reentrada: `http_serve` aninhado vira erro claro.
+    let _guarda = GuardaHandler::armar();
     let mut sink = std::io::sink();
     match vm.run_value(&chunk, &mut sink) {
         Ok(value) => response_from_value(&value).map_err(HandlerFail::Fail),
@@ -747,8 +1125,14 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Content Too Large",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Desconhecido",
     }
 }
@@ -799,6 +1183,22 @@ fn respond_429(stream: &TcpStream) -> Result<(), String> {
                 ("retry-after".to_string(), "1".to_string()),
             ],
             body: b"limite de requisicoes excedido".to_vec(),
+        },
+    )
+}
+
+/// Resposta 400 para request malformado (erro do cliente; sem detalhe
+/// interno) + log em stderr.
+fn respond_400(stream: &TcpStream) -> Result<(), String> {
+    write_response(
+        stream,
+        &HttpResponse {
+            status: 400,
+            headers: vec![(
+                "content-type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
+            body: b"requisicao invalida".to_vec(),
         },
     )
 }
@@ -854,5 +1254,56 @@ mod tests {
             .collect();
         let opts = parse_serve_opts(&ok).expect("opts validos");
         assert_eq!(opts.limite_taxa, 10);
+        // `host`: IP literal ok; `localhost` vira 127.0.0.1; resto rejeitado.
+        for bom in ["127.0.0.1", "0.0.0.0", "10.20.30.40", "::1"] {
+            let m: HashMap<String, Value> = [("host".to_string(), Value::Str(bom.to_string()))]
+                .into_iter()
+                .collect();
+            assert_eq!(parse_serve_opts(&m).expect("host valido").host, bom);
+        }
+        for alias in ["localhost", "LOCALHOST"] {
+            let m: HashMap<String, Value> = [("host".to_string(), Value::Str(alias.to_string()))]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                parse_serve_opts(&m).expect("localhost valido").host,
+                "127.0.0.1"
+            );
+        }
+        for ruim in ["", "999.1.1.1", "example.com", "0.0.0.0/0"] {
+            let m: HashMap<String, Value> = [("host".to_string(), Value::Str(ruim.to_string()))]
+                .into_iter()
+                .collect();
+            assert!(parse_serve_opts(&m).is_err(), "host aceito: {ruim}");
+        }
+        let m: HashMap<String, Value> = [("host".to_string(), Value::Int(1))].into_iter().collect();
+        assert!(parse_serve_opts(&m).is_err());
+        // Novos tetos: defaults e validacao.
+        let d = ServeOpts::default();
+        assert_eq!(d.host, "127.0.0.1");
+        assert_eq!(d.max_passos, DEFAULT_MAX_PASSOS);
+        assert_eq!(d.max_heap_bytes, 0);
+        let m: HashMap<String, Value> = [
+            ("max_passos".to_string(), Value::Int(100)),
+            ("max_heap_bytes".to_string(), Value::Int(1024)),
+        ]
+        .into_iter()
+        .collect();
+        let opts = parse_serve_opts(&m).expect("tetos validos");
+        assert_eq!(opts.max_passos, 100);
+        assert_eq!(opts.max_heap_bytes, 1024);
+        let m: HashMap<String, Value> = [("max_passos".to_string(), Value::Int(-1))]
+            .into_iter()
+            .collect();
+        assert!(parse_serve_opts(&m).is_err());
+    }
+
+    #[test]
+    fn percent_decode_preserva_utf8() {
+        assert_eq!(percent_decode("ola%20mundo"), "ola mundo");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(percent_decode("%ZZ"), "%ZZ");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("%"), "%");
     }
 }

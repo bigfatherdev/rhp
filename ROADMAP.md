@@ -1,4 +1,61 @@
-# ROADMAP.md — Planejamento e estado (missao Next Generation: CP1–CP7)
+# ROADMAP.md — Planejamento e estado (Next Generation + limitacoes cuidadas)
+
+## RHP 0.6.0 — Engenharia de correcao e robustez (2026-11-20, implementado e validado)
+
+- [x] `return`/`yield` em `try` capturam erro do operando (ordem do compilador corrigida; 8 casos).
+- [x] `http_serve` com `host` configuravel (default local; `0.0.0.0` opt-in) + erro claro de bind.
+- [x] HTTP: 400s corretos, teto de headers, CL estrito, corpo incompleto/chunked rejeitados, prazo total, accept resiliente, percent-decode UTF-8.
+- [x] Handler como valor + `max_passos`/`max_heap_bytes` + anti-reentrada (sem hangs).
+- [x] Corpo `chunked` (RFC 9112), `"localhost"` = 127.0.0.1, reasons 408/413/422/502/504.
+- [x] Provas Docker reais (container↔container, nginx reverso, port forwarding, controle negativo).
+- [x] Suite 354 testes + fmt/clippy limpos; baseline de bench 0.6.0; docs e changelog sincronizados.
+
+## Limitacoes cuidadas (2026-11-19, implementado e validado)
+
+- [x] Bounds de generics (RFC 0029 implementada): `type_args` preservados,
+  checagem em compilacao, apagamento mantido.
+- [x] Metodos `async` + transporte de `Instance` com classe (snapshot, sem
+  write-back; chave reservada `__rhp_instancia__`).
+- [x] RFC 0030 (nucleo): `await_timeout`, `async_cancel`/`async_cancelled`,
+  `await_all`, `await_race` (ids 75–79); pool segue adiado (documentado).
+- [x] Router do RHP Web com trie ordenada + teste diferencial + benchmark.
+- [x] Globais mutaveis: arquitetura permanente documentada (`docs/ASYNC.md`).
+
+## Next Generation — 8 fases (2026-11-19, implementado e validado)
+
+- [x] Fase 0: auditoria completa (matriz estado/dependencias/risco/estrategia).
+- [x] Fase 1: heranca (`extends`, `super`), interfaces (`implements`,
+  verificacao de aridade), traits (`use`, precedencia propria > trait > pai)
+  — RFC 0021.
+- [x] Fase 2: namespaces (`namespace`, `A\B`) + autoload (`import A\B`,
+  `as`, PSR-4 `A/B.rhp` na arvore) — RFC 0022.
+- [x] Fase 3: `async fn` + `await` sobre tarefas isoladas (args, erros
+  propagados; autocontidas) — RFC 0023.
+- [x] Fase 4: excecoes tipadas (`catch Tipo [var]`, hierarquia, `finally`)
+  — RFC 0024.
+- [x] Fase 5: generics por apagamento (`<T>`, `<int>`, `T` sem checagem) —
+  RFC 0025.
+- [x] Fase 6: extensoes nativas estaticas (`import native`, ABI 1, `demo`) —
+  RFC 0026.
+- [x] Fase 7: RHP Web (`framework/web.rhp`: rotas, params, middleware, JSON,
+  404/405, seguranca, templates; exemplo funcional) — RFC 0027.
+- [x] Fase 8: docs (specs, RFCs, guias), compatibilidade (suite verde),
+  auditoria final.
+
+## Itens 1–4 (2026-11-19, implementado e validado)
+
+- [x] Item 1: async com captura (valores planos) + codigo compartilhado no
+  worker (funcoes, classes, `import native`; nomes de closure unicos
+  `{closure:N}`); rejeicao clara de instancia como argumento (antes degradava
+  em mapa). Testes `nextgen_async_captura_ambiente`,
+  `nextgen_async_enxerga_funcoes_e_classes`, `nextgen_async_rejeita_instancia`,
+  `nextgen_async_aninhado`.
+- [x] Item 2: RHP Web via `rhp pkg` (`pkg add rhp_web <repo>/framework` ->
+  `pacotes/rhp_web/`; teste `nextgen_framework_via_pkg`; guia `docs/WEB.md`).
+- [x] Item 3: RFCs proposta 0028 (`[autoload]` + `use function`), 0029
+  (bounds `<T: X>`), 0030 (cancel/timeout/`all`/`race`) — nao implementadas.
+- [x] Item 4: suite final verde (340 testes), `fmt --check` limpo, `clippy`
+  sem avisos; release `0.4.0`.
 
 ## Auditoria e fortalecimento (2026-11-14, ramos `feat/engineering-audit` e `feat/next-generation`)
 

@@ -17,7 +17,7 @@
 - [Geradores](#8-geradores-rfc-0018)
 - [Concorrência](#9-concorrencia-rfc-0019)
 - [Módulos e pacotes](#10-modulos-e-pacotes)
-- [Biblioteca-padrão (74 builtins)](#11-biblioteca-padrao-74-builtins)
+- [Biblioteca-padrão (80 builtins)](#11-biblioteca-padrao-80-builtins)
 - [Erros e códigos](#12-erros-e-codigos)
 - [CLI](#13-cli)
 - [Exemplo completo](#14-exemplo-completo)
@@ -96,7 +96,9 @@ break; continue; break 2; continue 2; // N = niveis para fora (padrao 1)
 - `try { } catch e { } finally { }` (ao menos um de `catch`/`finally`
   obrigatorio); `throw v` lanca; nao capturado = `excecao nao capturada`.
   Erro de runtime capturado vira mapa `{tipo: "runtime",
-  mensagem: "..."}`; `exit()` nunca e capturado.
+  mensagem: "..."}`; `exit()` nunca e capturado. `return e;` dentro do
+  `try` tem `e` avaliado antes do `finally`: erros de `e` (ex.:
+  `return json_parse(s);`) sao capturados pelo `catch` ativo.
 
 ## 5. Funcoes e closures
 
@@ -133,7 +135,35 @@ argumento apos defaults, retorno): mismatch = erro
 zero checagem (nenhuma instrucao nova). `static`/destructuring sem
 anotacao.
 
-## 7. Classes e objetos (RFC 0017)
+### Generics com bounds (RFCs 0025/0029)
+
+```rhp
+class Caixa<T> {
+  fn novo(v) { this["v"] = v; }
+  fn obter() { return this["v"]; }
+}
+let c = new Caixa<int>(100);   // ok (apagado; sem custo em runtime)
+fn primeiro<T>(items) { return items[0]; }
+
+class Entidade { fn novo() { this["id"] = 0; } fn id() { return this["id"]; } }
+class Usuario extends Entidade { fn novo() { this["id"] = 1; } }
+class Repo<T: Entidade> {      // bound: classe ou interface conhecida
+  fn novo() { this["x"] = 0; }
+}
+let r = new Repo<Usuario>();   // ok (subclasse satisfaz)
+```
+
+- Parametros `<T, U: Bound>` em `fn`/`class`/`interface`; uso
+  `f<T>(...)` / `new C<T>(...)` guarda os argumentos de tipo.
+- Checagem em **compilacao** (apagamento mantido): aridade; nao-generica
+  com args = erro; builtin com args = erro; bound violado
+  (`` `Outra` nao satisfaz `T: Entidade` ``), bound desconhecido e tipo
+  desconhecido (inclui primitivas como `int` contra bound) = erro.
+- Sem argumentos de tipo = apagado, sem checagem (`new Caixa(v)`, `f(x)`).
+  Parametro de tipo visivel adia a checagem (`new Caixa<T>` dentro de
+  `fn f<T>`; erro so na instanciacao concreta).
+
+## 7. Classes e objetos (RFCs 0017/0021)
 
 ```rhp
 class Contador {
@@ -158,13 +188,73 @@ c.n = 10;               // atribuicao em campo
   (`let f = obj.m; f()`) nao persiste. Metodo inexistente = erro.
 - `new` com aridade errada = erro normal de chamada; `new` em nao-classe
   = erro; `this` fora de metodo = `nao definida`.
-- `new` com aridade errada = erro normal de chamada; `new` em nao-classe
-  = erro; `this` fora de metodo = `nao definida`.
-- Instancias sao por valor (copia; sem aliasing). Sem heranca,
-  sem `private`, sem estaticos (nao-objetivos declarados).
+- Instancias sao por valor (copia; sem aliasing). Sem `private` nem
+  estaticos (nao-objetivos declarados).
 - `echo` mostra `{n: 2}`; classe mostra `<classe Contador>`.
 - `==`: instancias comparam por estrutura (mesma classe + mesmos campos);
   classes comparam por nome; geradores, por identidade.
+
+### Heranca, interfaces e traits (RFC 0021)
+
+```rhp
+class Animal {
+  fn novo(n) { this["nome"] = n; }
+  fn falar() { return "Som"; }
+}
+class Cachorro extends Animal {   // heranca simples (pai definido antes)
+  fn falar() { return "Au au"; } // sobrescrita
+}
+let c = new Cachorro("Rex");
+echo c.falar();                  // "Au au"
+
+interface Logger { fn log(mensagem); }
+class ConsoleLogger implements Logger {  // contrato verificado em compilacao
+  fn novo() { this["x"] = 0; }
+  fn log(m) { echo m; }
+}
+
+trait Saudacao {
+  fn ola(nome) { return "ola " + nome; }
+}
+class Pessoa {
+  use Saudacao;                  // composicao
+  fn novo() { this["x"] = 0; }
+}
+
+class Filha extends Base {
+  fn quem() { return super.quem() + "!"; }  // metodo do pai, mesmo `this`
+}
+```
+
+- `extends`: unico; pai desconhecido, auto-heranca e ciclo = erro de
+  compilacao. Metodos achatados (propria > trait > pai).
+- `implements I, J`: todo metodo exigido deve existir com mesma aridade
+  (ou e erro `nao implementa`).
+- `use T1, T2;` no corpo: conflito trait-trait sem override na classe
+  = erro (`conflito de trait`).
+- `super.metodo(args)`: so em chamada de metodo; pai ausente ou sem o
+  metodo = erro em runtime; write-back no `this` do chamador.
+
+### Metodos `async` (snapshot, sem write-back)
+
+```rhp
+class Api {
+  fn novo() { this["x"] = 0; }
+  async fn buscar(id) { sleep(0.1); return "dado " + str(id); }
+}
+let api = new Api();
+let h = api.buscar(1);   // gera tarefa na hora (nao bloqueia)
+echo await h;            // "dado 1"
+```
+
+- `async fn` vale em classe e trait, para metodo, chamada destacada
+  (`let f = obj.m`) e `super.m()`: a chamada **gera tarefa** e devolve
+  handle (compativel com `await`/`async_join`).
+- Semantica de **snapshot**: `this` viaja como copia (com a classe);
+  mutacoes **nao voltam** ao chamador — devolva valores com `return`.
+- Restricoes: sem named/spread em chamada async; funcao/classe/gerador
+  como argumento = erro; mapa com chave `__rhp_instancia__` = erro
+  (chave reservada ao envelope de instancia).
 
 ## 8. Geradores (RFC 0018)
 
@@ -191,21 +281,36 @@ echo exhausted(g);              // false
   ("interrompido"; crie outro). `this` de metodo-gerador e vinculado na
   criacao (sem write-back). `yield` fora de funcao = erro de compilacao.
 
-## 9. Concorrencia (RFC 0019)
+## 9. Concorrencia (RFCs 0019/0023/0030)
 
 ```rhp
 fn lenta() { sleep(1); return "pronta"; }
 let h = async_spawn("lenta");   // Int (handle); roda em thread propria
 echo async_join(h);              // bloqueia; devolve o retorno ("pronta")
+
+async fn buscarA() { sleep(0.2); return "A"; }
+let a = buscarA();               // gera tarefa na hora (nao bloqueia)
+echo await a;                    // "A"
+echo await_timeout(a, 5);         // com prazo (estouro = erro capturavel)
+async_cancel(a);                 // cooperativo (a tarefa sonda async_cancelled())
+echo await_all([a(), b()]);      // junta em ordem
+echo await_race([a(), b()]);     // primeiro pronto vence
 ```
 
-- Tarefas isoladas: sem globais compartilhados (a thread recompila o
-  programa); comunicacao so pelo retorno (desserializado de JSON:
-  null/bool/int/float/string/array/mapa; funcao/classe/gerador = erro).
-- Zero-arg na v1 (sem parametros); so `fn` de nivel superior sem
-  captura; nao-generator (erros claros em cada caso).
+- Tarefas isoladas: compartilham o CODIGO (definicoes de topo: funcoes,
+  classes, `import native`), nao o ESTADO (globais mutaveis nao atravessam).
+  Captura cruza so valores planos e instancias (com classe, via envelope
+  `{"__rhp_instancia__": {"classe", "campos"}}`); funcao, classe e gerador
+  nao atravessam (erro claro); mapa com a chave reservada = erro.
+  Metodos `async` rodam sobre snapshot (sem write-back; devolva valores
+  com `return`).
+- Args posicionais (nao nomeados/spread); funcao sem captura vira tarefa;
+  `await`/`async_join` interoperam (handles one-shot, exceto apos timeout:
+  handle consumido vira `Int` comum e `await` dele = identidade).
 - Erro da tarefa vira erro do `join` (`tarefa ... falhou: ...`).
-- `join` e one-shot (reuso = `handle invalido`).
+- Cancelamento e cooperativo (`async_cancel` + `async_cancelled`); timeout
+  nao mata a tarefa (segue em voo; junte depois). Sem thread-pool (1 thread
+  por tarefa; documentado).
 - Paralelismo real: 2x `sleep(1)` em ~1s (nao ~2s).
 
 ## 10. Modulos e pacotes
@@ -230,7 +335,7 @@ import {u} from "./c1.rhp";
 - Comentarios `//` de linha e linhas em branco sao preservados pelo
   `rhp fmt` na mesma ordem relativa ao statement.
 
-## 11. Biblioteca-padrao (74 builtins)
+## 11. Biblioteca-padrao (80 builtins)
 
 Aridade checada na compilacao; erros sao `VmError` com mensagem em
 portugues (ver [codigos](#12-erros-e-codigos)).
@@ -314,7 +419,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 |---|---|
 | `http_get(url)` | GET `http://` com timeouts de 5s (DNS: resolvedor do sistema), teto de corpo 1 MiB, so 2xx com corpo UTF-8; resto = erro. |
 | `http_fetch(url, opts)` | GET com `opts` (`seguir`, `max_redirecionamentos` 0–10, `timeout` 0–60s, `headers`, `metodo`: so `GET`); `https://` verificado (raizes embutidas + `RHP_CA_BUNDLE`); redirects 301/302/303/307/308 (ate 10; sem downgrade https→http); devolve mapa `{status, cabecalhos, corpo}` (chaves minusculas). |
-| `http_serve(porta, handler, opts)` | Servidor HTTP (thread por conexao; handler stateless; erro 500 sem vazar; `exit(codigo)` encerra). `porta` 0–65535 (0 = livre). Handler `fn req => ...`: `req` = mapa `{metodo, caminho, query, cabecalhos, cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Opts: `max_conexoes`, `max_requisicoes`, `limite_taxa` (req/s por IP; excedeu = 429). |
+| `http_serve(porta, handler, opts)` | Servidor HTTP (thread por conexao; handler stateless; erro 500 sem vazar; `exit(codigo)` encerra). `porta` 0–65535 (0 = livre). Handler: nome de `fn` (string) ou valor de funcao do topo (`app`, nao closure). `req` = mapa `{metodo, caminho, query, cabecalhos, cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Opts: `host` (default `"127.0.0.1"`; `"localhost"` = idem; `"0.0.0.0"` = todas IPv4 — ver seguranca em `docs/WEB.md`), `max_conexoes`, `max_requisicoes`, `limite_taxa` (req/s por IP; excedeu = 429), `max_passos` (default 10M; estouro = 500), `max_heap_bytes`. Request malformado = 400; corpo `chunked` suportado; `http_serve` no handler = erro; falha de `accept` nao para o servidor. |
 | `template(texto, valores)` | Interpola `{{chave}}` com escape HTML obrigatorio; chave ausente/`{{` aberto/tipo invalido = erro; sem laco/condicional. |
 
 ### Banco de dados (Fase B + Etapa 5)
@@ -354,8 +459,13 @@ Padrao manual: `while !exhausted(g) { let v = next(g); if exhausted(g) { break; 
 
 | Funcao | Efeito |
 |---|---|
-| `async_spawn("f")` | Roda `fn` de nivel superior sem captura em thread propria (recompila o programa); devolve handle `Int` imediatamente. Isolada: sem globais compartilhados. Gerador/closure/nao-funcao = erro. |
-| `async_join(h)` | Bloqueia ate terminar; devolve o retorno (desserializado de JSON: null/bool/int/float/string/array/mapa; resto = erro). One-shot (reuso = `handle invalido`). Erro da tarefa = `tarefa ... falhou: ...`. |
+| `async_spawn("f")` | Roda `fn` de nivel superior sem captura em thread propria (recompila o programa; definicoes de topo reconstruidas no worker); devolve handle `Int` imediatamente. Gerador/closure/nao-funcao = erro. |
+| `async_join(h)` | Bloqueia ate terminar; devolve o retorno (desserializado de JSON + instancias com classe; resto = erro). One-shot (reuso = `handle invalido`). Erro da tarefa = `tarefa ... falhou: ...`. |
+| `await_timeout(h, s)` | Como `await`, com prazo em segundos (0–3600; `0` = sondagem); estouro = erro capturavel e a tarefa segue em voo (junte depois). |
+| `async_cancel(h)` | Sinaliza cancelamento cooperativo (`Null`); a tarefa precisa sondar `async_cancelled()`. |
+| `async_cancelled()` | `Bool`: `true` dentro de tarefa cancelada; `false` fora de tarefa. |
+| `await_all([h, ...])` | Junta em ordem, devolve array; falha rapida (demais seguem no mapa). |
+| `await_race([h, ...])` | Devolve o primeiro pronto (demais seguem no mapa); vazio = erro. |
 
 ### Sockets e Redis (RFC 0020)
 
