@@ -72,7 +72,7 @@ WhileStmt  := "while" Expr Block
 ForStmt    := "for" Ident "in" Expr Block
 ForCStmt   := "for" Stmt? ";" Expr? ";" (Assign | Expr)? Block
            // `init` = `let`/`const`/atribuicao/expressao; `passo` sem `let`;
-           // secoes vazias ok (`for (;;)` = infinito)
+           // secoes vazias ok (`for ;;` = infinito; sem parenteses)
 SwitchStmt := "switch" Expr "{" (CaseClause | DefaultClause)* "}"
 CaseClause := "case" Expr Block   // `default` unico, posicao livre
 DefaultClause := "default" Block
@@ -146,6 +146,10 @@ ExprStmt   := Expr ";"
   `yield` (valor) ou fim (`Null`, marca esgotado); `exhausted(g)` testa o
   fim sem executar. `next` apos o fim = erro; `yield` fora de funcao =
   erro de compilacao; `return` dentro de gerador descarta o valor.
+  `yield` dentro de `try` suspende com handler/escopos intactos (0.7.2):
+  o resume continua dentro do `try`; `finally` roda uma vez, no termino
+  normal/`return`/`throw` — nao a cada `yield`. Gerador abandonado nao
+  executa `finally` (sem finalizadores; ver `MEMORY_MODEL.md`).
   Padrao manual: `while !exhausted(g) { let v = next(g); if exhausted(g)
   { break; } ... }` (o `next` final entrega `Null` descartavel).
   `for x in gen` consome (com `break`/`continue`); gerador esgotado em
@@ -246,8 +250,10 @@ CallArg   := Expr | Ident ":" Expr | "..." Expr // posicional, nomeado, spread
 // chamada encadeadas; callee `Ident` simples usa `Call` classico)
 ```
 
-Literais: inteiros `i64` (`42`), floats (`1.5`, ao menos um digito apos o
-ponto), strings `"..."` com escapes `\" \\ \n \r \t \u{HEX}` (`\u` exige
+Literais: inteiros `i64` (`42`; `-` e unario: `-9223372036854775808`
+nao e expressavel diretamente — fora do intervalo do literal positivo;
+use `0-9223372036854775807-1`), floats (`1.5`, ao menos um digito apos o
+ponto; magnitude alem de `f64` = erro, nunca `inf` silencioso), strings `"..."` com escapes `\" \\ \n \r \t \u{HEX}` (`\u` exige
 chaves com 1–6 digitos hexadecimais formando ponto de codigo Unicode valido,
 ex.: `\u{41}` = `A`, `\u{1F600}` = 😀), `true`/`false`/`null`.
 Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
@@ -358,7 +364,7 @@ Identificadores: `[a-zA-Z_][a-zA-Z0-9_]*` (palavras-chave reservadas).
 | `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); placeholders `?` (SQLite) ou `$1` (PG), `params` array (`[]` sem params); devolve linhas afetadas (`Int`). Linhas de SELECT sao descartadas (use `db_query`). |
 | `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna => valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB = erro no SQLite; tipos PG mapeados por OID, resto vira `Str`; tipos numericos MySQL => `Int`/`Float` quando parseaveis, resto (incluindo data/hora) => `Str`). |
 | `db_close(h)` | Fecha o handle (reuso = erro); devolve `null`. Fim do programa fecha o resto. |
-| `http_serve(porta, handler, opts)` | (Fase C/D) Servidor HTTP: `porta` 0–65535 (0 = livre do SO), `handler` = nome de `fn(req)` global, `opts` com `max_conexoes` (padrão 64), `max_requisicoes` (padrão 0 = para sempre) e `limite_taxa` (req/s por IP, padrão 0 = sem limite; excedeu = 429). Por request: `req` = mapa `{metodo, caminho, query, cabecalhos (minúsculas), cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Erro no handler = 500 sem vazar; `exit(codigo)` termina o servidor. Handlers sem estado (sem compartilhar nada entre requests). |
+| `http_serve(porta, handler, opts)` | (Fase C/D) Servidor HTTP: `porta` 0–65535 (0 = livre do SO), `handler` = nome de `fn(req)` global, `opts` com `max_conexoes` (padrao 32), `max_requisicoes` (padrao 0 = para sempre) e `limite_taxa` (req/s por IP, padrao 0 = sem limite; excedeu = 429). Sobrecarga/limite responde 503/429 e pode encerrar com RST (clientes devem retentar). Sem prazo maximo por handler nesta versao (request lento ocupa um worker; `sleep` ate 3600 s). Por request: `req` = mapa `{metodo, caminho, query, cabecalhos (minusculas), cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Erro no handler = 500 sem vazar; `exit(codigo)` termina o servidor (responde 200 vazio antes). Handlers sem estado (sem compartilhar nada entre requests). `+` em caminho nao vira espaco (so em query); forma absoluta (`GET http://h/...`) normaliza; NUL/obs-fold = 400. |
 | `template(texto, valores)` | (Fase C) Interpola `{{chave}}` com escape HTML obrigatório (`&<>"'`); chave ausente/`{{` sem fechar/tipo inválido = erro; sem laços/condicionais. |
 | `tcp_connect(host, porta)` | (Etapa 5, RFC 0020) `Str`+`Int` => handle `Int` (DNS do sistema, timeout de 5s; erro claro). |
 | `tcp_send(h, dados)` | (Etapa 5) Escreve `Str`; devolve bytes escritos (`Int`). Handle invalido = erro. |

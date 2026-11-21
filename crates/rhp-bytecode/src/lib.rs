@@ -161,57 +161,96 @@ pub struct FuncValue {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Nunca aborta (VM-001/SEC-001): alem do teto escreve o marcador.
+        // Caminhos de usuario (`echo`, `str()`, `throw`, template) usam
+        // `to_display_string`, que devolve erro tratavel em vez de truncar.
+        if self.fmt_limited(f, 0).is_err() {
+            write!(f, "<profundidade maxima excedida>")?;
+        }
+        Ok(())
+    }
+}
+
+impl Value {
+    /// Formata com teto de profundidade (`MAX_VALUE_DEPTH`, 128): cada
+    /// nivel de aninhamento consome 1 frame Rust, 128 sao seguros.
+    /// `Err(())` = teto excedido (o chamador decide: marcador ou erro).
+    fn fmt_limited(&self, w: &mut dyn fmt::Write, depth: usize) -> Result<(), ()> {
+        if depth > MAX_VALUE_DEPTH {
+            return Err(());
+        }
         match self {
-            Self::Null => write!(f, "null"),
-            Self::Bool(b) => write!(f, "{b}"),
-            Self::Int(i) => write!(f, "{i}"),
-            Self::Float(x) => write!(f, "{x}"),
-            Self::Str(s) => write!(f, "{s}"),
+            Self::Null => write!(w, "null").map_err(|_| ())?,
+            Self::Bool(b) => write!(w, "{b}").map_err(|_| ())?,
+            Self::Int(i) => write!(w, "{i}").map_err(|_| ())?,
+            Self::Float(x) => write!(w, "{x}").map_err(|_| ())?,
+            Self::Str(s) => write!(w, "{s}").map_err(|_| ())?,
             Self::Array(items) => {
-                write!(f, "[")?;
+                write!(w, "[").map_err(|_| ())?;
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
-                        write!(f, ", ")?;
+                        write!(w, ", ").map_err(|_| ())?;
                     }
-                    write!(f, "{item}")?;
+                    item.fmt_limited(w, depth + 1)?;
                 }
-                write!(f, "]")
+                write!(w, "]").map_err(|_| ())?;
             }
             Self::Map(entries) => {
-                let mut keys: Vec<&String> = entries.keys().collect();
-                keys.sort();
-                write!(f, "{{")?;
-                for (i, key) in keys.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    if let Some(value) = entries.get(*key) {
-                        write!(f, "{key}: {value}")?;
-                    }
-                }
-                write!(f, "}}")
+                Self::fmt_map_limited(w, depth, entries.iter())?;
             }
-            Self::Class(def) => write!(f, "<classe {}>", def.name),
+            Self::Class(def) => write!(w, "<classe {}>", def.name).map_err(|_| ())?,
             Self::Instance { fields, .. } => {
-                let mut keys: Vec<&String> = fields.keys().collect();
-                keys.sort();
-                write!(f, "{{")?;
-                for (i, key) in keys.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    if let Some(value) = fields.get(*key) {
-                        write!(f, "{key}: {value}")?;
-                    }
-                }
-                write!(f, "}}")
+                Self::fmt_map_limited(w, depth, fields.iter())?;
             }
-            Self::Func(func) => write!(f, "<fn {}>", func.def.name),
-            Self::Generator(gen) => {
-                let state = gen.0.borrow();
-                write!(f, "<gerador {}>", state.func.def.name)
+            Self::Func(func) => write!(w, "<fn {}>", func.def.name).map_err(|_| ())?,
+            Self::Generator(_) => {
+                let state = self.generator_state_or_fail()?;
+                write!(w, "<gerador {}>", state.func.def.name).map_err(|_| ())?
             }
         }
+        Ok(())
+    }
+
+    /// Exibicao estrita para caminhos de usuario: `Ok(string)` ou
+    /// `Err` tratavel (capturavel por `try`), nunca abort.
+    pub fn to_display_string(&self) -> Result<String, String> {
+        let mut out = String::new();
+        self.fmt_limited(&mut out, 0).map_err(|_| {
+            format!("valor excede profundidade maxima de exibicao ({MAX_VALUE_DEPTH})")
+        })?;
+        Ok(out)
+    }
+
+    fn generator_state_or_fail(&self) -> Result<std::cell::Ref<'_, crate::GenState>, ()> {
+        match self {
+            Self::Generator(gen) => gen.0.try_borrow().map_err(|_| ()),
+            _ => Err(()),
+        }
+    }
+
+    fn fmt_map_limited<'a>(
+        w: &mut dyn fmt::Write,
+        depth: usize,
+        entries: impl Iterator<Item = (&'a String, &'a Value)>,
+    ) -> Result<(), ()> {
+        let mut keys: Vec<&String> = Vec::new();
+        let mut values: Vec<&Value> = Vec::new();
+        for (k, v) in entries {
+            keys.push(k);
+            values.push(v);
+        }
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|&a, &b| keys[a].cmp(keys[b]));
+        write!(w, "{{").map_err(|_| ())?;
+        for (i, &pos) in order.iter().enumerate() {
+            if i > 0 {
+                write!(w, ", ").map_err(|_| ())?;
+            }
+            write!(w, "{}: ", keys[pos]).map_err(|_| ())?;
+            values[pos].fmt_limited(w, depth + 1)?;
+        }
+        write!(w, "}}").map_err(|_| ())?;
+        Ok(())
     }
 }
 
@@ -1880,6 +1919,15 @@ impl Compiler {
         self.compile_expr(iter)?;
         let iter_idx = self.intern_name(&iter_name)?;
         self.emit(Op::DeclareName(iter_idx));
+        // Marca da forma per-iteracao (false = lazy, true = eager),
+        // declarada no escopo do laco: o corpo e compilado UMA vez e o
+        // `continue` despacha em runtime (correcao COMP-001: antes o corpo
+        // era compilado duas vezes, custo 2^N em `for` aninhados).
+        let eager_flag = self.hidden_for_name("eager");
+        let flag_off = self.add_constant(Value::Bool(false))?;
+        self.emit(Op::Constant(flag_off));
+        let flag_idx = self.intern_name(&eager_flag)?;
+        self.emit(Op::DeclareName(flag_idx));
         // if type(H_iter) == "gerador": forma lazy; senao, eager.
         let iter_ref = self.intern_name(&iter_name)?;
         self.emit(Op::LoadName(iter_ref));
@@ -1914,38 +1962,15 @@ impl Compiler {
         self.emit(Op::LoadName(iter_done));
         self.emit(Op::CallBuiltin(BuiltinId::from(Builtin::Exhausted)));
         let lazy_done_jump = self.emit(Op::JumpIfTrue(u32::MAX));
-        // Escopo do corpo (como na forma eager): o `DeclareName` de `x`
-        // cai dentro dele, nao no escopo do laco/global.
-        self.emit_scope_open();
+        // Valor da variavel + marca da forma (lazy): o corpo unico abaixo
+        // declara `x` e executa; `continue` volta aqui via despacho.
         let tmp_load = self.intern_name(&tmp_name)?;
         self.emit(Op::LoadName(tmp_load));
-        let var_lazy = self.intern_name(var)?;
-        self.emit(Op::DeclareName(var_lazy));
-        let lazy_body_depth = self.scopes.len();
-        self.loops.push(LoopCtx {
-            is_loop: true,
-            break_depth: for_depth,
-            continue_depth: lazy_body_depth,
-            start: None,
-            breaks: Vec::new(),
-            continues: Vec::new(),
-        });
-        let saved_scopes_lazy = self.scopes.clone();
-        self.compile_stmts(body)?;
-        self.scopes = saved_scopes_lazy;
-        // Trampolim do `continue`: fecha o escopo do corpo e volta ao teste.
-        let lazy_continue = self.chunk.code.len() as u32;
-        self.emit_scope_close()?;
-        self.emit(Op::Jump(lazy_start));
-        let lazy_continues = std::mem::take(&mut self.loops.last_mut().expect("laco").continues);
-        for pos in &lazy_continues {
-            self.patch_jump(*pos, lazy_continue);
-        }
-        // Gerador esgotado no meio do resume: sai (o `tmp` descartado fica
-        // para a proxima forma; nada aberto para fechar aqui).
-        let lazy_done = self.chunk.code.len() as u32;
-        self.patch_jump(lazy_done_jump, lazy_done);
-        let lazy_done_exit = self.emit(Op::Jump(u32::MAX));
+        let flag_lazy = self.add_constant(Value::Bool(false))?;
+        self.emit(Op::Constant(flag_lazy));
+        let flag_lazy_store = self.intern_name(&eager_flag)?;
+        self.emit(Op::StoreName(flag_lazy_store));
+        let to_shared_lazy = self.emit(Op::Jump(u32::MAX));
         // ---- Forma eager (array/mapa): a de antes, sobre H_iter.
         // (JumpIfTrue nao existe; o salto condicional acima ja desviou.)
         let eager_label = self.chunk.code.len() as u32;
@@ -1970,26 +1995,63 @@ impl Compiler {
         self.emit(Op::CallBuiltin(BuiltinId::from(Builtin::Len)));
         self.emit(Op::Lt);
         let exit_jump = self.emit(Op::JumpIfFalse(u32::MAX));
-        self.emit_scope_open();
-        // Sem `push` novo: o LoopCtx e o mesmo da forma lazy (um `for`,
-        // dois corpos; `break` das duas formas converge no mesmo fim e
-        // `continue` foi separado por forma acima).
         // VAR = H_list[H_idx].
         let list_elem = self.intern_name(&list_name)?;
         self.emit(Op::LoadName(list_elem));
         let idx_elem = self.intern_name(&idx_name)?;
         self.emit(Op::LoadName(idx_elem));
         self.emit(Op::Index);
+        // Valor da variavel + marca da forma (eager): corpo unico abaixo.
+        let flag_eager = self.add_constant(Value::Bool(true))?;
+        self.emit(Op::Constant(flag_eager));
+        let flag_eager_store = self.intern_name(&eager_flag)?;
+        self.emit(Op::StoreName(flag_eager_store));
+        let to_shared_eager = self.emit(Op::Jump(u32::MAX));
+        // ---- Corpo unico: as duas formas convergem aqui (COMP-001).
+        // Escopo do corpo: o `DeclareName` de `x` cai dentro dele, nao no
+        // escopo do laco/global. Um so LoopCtx: `break` (das duas formas)
+        // converge no fim; `continue` vai ao despacho abaixo.
+        let shared_label = self.chunk.code.len() as u32;
+        self.patch_jump(to_shared_lazy, shared_label);
+        self.patch_jump(to_shared_eager, shared_label);
+        self.emit_scope_open();
         let var_idx = self.intern_name(var)?;
         self.emit(Op::DeclareName(var_idx));
-        // Como no `while`: desvios no corpo mexem no rastreamento estatico;
-        // restaura-o para o caminho normal (incremento apos o corpo).
-        let saved_scopes = self.scopes.clone();
+        let shared_open = self.scopes.clone();
+        self.loops.push(LoopCtx {
+            is_loop: true,
+            break_depth: for_depth,
+            continue_depth: self.scopes.len(),
+            start: None,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
         self.compile_stmts(body)?;
-        self.scopes = saved_scopes;
-        let continue_target = self.chunk.code.len() as u32;
+        self.scopes = shared_open.clone();
+        // Saida normal do corpo: fecha o escopo e pede a proxima iteracao
+        // (despacho sem fechar de novo: o fechamento ja foi feito aqui).
         self.emit_scope_close()?;
-        // H_idx = H_idx + 1.
+        let to_next = self.emit(Op::Jump(u32::MAX));
+        // Trampolim do `continue`: fecha o escopo do corpo e despacha pela
+        // marca (eager incrementa e volta ao teste; lazy volta ao `next`).
+        let continue_dispatch = self.chunk.code.len() as u32;
+        self.scopes = shared_open;
+        self.emit_scope_close()?;
+        let flag_load = self.intern_name(&eager_flag)?;
+        self.emit(Op::LoadName(flag_load));
+        let to_eager_cont = self.emit(Op::JumpIfTrue(u32::MAX));
+        self.emit(Op::Jump(lazy_start));
+        // Proxima iteracao (fallthrough): mesma decisao, sem fechar.
+        let shared_next = self.chunk.code.len() as u32;
+        self.patch_jump(to_next, shared_next);
+        let flag_again = self.intern_name(&eager_flag)?;
+        self.emit(Op::LoadName(flag_again));
+        let to_eager_inc = self.emit(Op::JumpIfTrue(u32::MAX));
+        self.emit(Op::Jump(lazy_start));
+        // Ramo eager (`continue` ou fallthrough): H_idx++; volta ao teste.
+        let eager_inc = self.chunk.code.len() as u32;
+        self.patch_jump(to_eager_cont, eager_inc);
+        self.patch_jump(to_eager_inc, eager_inc);
         let idx_inc = self.intern_name(&idx_name)?;
         self.emit(Op::LoadName(idx_inc));
         let one = self.add_constant(Value::Int(1))?;
@@ -1998,21 +2060,22 @@ impl Compiler {
         let idx_store = self.intern_name(&idx_name)?;
         self.emit(Op::StoreName(idx_store));
         self.emit(Op::Jump(loop_start));
-        let exit_target = self.chunk.code.len() as u32;
-        self.patch_jump(exit_jump, exit_target);
-        // Saida da forma lazy (gerador esgotado) converge no mesmo fim.
-        self.patch_jump(lazy_exit, exit_target);
-        self.patch_jump(lazy_done_exit, exit_target);
+        // Fim: saidas das formas (`lazy_exit`, `exit_jump`, gerador
+        // esgotado no resume) e `break`s convergem aqui; fecha o laco.
+        let post_label = self.chunk.code.len() as u32;
+        self.patch_jump(lazy_exit, post_label);
+        self.patch_jump(exit_jump, post_label);
+        self.patch_jump(lazy_done_jump, post_label);
         let Some(loop_ctx) = self.loops.pop() else {
             return Err(CompileError::new(
                 "desequilibrio interno de lacos".to_string(),
             ));
         };
         for pos in &loop_ctx.breaks {
-            self.patch_jump(*pos, exit_target);
+            self.patch_jump(*pos, post_label);
         }
         for pos in &loop_ctx.continues {
-            self.patch_jump(*pos, continue_target);
+            self.patch_jump(*pos, continue_dispatch);
         }
         self.emit_scope_close()?;
         Ok(())
@@ -2240,19 +2303,25 @@ impl Compiler {
     /// `true` se `child` e `base` ou subclasse (cadeia `parent`).
     /// Limite anti-ciclo para bytecode artesanal (hierarquia valida nao tem).
     fn is_subclass_of(&self, child: &str, base: &str) -> bool {
+        // VM-006: sem teto de 256 (ver copia da VM): cadeia de `extends` e
+        // aciclica por construcao; revisita = ciclo, tratada como fim.
         let mut current = Some(child.to_string());
-        for _ in 0..256 {
+        let mut visited: Vec<String> = Vec::new();
+        loop {
             match current {
                 Some(name) => {
                     if name == base {
                         return true;
                     }
+                    if visited.iter().any(|n| n == &name) {
+                        return false;
+                    }
+                    visited.push(name.clone());
                     current = self.classes.get(&name).and_then(|i| i.parent.clone());
                 }
                 None => return false,
             }
         }
-        false
     }
 
     /// `true` se a classe (com herdados) implementa a interface com aridade.
@@ -3265,7 +3334,11 @@ impl Compiler {
                 if !self.in_function {
                     return Err(CompileError::new("`yield` fora de funcao"));
                 }
-                // Mesma ordem do `return`: operando antes de cruzar `try`s.
+                // Mesma ordem do `return`: operando antes de suspender.
+                // Diferente do `return`, `yield` NAO cruza `try`s (VM-002):
+                // o frame suspende com handlers/escopos intactos e o resume
+                // continua dentro do `try`; o `finally` roda no termino
+                // normal ou no `return`/`throw`, nao a cada `yield`.
                 match expr {
                     Some(expr) => self.compile_expr(expr)?,
                     None => {
@@ -3273,8 +3346,6 @@ impl Compiler {
                         self.emit(Op::Constant(idx));
                     }
                 }
-                // `yield` cruza `try`s como `return` (handler + `finally`).
-                self.emit_abrupt_exits(None)?;
                 self.emit(Op::Yield);
             }
             Stmt::Throw { expr } => {
@@ -4153,6 +4224,30 @@ mod tests {
             .expect_err("deve falhar")
             .message
             .contains("espera 1"));
+    }
+
+    #[test]
+    fn compiles_nested_for_linear_not_exponential() {
+        // COMP-001: o corpo do `for x in` era compilado duas vezes (lazy +
+        // eager), custo 2^N em l niveis (20 niveis travavam o CLI). O corpo
+        // agora e compilado uma vez: crescimento linear com a profundidade.
+        fn nested(depth: usize) -> String {
+            let mut src = String::from("echo 1;");
+            for _ in 0..depth {
+                src = format!("for x in [1] {{ {src} }}");
+            }
+            src
+        }
+        let small = compile_src(&nested(4));
+        small.validate().expect("for aninhado deve validar");
+        let big = compile_src(&nested(8));
+        big.validate().expect("for aninhado deve validar");
+        assert!(
+            big.code.len() < small.code.len() * 3,
+            "crescimento super-linear: 4 niveis = {} ops, 8 niveis = {} ops",
+            small.code.len(),
+            big.code.len()
+        );
     }
 
     #[test]

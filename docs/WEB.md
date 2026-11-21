@@ -68,13 +68,15 @@ http_serve(8080, "handler", {});
   como string UTF-8 ao handler.
   Falha de `accept` nao derruba o servidor (log + nova tentativa).
 - `http_serve` dentro do handler = erro (500), nao hang.
-- `exit(codigo)` no handler encerra o servidor (codigo de saida).
+- `exit(codigo)` no handler encerra o servidor (codigo de saida),
+  apos responder 200 vazio com `Connection: close`.
 
 ## Rotas
 
 - Metodos: `web_get/post/put/patch/delete/head/options(padrao, handler)`.
 - Padroes: `/users/:id` (params em `req["params"]`). Primeiro match vence.
-- Sem match = 404; metodo errado com padrao certo = 405 + `Allow`.
+- Sem match = 404; metodo errado com padrao certo = 405 + `Allow`
+  (sem duplicatas). Ambos passam pelo finalizar (cabecalhos de seguranca).
 
 ## Request/response
 
@@ -104,8 +106,11 @@ web_use(fn(req) {
   `http_serve(8080, "handler", {"host": "0.0.0.0"})` — e entenda que
   TODAS as interfaces passam a aceitar conexoes (restrinja com firewall /
   security groups; nao exponha debug/admin sem autenticacao).
-- Cabecalhos `x-content-type-options: nosniff`, `x-frame-options: DENY`.
-- Teto de payload 1 MiB (413). Rate limiting via `http_serve`:
+- Cabecalhos `x-content-type-options: nosniff`, `x-frame-options: DENY`
+  (aplicados pelo finalizar em 200/404/405 e respostas de rota).
+- Teto de corpo 1 MiB no servidor (request maior = 400 antes do handler;
+  `web_seguranca` retornando 413 so e alcancavel se o teto subir).
+  Rate limiting via `http_serve`:
   `http_serve(8080, "handler", { limite_taxa: 100 })`.
 - Erros de handler viram 500 opaco (sem stack trace). Escape via
   `template()`/`web_render` (nunca concatene HTML com dados sem escape).

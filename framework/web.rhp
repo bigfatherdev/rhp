@@ -291,13 +291,23 @@ export fn web_despachar(req) {
       let resp = handler(req2);
       return web_finalizar(resp);
     }
-    permitir = push(permitir, rota["metodo"]);
+    permitir = push_unique(permitir, rota["metodo"]);
     j = j + 1;
   }
   if len(permitir) > 0 {
-    return {status: 405, cabecalhos: {allow: join(permitir, ", ")}, corpo: "metodo nao permitido"};
+    // HTTP-003/004: passa pelo finalizar (cabecalhos de seguranca) e sem
+    // `Allow` duplicado.
+    return web_finalizar({status: 405, cabecalhos: {allow: join(permitir, ", ")}, corpo: "metodo nao permitido"});
   }
-  return web_not_found();
+  return web_finalizar(web_not_found());
+}
+
+// HTTP-004: `push` sem duplicar (para o `Allow` do 405).
+fn push_unique(lista, valor) {
+  if contains(lista, valor) {
+    return lista;
+  }
+  return push(lista, valor);
 }
 
 fn web_finalizar(resp) {
@@ -305,9 +315,14 @@ fn web_finalizar(resp) {
   if type(resp) == "string" {
     resp = web_text(resp);
   }
-  let cab = resp["cabecalhos"];
-  if cab == null {
-    cab = {};
+  // HTTP-002: resposta sem `cabecalhos` (docs dizem opcional) nao pode
+  // quebrar — `resp["cabecalhos"]` lancava "chave inexistente" (500).
+  if type(resp) != "mapa" {
+    throw "resposta do handler deve ser string ou mapa";
+  }
+  let cab = {};
+  if has(resp, "cabecalhos") {
+    cab = resp["cabecalhos"];
   }
   if !has(cab, "x-content-type-options") {
     cab["x-content-type-options"] = "nosniff";

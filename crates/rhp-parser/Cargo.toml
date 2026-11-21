@@ -1,6 +1,6 @@
 [package]
 name = "rhp-parser"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 description = "Parser escrito a mao + AST para a linguagem RHP (Fase 1)"
 license = "MIT OR Apache-2.0"

@@ -19,6 +19,18 @@ use std::collections::HashMap;
 /// Profundidade maxima de aninhamento em parse e serializacao.
 pub const MAX_JSON_DEPTH: usize = 128;
 
+/// Largura do escalar UTF-8 pelo byte inicial (PERF-004); `None` = byte
+/// invalido como inicio (continuacao 0x80-0xBF, 0xC0/0xC1, 0xF5-0xFF).
+fn utf8_width(first: u8) -> Option<usize> {
+    match first {
+        0x00..=0x7F => Some(1),
+        0xC2..=0xDF => Some(2),
+        0xE0..=0xEF => Some(3),
+        0xF0..=0xF4 => Some(4),
+        _ => None,
+    }
+}
+
 /// Converte texto JSON em valor do RHP.
 ///
 /// # Erros
@@ -199,13 +211,25 @@ impl Parser<'_> {
                 }
                 0x00..=0x1F => return Err(self.error("controle literal em string")),
                 _ => {
-                    // Avanca um escalar UTF-8 inteiro (entrada e `&str`).
-                    let rest = &self.bytes[self.pos..];
+                    // PERF-004: `from_utf8(rest)` revalidava o SUFIXO
+                    // inteiro a cada char (O(n²) em strings longas: 400 KB
+                    // levavam 8.6 s). Decodifica pela largura do byte
+                    // inicial e valida so a fatia do escalar (O(1) por
+                    // char; rejeita as mesmas entradas de antes).
+                    let width = utf8_width(byte).ok_or_else(|| self.error("UTF-8 invalido"))?;
+                    let end = self.pos + width;
+                    let chunk = self
+                        .bytes
+                        .get(self.pos..end)
+                        .ok_or_else(|| self.error("UTF-8 invalido"))?;
                     let text =
-                        std::str::from_utf8(rest).map_err(|_| self.error("UTF-8 invalido"))?;
-                    let ch = text.chars().next().expect("byte existente");
+                        std::str::from_utf8(chunk).map_err(|_| self.error("UTF-8 invalido"))?;
+                    let ch = text
+                        .chars()
+                        .next()
+                        .ok_or_else(|| self.error("UTF-8 invalido"))?;
                     out.push(ch);
-                    self.pos += ch.len_utf8();
+                    self.pos += width;
                 }
             }
         }

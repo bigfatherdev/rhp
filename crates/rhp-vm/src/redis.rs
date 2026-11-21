@@ -15,6 +15,10 @@ use std::collections::HashMap;
 /// Profundidade maxima de arrays RESP aninhados.
 const MAX_DEPTH: usize = 128;
 
+/// Elementos maximos num array RESP (CONN-001: `len` vem da rede;
+/// sem teto, `with_capacity` abortava o processo).
+const MAX_ARRAY_LEN: i64 = 1_000_000;
+
 /// Conexao Redis (socket proprio; fecha no `drop` via `TcpConn`... nao:
 // -- `close` explicito; veja `RedisHandles`).
 #[derive(Debug)]
@@ -91,7 +95,15 @@ fn resp_decode(conn: &mut TcpConn, depth: usize) -> Result<Option<Value>, String
             if len < 0 {
                 return Ok(None);
             }
-            let mut items = Vec::with_capacity(len as usize);
+            // CONN-001: `len` vem da rede; `with_capacity` sem teto aborta
+            // o processo (alocacao gigante). Teto + reserva incremental.
+            if len > MAX_ARRAY_LEN {
+                return Err(format!("array RESP grande demais ({len} elementos)"));
+            }
+            let mut items = Vec::new();
+            items
+                .try_reserve(len as usize)
+                .map_err(|_| "array RESP grande demais para alocar".to_string())?;
             for _ in 0..len {
                 match resp_decode(conn, depth + 1)? {
                     Some(value) => items.push(value),
@@ -138,5 +150,35 @@ impl RedisConn {
         self.conn.write_all(&out)?;
         // Nulo de topo = `Null` (ex.: `GET` de chave ausente).
         Ok(resp_decode(&mut self.conn, 0)?.unwrap_or(Value::Null))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Fake que anuncia array com 999.999.999 elementos (CONN-001): sem o
+    /// teto, `with_capacity` abortava o processo (SIGABRT). Agora e erro.
+    fn evil_array_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("porta").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = vec![0u8; 64];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"*999999999\r\n");
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn redis_open_rejects_giant_array_without_abort() {
+        let port = evil_array_port();
+        let err = RedisConn::open("127.0.0.1", port).expect_err("array gigante deve falhar");
+        assert!(err.contains("grande demais"), "erro inesperado: {err}");
     }
 }

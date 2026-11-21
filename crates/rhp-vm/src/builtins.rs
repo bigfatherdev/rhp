@@ -84,7 +84,11 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
-        Builtin::Str => Ok(Value::Str(args[0].to_string())),
+        Builtin::Str => Ok(Value::Str(
+            args[0]
+                .to_display_string()
+                .map_err(VmError::new)?,
+        )),
         Builtin::Int => match &args[0] {
             Value::Int(v) => Ok(Value::Int(*v)),
             Value::Float(v) => {
@@ -262,6 +266,9 @@ pub(super) fn call_builtin(
             Value::Int(v) if *v >= 0 => Ok(Value::Float((*v as f64).sqrt())),
             Value::Float(v) if *v >= 0.0 => Ok(Value::Float(v.sqrt())),
             Value::Int(_) | Value::Float(_) => {
+                if matches!(&args[0], Value::Float(v) if v.is_nan()) {
+                    return Err(VmError::new("`sqrt` de NaN (indefinido)".to_string()));
+                }
                 Err(VmError::new("`sqrt` de numero negativo".to_string()))
             }
             other => Err(VmError::new(format!(
@@ -599,8 +606,11 @@ pub(super) fn call_builtin(
         },
         Builtin::TcpRecv => match (&args[0], &args[1]) {
             (Value::Int(handle), Value::Int(max)) => {
-                if *max < 0 {
-                    return Err(VmError::new("`tcp_recv`: max negativo".to_string()));
+                // LIB-012: `max = 0` devolvia `Null` (indistinguivel de EOF).
+                if *max <= 0 {
+                    return Err(VmError::new(
+                        "`tcp_recv`: max deve ser positivo".to_string(),
+                    ));
                 }
                 let conn = net.conns.get_mut(handle).ok_or_else(|| {
                     VmError::new(format!("`tcp_recv`: handle {handle} invalido ou fechado"))
@@ -795,8 +805,10 @@ pub(super) fn call_builtin(
         Builtin::FsChmod => match (&args[0], &args[1]) {
             (Value::Str(path), Value::Int(mode)) => {
                 if !(0..=0o7777).contains(mode) {
+                    // LIB-007: mostra o modo em octal (antes, decimal puro
+                    // confundia: `4096` = `0o10000`, fora do teto `0o7777`).
                     return Err(VmError::new(format!(
-                        "`fs_chmod` exige modo octal 0-0o7777, encontrado {mode}"
+                        "`fs_chmod` exige modo octal 0-0o7777, encontrado 0o{mode:o}"
                     )));
                 }
                 #[cfg(unix)]
@@ -864,9 +876,11 @@ pub(super) fn call_builtin(
                     re.replace_all(haystack, replacement.as_str()).into_owned(),
                 ))
             }
-            (other, _, _) => Err(VmError::new(format!(
-                "`regex_replace` exige (texto, padrao, substituicao) em strings, encontrado {}",
-                type_name(other)
+            (_, _, _) => Err(VmError::new(format!(
+                "`regex_replace` exige (texto, padrao, substituicao) em strings, encontrado ({}, {}, {})",
+                type_name(&args[0]),
+                type_name(&args[1]),
+                type_name(&args[2])
             ))),
         },
         Builtin::RegexSplit => match (&args[0], &args[1]) {
@@ -925,9 +939,11 @@ pub(super) fn call_builtin(
                 })?;
                 Ok(Value::Bool(mac.verify_slice(&expected).is_ok()))
             }
-            (other, _, _) => Err(VmError::new(format!(
-                "`hmac_verify` exige (chave, mensagem, tag) em strings, encontrado {}",
-                type_name(other)
+            (_, _, _) => Err(VmError::new(format!(
+                "`hmac_verify` exige (chave, mensagem, tag) em strings, encontrado ({}, {}, {})",
+                type_name(&args[0]),
+                type_name(&args[1]),
+                type_name(&args[2])
             ))),
         },
         Builtin::HashPassword => match &args[0] {
@@ -1339,6 +1355,14 @@ fn do_request(url: &str, opts: &FetchOpts) -> Result<HttpResponse, VmError> {
     if authority.is_empty() {
         return Err(VmError::new("`http_get` com host vazio".to_string()));
     }
+    // SEC-003: `userinfo@host` nunca foi suportado; antes, vazava para o
+    // `Host:`, para o resolvedor e para mensagens de erro (segredo em
+    // stderr/logs e em valores capturados por `try`). Rejeita claro.
+    if authority.contains('@') {
+        return Err(VmError::new(
+            "`http_get` nao suporta credenciais na url (use cabecalho `Authorization`)".to_string(),
+        ));
+    }
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port_text)) if !host.is_empty() => {
             let port = port_text
@@ -1653,7 +1677,9 @@ fn render_template(
         let Some(value) = values.get(key) else {
             return Err(VmError::new(format!("`template`: chave ausente `{key}`")));
         };
-        out.push_str(&escape_html(&value.to_string()));
+        out.push_str(&escape_html(
+            &value.to_display_string().map_err(VmError::new)?,
+        ));
         rest = &after[close + 2..];
     }
     Ok(out)

@@ -21,6 +21,25 @@ fn run_file(path: &std::path::Path) -> std::process::Output {
         .expect("falha ao executar o binario rhp")
 }
 
+fn run_temp_source_with_env(
+    name: &str,
+    source: &str,
+    envs: &[(&str, &str)],
+) -> std::process::Output {
+    let dir = std::env::temp_dir().join(format!("rhp-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
+    let file = dir.join(name);
+    std::fs::write(&file, source).expect("nao foi possivel escrever programa temporario");
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let mut cmd = Command::new(rhp_bin);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.args(["run", &file.to_string_lossy()])
+        .output()
+        .expect("falha ao executar o binario rhp")
+}
+
 fn run_temp_source(name: &str, source: &str) -> std::process::Output {
     let dir = std::env::temp_dir().join(format!("rhp-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("nao foi possivel criar dir temporario");
@@ -114,6 +133,247 @@ fn rhp_run_control_flow() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"0\num\n2\n");
+}
+
+#[test]
+fn rhp_run_nested_for_both_forms() {
+    // COMP-001: `for` aninhados exerciam as duas formas (lazy/eager) com
+    // `break`/`continue`/`break 2`; o corpo era compilado 2x por nivel.
+    let output = run_temp_source(
+        "aninhado.rhp",
+        "fn cont(n) {\n  let i = 0;\n  while i < n {\n    yield i;\n    i = i + 1;\n  }\n}\nlet t = 0;\nfor a in [1, 2] {\n  for b in cont(3) {\n    if b == 1 {\n      continue;\n    }\n    if a == 2 {\n      break;\n    }\n    t = t + a * 10 + b;\n  }\n}\necho t;\nlet u = 0;\nfor a in [1, 2, 3] {\n  for b in [1, 2, 3] {\n    if b == 2 {\n      continue;\n    }\n    if a == 3 {\n      break 2;\n    }\n    u = u + 1;\n  }\n}\necho u;\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"22\n4\n");
+}
+
+#[test]
+fn rhp_run_yield_inside_try_keeps_handler() {
+    // VM-002: `yield` dentro de `try` suspendia com o handler consumido
+    // (`TryEnd` emitido como `return`); o 2o resume falhava com
+    // "desequilibrio interno de handlers". `yield` suspende com tudo
+    // intacto; `finally` roda uma vez, no termino.
+    let output = run_temp_source(
+        "yield_try.rhp",
+        "fn g() {\n  try {\n    yield 1;\n    throw \"x\";\n  } catch e {\n    echo \"pegou \" + str(e);\n    yield 2;\n  } finally {\n    echo \"fim\";\n  }\n  yield 3;\n}\nlet x = g();\necho next(x);\necho next(x);\necho next(x);\necho next(x);\n",
+    );
+    assert!(
+        output.status.success(),
+        "rhp run falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1\npegou x\n2\nfim\n3\nnull\n");
+}
+
+#[test]
+fn rhp_run_deep_value_display_is_catchable_error() {
+    // VM-001/SEC-001: `echo`/`str()`/`throw` de valor com profundidade
+    // alem de 128 abria `stack overflow` (SIGABRT). Agora e erro E3000
+    // tratavel (capturavel por `try`), sem abortar o processo.
+    let build = "let a = 1;\nlet i = 0;\nwhile i < 300 {\n  a = [a];\n  i = i + 1;\n}\n";
+    let echo_deep = run_temp_source("fundo_echo.rhp", &format!("{build}echo a;\n"));
+    assert!(!echo_deep.status.success());
+    assert!(
+        String::from_utf8_lossy(&echo_deep.stderr).contains("profundidade maxima de exibicao"),
+        "stderr={}",
+        String::from_utf8_lossy(&echo_deep.stderr)
+    );
+    let caught = run_temp_source(
+        "fundo_try.rhp",
+        &format!("{build}try {{\n  echo a;\n}} catch e {{\n  echo \"pegou\";\n}}\ntry {{\n  throw a;\n}} catch e {{\n  echo \"capturado\";\n}}\n"),
+    );
+    assert!(
+        caught.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&caught.stderr)
+    );
+    assert_eq!(caught.stdout, b"pegou\ncapturado\n");
+}
+
+#[test]
+fn rhp_run_gen_resume_respects_call_depth() {
+    // VM-003: `next` empilhava frames suspensos sem checar `MAX_CALL_DEPTH`
+    // (2000+ frames vivos). Agora `next` alem de 512 gera E3006 e o gerador
+    // segue utilizavel.
+    let output = run_temp_source(
+        "profundidade_gen.rhp",
+        "fn cadeia(n) {\n  if n <= 0 {\n    yield 0;\n  } else {\n    let v = next(gens[n - 1]);\n    yield v + 1;\n  }\n}\nlet gens = [];\nlet i = 0;\nwhile i < 600 {\n  gens = push(gens, cadeia(i));\n  i = i + 1;\n}\ntry {\n  echo next(gens[599]);\n} catch e {\n  echo \"limite-ok\";\n}\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"limite-ok\n");
+}
+
+#[test]
+fn rhp_run_hof_rejects_native_and_async_callbacks() {
+    // VM-004: callback nativa caia no `Halt` interno; VM-005: callback
+    // `async` executava sincrono fora do modelo de tarefas. Ambos agora
+    // sao erros claros.
+    let native = run_temp_source(
+        "hof_nativa.rhp",
+        "import native \"demo\";\necho map([1, 2], demo_eco);\n",
+    );
+    assert!(!native.status.success());
+    assert!(
+        String::from_utf8_lossy(&native.stderr).contains("deve ser funcao RHP"),
+        "stderr={}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let async_cb = run_temp_source(
+        "hof_async.rhp",
+        "async fn dobra(x) {\n  return x * 2;\n}\necho map([1, 2], dobra);\n",
+    );
+    assert!(!async_cb.status.success());
+    assert!(
+        String::from_utf8_lossy(&async_cb.stderr).contains("nao pode ser `async`"),
+        "stderr={}",
+        String::from_utf8_lossy(&async_cb.stderr)
+    );
+}
+
+#[test]
+fn rhp_run_http_userinfo_rejected_without_leak() {
+    // SEC-003: `usuario:senha@host` vazava o segredo em mensagens de erro
+    // (stderr/logs e valores de `try`). Agora e rejeitado sem ecoar nada.
+    let output = run_temp_source(
+        "userinfo.rhp",
+        "echo http_get(\"http://usuario:SENHA-SECRETA@127.0.0.1:1/x\");\n",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nao suporta credenciais na url"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains("SENHA-SECRETA"), "segredo vazou: {stderr}");
+}
+
+#[test]
+fn rhp_run_https_with_empty_ca_bundle_reaches_network() {
+    // SEC-002: `RHP_CA_BUNDLE=""` quebrava todo `https` (tentava abrir
+    // arquivo vazio); doc promete "vazio = so embutidas". Sem servidor, o
+    // erro esperado e de conexao — nao de bundle.
+    let output = run_temp_source_with_env(
+        "bundle_vazio.rhp",
+        "echo http_fetch(\"https://127.0.0.1:1/\", {\"timeout\": 2});\n",
+        &[("RHP_CA_BUNDLE", "")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("RHP_CA_BUNDLE"),
+        "bundle vazio ainda quebra: {stderr}"
+    );
+}
+
+#[test]
+fn rhp_run_typed_catch_deep_hierarchy() {
+    // VM-006: `catch` com cadeia `parent` alem de 256 niveis falhava em
+    // silencio (teto arbitrario). Agora a caminhada e sem teto, com
+    // deteccao de ciclo (fail-safe para bytecode artesanal).
+    let mut src = String::from("class C0 {\n  fn novo() {\n  }\n}\n");
+    for i in 1..300 {
+        src.push_str(&format!(
+            "class C{i} extends C{} {{\n  fn novo() {{\n  }}\n}}\n",
+            i - 1
+        ));
+    }
+    src.push_str("try {\n  throw new C299();\n} catch C0 {\n  echo \"pegou\";\n}\n");
+    let output = run_temp_source("hierarquia.rhp", &src);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"pegou\n");
+}
+
+#[test]
+fn rhp_repl_survives_syntax_error_and_multiline() {
+    // CLI-001: erro de sintaxe matava a sessao (rc=1) e `fn` multilinha
+    // era impossivel (compilacao por linha). Agora: erro e reportado, a
+    // sessao continua, blocos continuam com `... ` ate fechar.
+    use std::io::Write;
+    use std::process::Stdio;
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let mut child = Command::new(rhp_bin)
+        .args(["repl"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("falha ao iniciar repl");
+    let input =
+        "echo 1 +;\necho \"vivo\";\nfn soma(a, b) {\nreturn a + b;\n}\necho soma(20, 22);\n";
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("escrever stdin");
+    let output = child.wait_with_output().expect("repl");
+    assert!(
+        output.status.success(),
+        "repl falhou: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"vivo\n42\n");
+}
+
+#[test]
+fn rhp_run_argv_skips_dashdash_separator() {
+    // LIB-004: `rhp run prog.rhp -- um dois` incluia o `--` em `argv()`.
+    let dir = std::env::temp_dir().join(format!("rhp-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir temporario");
+    let file = dir.join("argv_sep.rhp");
+    std::fs::write(&file, "echo argv();\n").expect("programa temporario");
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let output = Command::new(rhp_bin)
+        .args(["run", &file.to_string_lossy(), "--", "um", "dois"])
+        .output()
+        .expect("rhp run");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"[um, dois]\n");
+}
+
+#[test]
+fn rhp_test_descends_into_subdirectories() {
+    // CLI-002: `rhp test dir/` ignorava `*_test.rhp` em `sub/` em silencio.
+    let base = std::env::temp_dir().join(format!("rhp-testdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("sub")).expect("dirs");
+    std::fs::write(base.join("a_test.rhp"), "echo \"a\";\n").expect("a");
+    std::fs::write(base.join("sub").join("b_test.rhp"), "echo \"b\";\n").expect("b");
+    let rhp_bin = env!("CARGO_BIN_EXE_rhp");
+    let output = Command::new(rhp_bin)
+        .args(["test", &base.to_string_lossy()])
+        .output()
+        .expect("rhp test");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "ok {}\nok {}\n2 teste(s), 0 falhas\n",
+            base.join("a_test.rhp").display(),
+            base.join("sub").join("b_test.rhp").display()
+        )
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
