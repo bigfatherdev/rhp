@@ -380,6 +380,11 @@ pub enum Builtin {
     FsRemove,
     /// `fs_mkdir(caminho)` — cria diretorio (inclui pais; `Null`).
     FsMkdir,
+    /// `fs_chmod(caminho, modo)` — permissao Unix (`Int` octal; `Null`).
+    FsChmod,
+    /// `fs_stat(caminho)` — mapa `{tamanho, e_diretorio, e_arquivo,
+    /// somente_leitura, modificado}` (epoch `Int`; erro se inexistente).
+    FsStat,
 }
 
 /// Retorna o builtin para um nome, se existir.
@@ -469,6 +474,8 @@ pub fn builtin_by_name(name: &str) -> Option<Builtin> {
         "fs_rename" => Some(Builtin::FsRename),
         "fs_remove" => Some(Builtin::FsRemove),
         "fs_mkdir" => Some(Builtin::FsMkdir),
+        "fs_chmod" => Some(Builtin::FsChmod),
+        "fs_stat" => Some(Builtin::FsStat),
         _ => None,
     }
 }
@@ -519,6 +526,7 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::RedisClose
         | Builtin::FsRemove
         | Builtin::FsMkdir
+        | Builtin::FsStat
         | Builtin::Sha256 => 1,
         Builtin::Push
         | Builtin::Contains
@@ -549,7 +557,8 @@ pub const fn builtin_arity(builtin: Builtin) -> usize {
         | Builtin::RedisOpen
         | Builtin::RedisExec
         | Builtin::AwaitTimeout
-        | Builtin::FsRename => 2,
+        | Builtin::FsRename
+        | Builtin::FsChmod => 2,
         Builtin::DbExec
         | Builtin::DbQuery
         | Builtin::HttpServe
@@ -795,6 +804,8 @@ impl BuiltinId {
             80 => Ok(Builtin::FsRename),
             81 => Ok(Builtin::FsRemove),
             82 => Ok(Builtin::FsMkdir),
+            83 => Ok(Builtin::FsChmod),
+            84 => Ok(Builtin::FsStat),
             other => Err(CompileError::new(format!("builtin desconhecido: {other}"))),
         }
     }
@@ -886,6 +897,8 @@ impl From<Builtin> for BuiltinId {
             Builtin::FsRename => 80,
             Builtin::FsRemove => 81,
             Builtin::FsMkdir => 82,
+            Builtin::FsChmod => 83,
+            Builtin::FsStat => 84,
         };
         Self(id)
     }

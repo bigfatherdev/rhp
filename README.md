@@ -107,11 +107,11 @@ operacao em [`docs/DOCKER.md`](docs/DOCKER.md)).
 
 ```bash
 docker pull bigfatherdev/rhp:latest
-docker run --rm bigfatherdev/rhp:latest --version   # rhp 0.7.0
+docker run --rm bigfatherdev/rhp:latest --version   # rhp 0.7.1
 docker run --rm -v "$PWD:/work" bigfatherdev/rhp:latest run hello.rhp
 ```
 
-Tags: `latest` (main atual), `0.7.0` (fixa), `0.7`, `0` (releases anteriores, se publicadas).
+Tags: `latest` (main atual), `0.7.1` (fixa), `0.7`, `0` (releases anteriores, se publicadas).
 Roda como usuario nao privilegiado (`rhp`, UID 10001).
 
 ## Primeiro programa

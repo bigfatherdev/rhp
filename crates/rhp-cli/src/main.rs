@@ -2741,6 +2741,12 @@ mod tests {
                 "echo fs_exists({g:?});\n",
                 "try {{ echo fs_remove({subparent:?}); }} catch e {{ echo \"cheio\"; }}\n",
                 "echo fs_remove({g:?});\n",
+                "echo fs_stat({ninho:?})[\"e_diretorio\"];\n",
+                "echo fs_write({f2:?}, \"0123456789\");\n",
+                "echo fs_stat({f2:?})[\"tamanho\"];\n",
+                "echo fs_chmod({f2:?}, 493);\n",
+                "echo fs_stat({f2:?})[\"somente_leitura\"];\n",
+                "echo fs_remove({f2:?});\n",
                 "echo fs_remove({ninho:?});\n",
                 "echo fs_remove({subparent:?});\n",
                 "echo fs_exists({subparent:?});\n",
@@ -2748,15 +2754,17 @@ mod tests {
             sub = sub.to_string_lossy(),
             f = sub.join("f.txt").to_string_lossy(),
             g = sub.join("g.txt").to_string_lossy(),
+            f2 = sub.join("g2.txt").to_string_lossy(),
             subparent = dir.join("sub").to_string_lossy(),
             ninho = sub.to_string_lossy(),
         );
+        // Arquivo extra para chmod/stat e criado dentro do script (apos o mkdir).
         let main = write_temp_module(&dir, "main.rhp", &src);
         let mut buf: Vec<u8> = Vec::new();
         run_file_with_args(&main.to_string_lossy(), &[], &mut buf).expect("deve passar");
         assert_eq!(
             String::from_utf8(buf).expect("saida utf8"),
-            "null\n1\nnull\nfalse\ntrue\ncheio\nnull\nnull\nnull\nfalse\n"
+            "null\n1\nnull\nfalse\ntrue\ncheio\nnull\ntrue\n10\n10\nnull\nfalse\nnull\nnull\nnull\nfalse\n"
         );
         let bad = write_temp_module(
             &dir,

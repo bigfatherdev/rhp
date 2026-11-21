@@ -1,5 +1,12 @@
 # ROADMAP.md — Planejamento e estado (Next Generation + limitacoes cuidadas)
 
+## RHP 0.7.1 — Complementos (2026-11-20)
+
+- [x] `fs_chmod`/`fs_stat` (85 builtins) + padrão `join` documentado.
+- [x] RFC 0034 (MySQL TLS, proposta p/ 0.8.0).
+- [ ] 0.8.0 planejado: `and`/`or` e `in` seguem rejeitados (RFCs 0031/0032);
+  TLS (RFC 0034), builder de strings, `fs_chown`/ACL, unificar `db_exec`.
+
 ## RHP 0.7.0 — Lógica, pertinência e caching_sha2 (2026-11-20, RFCs 0031–0033)
 
 - [x] `&&`/`||` com curto-circuito (E3003 estrito; `AssertBool`; precedência documentada).
