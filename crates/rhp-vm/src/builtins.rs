@@ -792,6 +792,60 @@ pub(super) fn call_builtin(
                 type_name(other)
             ))),
         },
+        Builtin::FsChmod => match (&args[0], &args[1]) {
+            (Value::Str(path), Value::Int(mode)) => {
+                if !(0..=0o7777).contains(mode) {
+                    return Err(VmError::new(format!(
+                        "`fs_chmod` exige modo octal 0-0o7777, encontrado {mode}"
+                    )));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode as u32))
+                        .map_err(|e| VmError::new(format!("`fs_chmod` falhou em `{path}`: {e}")))?;
+                    Ok(Value::Null)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (path, mode);
+                    Err(VmError::new(
+                        "`fs_chmod` disponivel apenas em Unix".to_string(),
+                    ))
+                }
+            }
+            (a, b) => Err(VmError::new(format!(
+                "`fs_chmod` exige (caminho, modo), encontrado ({}, {})",
+                type_name(a),
+                type_name(b)
+            ))),
+        },
+        Builtin::FsStat => match &args[0] {
+            Value::Str(path) => {
+                let meta = std::fs::metadata(path)
+                    .map_err(|e| VmError::new(format!("`fs_stat` falhou em `{path}`: {e}")))?;
+                let modificado = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| Value::Int(d.as_secs() as i64))
+                    .unwrap_or(Value::Null);
+                let mut entries = std::collections::HashMap::new();
+                entries.insert("tamanho".to_string(), Value::Int(meta.len() as i64));
+                entries.insert("e_diretorio".to_string(), Value::Bool(meta.is_dir()));
+                entries.insert("e_arquivo".to_string(), Value::Bool(meta.is_file()));
+                entries.insert(
+                    "somente_leitura".to_string(),
+                    Value::Bool(meta.permissions().readonly()),
+                );
+                entries.insert("modificado".to_string(), modificado);
+                Ok(Value::Map(entries))
+            }
+            other => Err(VmError::new(format!(
+                "`fs_stat` exige caminho (string), encontrado {}",
+                type_name(other)
+            ))),
+        },
         Builtin::RegexMatch => match (&args[0], &args[1]) {
             (Value::Str(haystack), Value::Str(pattern)) => {
                 let re = compile_regex(pattern)?;

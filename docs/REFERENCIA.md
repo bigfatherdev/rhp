@@ -17,7 +17,7 @@
 - [Geradores](#8-geradores-rfc-0018)
 - [Concorrência](#9-concorrencia-rfc-0019)
 - [Módulos e pacotes](#10-modulos-e-pacotes)
-- [Biblioteca-padrão (83 builtins)](#11-biblioteca-padrao-83-builtins)
+- [Biblioteca-padrão (85 builtins)](#11-biblioteca-padrao-85-builtins)
 - [Erros e códigos](#12-erros-e-codigos)
 - [CLI](#13-cli)
 - [Exemplo completo](#14-exemplo-completo)
@@ -74,6 +74,8 @@ Precedencia (da menor para a maior): ternario `a ? b : c` (a direita)
 - `/` e `%` por zero (int ou float) sao erro; estouro de `Int` e erro.
 - `Int + Float` promove para `Float`.
 - `Str + Str` concatena; demais misturas sao erro (use `str()` etc.).
+  Concatenar em loop (`s = s + x`) e O(n²) por copia de valor: para montar
+  textos grandes, acumule em array e finalize com `join` uma vez.
 - `%` exige `Int` e `Int`; `-x` exige numero; `!x` exige `Bool`.
 - Comparacao `< <= > >=` aceita numero-numero (com promocao); demais
   combinacoes sao erro. `==`/`!=` comparam por valor.
@@ -339,7 +341,7 @@ import {u} from "./c1.rhp";
 - Comentarios `//` de linha e linhas em branco sao preservados pelo
   `rhp fmt` na mesma ordem relativa ao statement.
 
-## 11. Biblioteca-padrao (83 builtins)
+## 11. Biblioteca-padrao (85 builtins)
 
 Aridade checada na compilacao; erros sao `VmError` com mensagem em
 portugues (ver [codigos](#12-erros-e-codigos)).
@@ -410,6 +412,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 | `fs_read(caminho)` | Conteudo do arquivo (`Str` UTF-8); I/O ou > 8 MiB = erro. |
 | `fs_write(caminho, texto)` / `fs_append(caminho, texto)` | Escreve/anexa; devolve bytes escritos. Relativos resolvem no diretorio atual. |
 | `fs_rename(de, para)` / `fs_remove(caminho)` / `fs_mkdir(caminho)` | Renomeia-move / remove (arquivo ou diretorio vazio) / cria diretorio (com pais); devolvem `Null`; I/O = erro. |
+| `fs_chmod(caminho, modo)` / `fs_stat(caminho)` | Permissao Unix (`Int` octal, ex.: 493 = `0o755`; so Unix) / mapa `{tamanho, e_diretorio, e_arquivo, somente_leitura, modificado}` (`modificado` = epoch `Int`; erro se inexistente). |
 | `fs_exists(caminho)` | `true` se legivel (qualquer falha = `false`). |
 | `fs_list(dir)` | Nomes de entradas ordenados (`[]` se vazio); inexistente/nao-diretorio = erro. |
 | `argv()` | `Array` de `Str` com os argumentos apos o arquivo. |

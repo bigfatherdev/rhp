@@ -1,6 +1,6 @@
 [package]
 name = "rhp-diagnostic"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "Diagnosticos estruturados do RHP, independentes de apresentacao"
 license = "MIT OR Apache-2.0"

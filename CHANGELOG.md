@@ -2,6 +2,29 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
+## [0.7.1] — 2026-11-20 (Ciclo de vida de arquivos + RFC TLS proposta)
+
+### Added
+
+- `fs_chmod(caminho, modo)` (permissão Unix, `Int` octal) e
+  `fs_stat(caminho)` (mapa `{tamanho, e_diretorio, e_arquivo,
+  somente_leitura, modificado}`) — builtins 83–84 (85 no total).
+  Registro: `changes/2026-11-20-feat-fs-stat-chmod.md`.
+- RFC 0034 (proposta, 0.8.0): MySQL sobre TLS opt-in (diseño com verificação
+  por padrão + pino; sem fallback silencioso).
+
+### Improved
+
+- `docs/REFERENCIA.md`: padrão `join` para textos grandes (O(n²) do `+=`).
+
+### Known limitations (reafirmadas, com motivo)
+
+- Sem `and`/`or`, sem `in`: rejeitados nas RFCs 0031/0032 (sintaxe duplicada).
+- Sem TLS no MySQL nesta versão: exige RFC 0034 (verificação de certificado);
+  proxy TLS segue a recomendação.
+- Sem builder de strings como tipo (padrão array+`join` documentado).
+- `db_exec(SELECT)` difere por driver (documentado; unificar quebraria compat).
+
 ## [0.7.0] — 2026-11-20 (Operadores lógicos, pertinência em array, MySQL caching_sha2)
 
 ### Added
