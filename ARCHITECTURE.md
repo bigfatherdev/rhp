@@ -22,9 +22,14 @@ templates) sobre `http_serve`; exemplo `framework/exemplo_api.rhp`.
 Extensoes: `crates/rhp-vm/src/extensions.rs` (`demo`; ABI 1; sem `unsafe`/`.so`).
 
 Toolchain: Rust stable, edicao 2021.
-Dependencias externas: zero (auditoria: workspace + std; `cargo tree` sem
-terceiros). `unsafe` proibido e ausente. Sem `unwrap()`/`expect()` em
-producao (apenas `#[cfg(test)]`, testes de integracao e `tools/`).
+Dependencias externas: minimas e declaradas (`rhp-vm/Cargo.toml`: Argon2,
+bcrypt, regex, SHA-2/HMAC, rustls + raizes, RSA/SHA-1 para MySQL; `sqlite3`
+via FFI com o lib do SO). Auditoria: `cargo tree` revisado; sem crates
+gratuitos. `unsafe` isolado no FFI SQLite (`sqlite.rs`, com invariantes
+documentados e sem alcance por entrada RHP); resto do workspace sem
+`unsafe`. `unwrap()`/`expect()` fora de testes so em invariantes internas
+(cursor do parser apos `peek`, chaves recem-ordenadas, mutex do servidor),
+nunca em dado nao confiavel — panics de runtime viram `VmError`.
 
 ## Fluxo lexer → parser → bytecode → VM
 

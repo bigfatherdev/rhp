@@ -764,21 +764,21 @@ impl<'a> Cursor<'a> {
 
 fn token_width(token: &Token) -> usize {
     match &token.kind {
-        TokenKind::Echo
-        | TokenKind::Let
-        | TokenKind::If
-        | TokenKind::Else
-        | TokenKind::While
-        | TokenKind::For
-        | TokenKind::Try
-        | TokenKind::Catch
-        | TokenKind::Finally
-        | TokenKind::Throw
-        | TokenKind::Fn
-        | TokenKind::Import
-        | TokenKind::Null
-        | TokenKind::True
-        | TokenKind::False => 0, // largura exata irrelevante para EOF apos palavra-chave
+        TokenKind::Echo => 4,
+        TokenKind::Let => 3,
+        TokenKind::If => 2,
+        TokenKind::Else => 4,
+        TokenKind::While => 5,
+        TokenKind::For => 3,
+        TokenKind::Try => 3,
+        TokenKind::Catch => 5,
+        TokenKind::Finally => 7,
+        TokenKind::Throw => 5,
+        TokenKind::Fn => 2,
+        TokenKind::Import => 6,
+        TokenKind::Null => 4,
+        TokenKind::True => 4,
+        TokenKind::False => 5,
         TokenKind::Return => 6,
         TokenKind::Ident(s) => s.len(),
         TokenKind::StringLiteral(s) => s.len() + 2,
@@ -3436,6 +3436,18 @@ mod tests {
     fn lex_and_parse(src: &str) -> Result<Program, ParseError> {
         let tokens = rhp_lexer::lex(src).expect("lex deve passar");
         parse(&tokens)
+    }
+
+    #[test]
+    fn eof_after_keyword_points_past_it() {
+        // COMP-006: `token_width` devolvia 0 para palavras-chave; EOF apos
+        // `echo` apontava 1:1 em vez de 1:5 (caret/LSP enganoso).
+        let err = lex_and_parse("echo").expect_err("deve falhar");
+        assert_eq!((err.line, err.col), (1, 5), "erro: {err:?}");
+        let err = lex_and_parse("let").expect_err("deve falhar");
+        assert_eq!((err.line, err.col), (1, 4), "erro: {err:?}");
+        let err = lex_and_parse("if true").expect_err("deve falhar");
+        assert_eq!((err.line, err.col), (1, 8), "erro: {err:?}");
     }
 
     #[test]

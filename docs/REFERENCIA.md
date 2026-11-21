@@ -41,6 +41,8 @@
 Semântica de valores: atribuicao, argumentos, retorno e `push` copiam
 integralmente. Mutacao observavel so existe em variaveis nomeadas
 (`a[i] = v`, `obj.campo = v`, `obj.metodo()` com write-back).
+Exibicao com teto: `echo`/`str()`/`throw`/template em valor com mais de
+128 niveis = erro capturavel (nunca abort).
 
 ## 2. Literais, variáveis e constantes
 
@@ -286,6 +288,9 @@ echo exhausted(g);              // false
 - Erro dentro do gerador: `try` externo captura; resume seguinte falha
   ("interrompido"; crie outro). `this` de metodo-gerador e vinculado na
   criacao (sem write-back). `yield` fora de funcao = erro de compilacao.
+- `yield` dentro de `try` suspende com tudo intacto (0.7.2): o resume
+  continua dentro do `try`; `finally` roda uma vez, no termino — nao a
+  cada `yield`. Gerador abandonado nao executa `finally`.
 
 ## 9. Concorrencia (RFCs 0019/0023/0030)
 
@@ -359,7 +364,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 | `merge(a, b)` | Une dois mapas; chaves de `b` vencem. |
 | `has(m, chave)` | `true` se a chave existe. |
 | `str(v)` | Representacao `Display` (mapa ordenado por chave). |
-| `int(v)` | `Int`->igual; `Float` integral->trunca (faixa `i64`); `Str`->parse; resto = erro. |
+| `int(v)` | `Int`->igual; `Float` integral->converte (faixa `i64`, sem truncar fracao: `1.5` = erro); `Str`->parse; resto = erro. |
 | `float(v)` | `Float`->igual; `Int`->converte; `Str`->parse; resto = erro. |
 | `type(v)` | `"null"`, `"bool"`, `"int"`, `"float"`, `"string"`, `"array"`, `"mapa"`, `"funcao"`, `"classe"`, `"instancia"`, `"gerador"`. |
 | `assert(cond)` | `true` -> `null`; `false`/nao-`Bool` = erro (`assercao`). |
@@ -394,9 +399,9 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 
 | Funcao | Efeito |
 |---|---|
-| `map(arr, f)` | Aplica `f(elem)` e devolve array de resultados (mesma ordem). |
-| `filter(arr, f)` | Devolve elementos cujo `f(elem)` retorna `true` (sem truthiness). |
-| `usort(arr, cmp)` | Ordenacao estavel por `cmp(a, b): Int` (`< 0`: `a` antes; `> 0`: depois; `0`: empate). |
+| `map(arr, f)` | Aplica `f(elem)` e devolve array de resultados (mesma ordem). `f` = funcao RHP (nativa ou `async` = erro). |
+| `filter(arr, f)` | Devolve elementos cujo `f(elem)` retorna `true` (sem truthiness). `f` = funcao RHP (nativa ou `async` = erro). |
+| `usort(arr, cmp)` | Ordenacao estavel por `cmp(a, b): Int` (`< 0`: `a` antes; `> 0`: depois; `0`: empate). `cmp` = funcao RHP (nativa ou `async` = erro). |
 
 ### JSON
 
@@ -412,10 +417,10 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 | `fs_read(caminho)` | Conteudo do arquivo (`Str` UTF-8); I/O ou > 8 MiB = erro. |
 | `fs_write(caminho, texto)` / `fs_append(caminho, texto)` | Escreve/anexa; devolve bytes escritos. Relativos resolvem no diretorio atual. |
 | `fs_rename(de, para)` / `fs_remove(caminho)` / `fs_mkdir(caminho)` | Renomeia-move / remove (arquivo ou diretorio vazio) / cria diretorio (com pais); devolvem `Null`; I/O = erro. |
-| `fs_chmod(caminho, modo)` / `fs_stat(caminho)` | Permissao Unix (`Int` octal, ex.: 493 = `0o755`; so Unix) / mapa `{tamanho, e_diretorio, e_arquivo, somente_leitura, modificado}` (`modificado` = epoch `Int`; erro se inexistente). |
-| `fs_exists(caminho)` | `true` se legivel (qualquer falha = `false`). |
+| `fs_chmod(caminho, modo)` / `fs_stat(caminho)` | Permissao Unix (`Int` octal, ex.: 493 = `0o755`; so Unix; mensagem mostra `0o...`) / mapa `{tamanho, e_diretorio, e_arquivo, somente_leitura, modificado}` (`modificado` = epoch `Int`, ou `null` se anterior a 1970; erro se inexistente). |
+| `fs_exists(caminho)` | `true` se existe (qualquer falha = `false`; nao testa legibilidade). |
 | `fs_list(dir)` | Nomes de entradas ordenados (`[]` se vazio); inexistente/nao-diretorio = erro. |
-| `argv()` | `Array` de `Str` com os argumentos apos o arquivo. |
+| `argv()` | `Array` de `Str` com os argumentos apos o arquivo (`--` separador nao entra). |
 | `env(nome)` | Valor da variavel de ambiente ou `null` se ausente. |
 | `now()` | Segundos Unix (`Int`). |
 | `sleep(s)` | Bloqueia `s` segundos (`Int`/`Float`); negativo/NaN/>3600 = erro; devolve `null`. |
@@ -425,9 +430,9 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 
 | Funcao | Efeito |
 |---|---|
-| `http_get(url)` | GET `http://` com timeouts de 5s (DNS: resolvedor do sistema), teto de corpo 1 MiB, so 2xx com corpo UTF-8; resto = erro. |
-| `http_fetch(url, opts)` | GET com `opts` (`seguir`, `max_redirecionamentos` 0–10, `timeout` 0–60s, `headers`, `metodo`: so `GET`); `https://` verificado (raizes embutidas + `RHP_CA_BUNDLE`); redirects 301/302/303/307/308 (ate 10; sem downgrade https→http); devolve mapa `{status, cabecalhos, corpo}` (chaves minusculas). |
-| `http_serve(porta, handler, opts)` | Servidor HTTP (thread por conexao; handler stateless; erro 500 sem vazar; `exit(codigo)` encerra). `porta` 0–65535 (0 = livre). Handler: nome de `fn` (string) ou valor de funcao do topo (`app`, nao closure). `req` = mapa `{metodo, caminho, query, cabecalhos, cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Opts: `host` (default `"127.0.0.1"`; `"localhost"` = idem; `"0.0.0.0"` = todas IPv4 — ver seguranca em `docs/WEB.md`), `max_conexoes`, `max_requisicoes`, `limite_taxa` (req/s por IP; excedeu = 429), `max_passos` (default 10M; estouro = 500), `max_heap_bytes`. Request malformado = 400; corpo `chunked` suportado; `http_serve` no handler = erro; falha de `accept` nao para o servidor. |
+| `http_get(url)` | GET `http://` com timeouts de 5s (DNS: resolvedor do sistema), teto de corpo 1 MiB, so 2xx com corpo UTF-8; resto = erro. `userinfo@host` = erro (use `Authorization`). |
+| `http_fetch(url, opts)` | GET com `opts` (`seguir`, `max_redirecionamentos` 0–10, `timeout` (0,60]s, `headers`, `metodo`: so `GET`); `https://` verificado (raizes embutidas + `RHP_CA_BUNDLE`; vazio = so embutidas); redirects 301/302/303/307/308 (ate 10; sem downgrade https→http); devolve mapa `{status, cabecalhos, corpo}` (chaves minusculas). |
+| `http_serve(porta, handler, opts)` | Servidor HTTP (thread por conexao, sem prazo por handler; handler stateless; erro 500 sem vazar; `exit(codigo)` encerra após 200 vazio). `porta` 0–65535 (0 = livre). Handler: nome de `fn` (string) ou valor de funcao do topo (`app`, nao closure). `req` = mapa `{metodo, caminho, query, cabecalhos, cookies, corpo}`; retorno `Str` (corpo, 200) ou mapa `{status?, cabecalhos?, corpo?}`. Opts: `host` (default `"127.0.0.1"`; `"localhost"` = idem; `"0.0.0.0"` = todas IPv4 — ver seguranca em `docs/WEB.md`), `max_conexoes` (default 32), `max_requisicoes`, `limite_taxa` (req/s por IP; excedeu = 429; sob carga pode encerrar com RST — retente), `max_passos` (default 10M; estouro = 500), `max_heap_bytes`. Request malformado/obs-fold/NUL = 400; `+` em caminho nao vira espaco; forma absoluta normaliza; corpo `chunked` suportado; `http_serve` no handler = erro; chamada no topo (`echo`/blocos) e filtrada no worker; falha de `accept` nao para o servidor. |
 | `template(texto, valores)` | Interpola `{{chave}}` com escape HTML obrigatorio; chave ausente/`{{` aberto/tipo invalido = erro; sem laco/condicional. |
 
 ### Banco de dados (Fase B + Etapa 5)
@@ -437,7 +442,7 @@ portugues (ver [codigos](#12-erros-e-codigos)).
 | `db_open(caminho)` | Abre/cria SQLite (`Int` = handle); relativo resolve no cwd; roda com as permissoes do usuario. |
 | `db_open("pg:...")` | Conecta no PostgreSQL (`host`, `port`, `user`, `dbname`; auth `trust`; padroes host 127.0.0.1/porta 5432/user `postgres`/dbname = user). |
 | `db_open("mysql:...")` | Conecta no MySQL (protocolo 4.1 + `mysql_native_password` ou `caching_sha2_password` com fast_auth e full auth RSA-OAEP; chaves `host`, `port` (padrao 127.0.0.1:3306), `user` (padrao `root`), `password`, `dbname`). |
-| `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); `?` posicionais (SQLite/MySQL via escape client-side; PG `$1`... nativo); devolve linhas afetadas (`Int`). `SELECT` via `exec`: MySQL devolve erro (use `db_query`); PG devolve a contagem. Linhas de SELECT sao descartadas. |
+| `db_exec(h, sql, params)` | Uma instrucao (INSERT/UPDATE/DELETE/DDL...); `?` posicionais (SQLite/MySQL via escape client-side — `?` em literais/comentarios nao conta; PG `$1`... nativo); SQL vazio = erro; devolve linhas afetadas (`Int`). `SELECT` via `exec`: SQLite devolve 0, MySQL devolve erro (use `db_query`); PG devolve a contagem. Linhas de SELECT sao descartadas. |
 | `db_query(h, sql, params)` | Consulta; devolve array de mapas coluna=>valor (`Int`/`Float`/`Bool`/`Str`/`null`; BLOB SQLite = erro; tipos PG mapeados por OID, resto vira `Str`; MySQL: numericos=>numero, resto (incl. datas)=>`Str`). Nota: SQLite/MySQL nao tem booleano nativo — `true` gravado volta como `1` (`Int`); so o PG round-tripa `Bool`. |
 | `db_close(h)` | Fecha (reuso = erro); devolve `null`. Fim do programa fecha o resto. |
 
@@ -481,7 +486,7 @@ Padrao manual: `while !exhausted(g) { let v = next(g); if exhausted(g) { break; 
 |---|---|
 | `tcp_connect(host, porta)` | Conecta (DNS do sistema; timeout 5s); devolve handle `Int`. |
 | `tcp_send(h, dados)` | Escreve `Str`; devolve bytes escritos (`Int`). |
-| `tcp_recv(h, max)` | Le ate `max` bytes; devolve `Str` (nao-UTF-8 = erro) ou `Null` em EOF limpo. |
+| `tcp_recv(h, max)` | Le ate `max` bytes (`max` > 0); devolve `Str` (nao-UTF-8 = erro) ou `Null` em EOF limpo. |
 | `tcp_close(h)` | Fecha; devolve `null` (reuso = erro). |
 | `redis_open(host, porta)` | Conecta (RESP2; sem AUTH v1 — servidor com senha = erro). Devolve handle `Int`. |
 | `redis_exec(h, [cmd, args...])` | Executa; simples/bulk => `Str`, inteiro => `Int`, nulo => `null`, array => `Array` (recursivo, teto 128). Erro RESP (`-...`) vira erro RHP; comando vazio/arg nao-`Str` = erro. |

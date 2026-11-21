@@ -2,6 +2,55 @@
 
 Formato inspirado em Keep a Changelog. Detalhes auditaveis ficam em `changes/`.
 
+## [0.7.2] — 2026-11-21 (Auditoria de engenharia: 5 P0 + 9 P1/P2 zerados)
+
+Auditoria independente completa (compilador, VM, 85 builtins, conectores,
+HTTP, async, segurança, performance, CLI, docs). Suíte: 395 testes, 0 falhas.
+
+### Fixed
+
+- `for x in` aninhados: corpo compilado 1x (antes 2^N; 20 níveis travavam).
+  Registro: `changes/2026-11-21-fix-compiler-for-yield.md`.
+- `yield` em `try`: suspende com handler intacto; `finally` 1x no término.
+- `echo`/`str()`/`throw` profundos (128+): erro E3000 capturável, sem abort.
+- `next` respeita `MAX_CALL_DEPTH` (512); callbacks HOF nativas/`async` rejeitadas.
+- `catch` tipado sem teto 256 (detecção de ciclo); closures entram em `max_heap_bytes`.
+- `echo http_serve(...)`/`if` no topo filtrados do worker (antes: 500 geral).
+- MySQL: `?` em literais/comentários não é placeholder.
+- HTTP: `+` só em query; forma absoluta normaliza; obs-fold/NUL = 400; `exit()` responde 200.
+- Framework: `cabecalhos` opcional, 404/405 com selo, `Allow` único.
+- REPL sobrevive a erro + multilinha; `rhp test` desce subdirs.
+- sqlite: `exec(SELECT)` = 0, vazio = erro; `tcp_recv` exige `max` > 0; `argv` sem `--`.
+- Mensagens: `regex_replace`/`hmac_verify` (3 tipos), `sqrt(NaN)`, `fs_chmod` (`0o...`).
+- Diagnóstico: EOF após palavra-chave com coluna certa; float `inf` = erro.
+
+### Security
+
+- RESP array gigante e ncol MySQL absurda: erro em vez de abort (DoS remoto).
+  Registros: `changes/2026-11-21-security-dos-caps.md`.
+- `RHP_CA_BUNDLE=""` = só embutidas (doc já prometia).
+- `userinfo@host` rejeitado sem vazar segredo.
+
+### Performance
+
+- `json_parse` de string longa O(n²)→O(n) (400 KB: 8.6 s → 0.2 s, ~43x).
+  Registro: `changes/2026-11-21-perf-json-parse.md`.
+
+### Compatibility
+
+- Correções compatíveis; só muda o que abortava/travava/enganava.
+  `tcp_recv(h, 0)`, `argv` com `--`, HOF com callback nativa/`async` agora
+  erram limpo. Nenhuma sintaxe removida; nenhum E-code alterado.
+
+### Known limitations (reafirmadas + novas, com motivo)
+
+- Sem TLS no MySQL (RFC 0034, alvo 0.8.0); sem `and`/`or`/`in` (rejeitados);
+  sem builder de strings; `db_exec(SELECT)` difere por driver.
+- Sem prazo por handler HTTP; 503/429 podem encerrar com RST (retentar).
+- Push/atribuição de compostos segue O(n²) (semântica por valor; exige RFC).
+- `i64::MIN` sem literal direto (`0-9223372036854775807-1`).
+- Fuzz versionado, sem gate de CI; resultados grandes sem paginação.
+
 ## [0.7.1] — 2026-11-20 (Ciclo de vida de arquivos + RFC TLS proposta)
 
 ### Added

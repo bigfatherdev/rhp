@@ -619,6 +619,14 @@ fn lex_number(
                 ))
             },
             |v| {
+                // COMP-007: magnitude alem de f64 virava `inf` em silencio.
+                if !v.is_finite() {
+                    return Err(LexError::new(
+                        format!("literal float fora do intervalo: {text}"),
+                        start_line,
+                        start_col,
+                    ));
+                }
                 Ok(Token::new(
                     TokenKind::FloatLiteral(v),
                     start_line,
@@ -853,6 +861,20 @@ mod tests {
     fn reports_integer_overflow() {
         let err = lex("99999999999999999999999").expect_err("deve falhar");
         assert!(err.message.contains("fora do intervalo"));
+    }
+
+    #[test]
+    fn rejects_non_finite_float_literal() {
+        // COMP-007: magnitude alem de f64 virava `inf` em silencio.
+        let huge = "9".repeat(400) + ".0";
+        let err = lex(&huge).expect_err("deve falhar");
+        assert!(
+            err.message.contains("fora do intervalo"),
+            "mensagem: {}",
+            err.message
+        );
+        // Finitos passam.
+        assert_eq!(kinds("1.5"), vec![TokenKind::FloatLiteral(1.5)]);
     }
 
     #[test]

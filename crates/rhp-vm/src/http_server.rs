@@ -12,7 +12,7 @@
 
 use rhp_bytecode::{compile, Value};
 use rhp_parser::Program as AstProgram;
-use rhp_parser::{CallArg, CallData, Expr, Program, Stmt, StmtNode};
+use rhp_parser::{AssignTarget, CallArg, CallData, Expr, Program, Stmt, StmtNode};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -479,17 +479,95 @@ fn synthetic_program(
     })
 }
 
-/// `true` se o statement e (ou contem no topo) uma chamada `http_serve`
-/// — filtrado do programa sintetico do worker (evita re-servir).
+/// `true` se executar o statement no topo invocaria `http_serve(...)` —
+/// filtrado do programa sintetico do worker (evita re-servir).
+/// LIB-001: antes so `ExprStmt`/`Let`/`Const`/`Return`/`Throw` eram
+/// filtrados; `echo http_serve(...)` ou `if (c) { http_serve(...); }` no
+/// topo quebravam TODO request com 500 (anti-reentrancia).
+/// Regra: expressoes e blocos que executam no topo sao varridos;
+/// contextos de definicao (`fn`, metodos, closures) nao executam no topo
+/// (a guarda anti-reentrancia cobre chamadas reais no handler).
 fn is_serve_stmt(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::ExprStmt { expr } => expr_calls_serve(expr),
+        // Definicoes nao executam no topo: mantidas (o worker precisa delas).
+        Stmt::FnDef { .. }
+        | Stmt::ClassDef { .. }
+        | Stmt::InterfaceDef { .. }
+        | Stmt::TraitDef { .. }
+        | Stmt::Import { .. }
+        | Stmt::ImportNames { .. }
+        | Stmt::ReExport { .. }
+        | Stmt::Export { .. }
+        | Stmt::Namespace { .. }
+        | Stmt::ImportQualified { .. }
+        | Stmt::ImportNative { .. }
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::BreakN(_)
+        | Stmt::ContinueN(_) => false,
+        Stmt::ExprStmt { expr } | Stmt::Throw { expr } => expr_calls_serve(expr),
+        Stmt::Return { expr: Some(e) } => expr_calls_serve(e),
+        Stmt::Return { expr: None } | Stmt::Yield { .. } => false,
         Stmt::Let { init: Some(e), .. }
         | Stmt::Const { init: e, .. }
-        | Stmt::Return { expr: Some(e) }
-        | Stmt::Throw { expr: e } => expr_calls_serve(e),
-        _ => false,
+        | Stmt::Static { init: e, .. } => expr_calls_serve(e),
+        Stmt::Let { init: None, .. } => false,
+        Stmt::Destructure { init, .. } => expr_calls_serve(init),
+        Stmt::Assign { target, expr } => {
+            expr_calls_serve(expr)
+                || match target {
+                    AssignTarget::Var(_) => false,
+                    AssignTarget::Index { name: _, index } => expr_calls_serve(index),
+                }
+        }
+        Stmt::Echo { expr } => expr_calls_serve(expr),
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_calls_serve(cond)
+                || block_calls_serve(then_branch)
+                || else_branch.as_ref().is_some_and(|b| block_calls_serve(b))
+        }
+        Stmt::While { cond, body } => expr_calls_serve(cond) || block_calls_serve(body),
+        Stmt::For { iter, body, .. } => expr_calls_serve(iter) || block_calls_serve(body),
+        Stmt::ForC {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.as_ref().is_some_and(|s| is_serve_stmt(&s.stmt))
+                || cond.as_ref().is_some_and(expr_calls_serve)
+                || step.as_ref().is_some_and(|s| is_serve_stmt(&s.stmt))
+                || block_calls_serve(body)
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            expr_calls_serve(discriminant)
+                || cases.iter().any(|c| {
+                    c.cond.as_ref().is_some_and(expr_calls_serve) || block_calls_serve(&c.body)
+                })
+        }
+        Stmt::Try {
+            body,
+            catches,
+            finally_body,
+        } => {
+            block_calls_serve(body)
+                || catches.iter().any(|c| block_calls_serve(&c.body))
+                || finally_body.as_ref().is_some_and(|b| block_calls_serve(b))
+        }
+        Stmt::Block(stmts) => block_calls_serve(stmts),
     }
+}
+
+/// Algum statement do bloco invocaria `http_serve` se executado.
+fn block_calls_serve(stmts: &[StmtNode]) -> bool {
+    stmts.iter().any(|node| is_serve_stmt(&node.stmt))
 }
 
 /// Procura `http_serve(...)` na expressao (direta ou aninhada em chamada).
@@ -521,19 +599,9 @@ fn expr_calls_serve(expr: &Expr) -> bool {
                     a.cond.as_ref().is_some_and(expr_calls_serve) || expr_calls_serve(&a.value)
                 })
         }
-        Expr::Closure(data) => data.body.iter().any(|n| stmt_calls_serve(&n.stmt)),
-        _ => false,
-    }
-}
-
-/// Procura `http_serve` em statements aninhados (corpos de `if`/`for`/etc.).
-/// Conservador: qualquer bloco com a chamada marca o statement pai.
-fn stmt_calls_serve(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::ExprStmt { expr } | Stmt::Throw { expr } | Stmt::Echo { expr } => {
-            expr_calls_serve(expr)
-        }
-        Stmt::Let { init: Some(e), .. } | Stmt::Const { init: e, .. } => expr_calls_serve(e),
+        // Closures sao definicoes (nao executam no topo): a guarda
+        // anti-reentrancia cobre chamadas reais dentro do handler.
+        Expr::Closure(_) => false,
         _ => false,
     }
 }
@@ -591,7 +659,19 @@ fn handle_one(
             }
             None
         }
-        Err(HandlerFail::Exit(code)) => Some(code),
+        Err(HandlerFail::Exit(code)) => {
+            // HTTP-006: antes a conexao caia sem resposta (EOF abrupto).
+            // Envia 200 vazio com `Connection: close` antes de encerrar.
+            let _ = write_response(
+                &stream,
+                &HttpResponse {
+                    status: 200,
+                    headers: vec![("connection".to_string(), "close".to_string())],
+                    body: Vec::new(),
+                },
+            );
+            Some(code)
+        }
         Err(HandlerFail::Fail(message)) => {
             eprintln!("rhp: handler `{handler}`: {message}");
             let _ = respond_500(&stream);
@@ -678,24 +758,44 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         .next()
         .ok_or_else(|| "request sem caminho".to_string())?
         .to_string();
+    // HTTP-009: NUL no alvo invalida o request (evita confusao em roteador,
+    // filesystem e logs downstream; `%00` decodificado tambem e barrado).
+    if target.bytes().any(|b| b == 0) {
+        return Err("caminho com byte NUL".to_string());
+    }
+    // HTTP-008: forma absoluta (`GET http://host/abc?q=1`) — normaliza para
+    // origem (caminho + query); proxies de encaminhamento usam essa forma.
+    let target = strip_absolute_form(&target);
     let (path, query) = match target.find('?') {
         Some(pos) => (
-            percent_decode(&target[..pos]),
+            percent_decode(&target[..pos], false),
             parse_query(&target[pos + 1..]),
         ),
-        None => (percent_decode(&target), HashMap::new()),
+        None => (percent_decode(target, false), HashMap::new()),
     };
+    // HTTP-009 (cont.): `%00` decodificado vira NUL — barra apos decode.
+    if path.bytes().any(|b| b == 0) {
+        return Err("caminho com byte NUL".to_string());
+    }
     let mut headers = HashMap::new();
     for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            let entry = headers
-                .entry(name.trim().to_lowercase())
-                .or_insert_with(String::new);
-            if !entry.is_empty() {
-                entry.push_str(", ");
-            }
-            entry.push_str(value.trim());
+        let Some((name, value)) = line.split_once(':') else {
+            // HTTP-007: linha sem `:` (obs-fold) = request invalido (400).
+            // Antes era ignorada em silencio (risco de smuggling contra
+            // proxies que desdobram a continuacao).
+            return Err("cabecalho sem `:` (obs-fold nao suportado)".to_string());
+        };
+        // HTTP-009 (cont.): NUL em nome/valor de cabecalho.
+        if name.bytes().any(|b| b == 0) || value.bytes().any(|b| b == 0) {
+            return Err("cabecalho com byte NUL".to_string());
         }
+        let entry = headers
+            .entry(name.trim().to_lowercase())
+            .or_insert_with(String::new);
+        if !entry.is_empty() {
+            entry.push_str(", ");
+        }
+        entry.push_str(value.trim());
     }
     let mut corpo = LeitorCorpo {
         buf: raw[header_end + 4..].to_vec(),
@@ -909,10 +1009,27 @@ fn parse_cookies(header: &str) -> HashMap<String, String> {
     out
 }
 
-/// Decodifica `%XX` e `+` (query); invalido = mantem literal.
+/// Normaliza forma absoluta (`http://host/abc?q=1` ou `https://...`) para
+/// origem (`/abc?q=1`). Sem esquema reconhecivel, devolve intacto.
+fn strip_absolute_form(target: &str) -> &str {
+    let rest = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"));
+    match rest {
+        Some(after) => match after.find('/') {
+            Some(pos) => &after[pos..],
+            None => "/",
+        },
+        None => target,
+    }
+}
+
+/// Decodifica `%XX` (e `+`, so em query); invalido = mantem literal.
 /// Opera em bytes e so converte no fim (`from_utf8_lossy`): `%C3%A9`
 /// vira "é", nao dois escalares latinos.
-fn percent_decode(text: &str) -> String {
+/// HTTP-001: `+` em caminho NAO vira espaco (so em query, application/
+/// x-www-form-urlencoded). Antes, `/a+b` e `/a%2Bb` colidiam em `/a b`.
+fn percent_decode(text: &str, plus_as_space: bool) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -924,7 +1041,7 @@ fn percent_decode(text: &str) -> String {
                 continue;
             }
         }
-        if bytes[i] == b'+' {
+        if bytes[i] == b'+' && plus_as_space {
             out.push(b' ');
         } else {
             out.push(bytes[i]);
@@ -951,10 +1068,10 @@ fn parse_query(query: &str) -> HashMap<String, String> {
         }
         match pair.split_once('=') {
             Some((k, v)) => {
-                map.insert(percent_decode(k), percent_decode(v));
+                map.insert(percent_decode(k, true), percent_decode(v, true));
             }
             None => {
-                map.insert(percent_decode(pair), String::new());
+                map.insert(percent_decode(pair, true), String::new());
             }
         }
     }
@@ -1228,6 +1345,45 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_program_filters_echo_and_compound_serve() {
+        // LIB-001: `echo http_serve(...)` / `if` no topo nao eram filtrados:
+        // o worker re-executava a chamada e todo request dava 500
+        // (anti-reentrancia). Definicoes (`fn`) sao mantidas.
+        let src = "fn h(req) { return {\"status\": 200, \"corpo\": \"oi\"}; }\n\
+             echo http_serve(18091, \"h\", {});\n";
+        let program = rhp_parser::parse_source(src).expect("parse");
+        let req = Value::Map(
+            [("caminho".to_string(), Value::Str("/".to_string()))]
+                .into_iter()
+                .collect(),
+        );
+        let synth = synthetic_program(&program, "h", &req).expect("sintetico");
+        let kept: Vec<String> = synth
+            .statements
+            .iter()
+            .map(|n| format!("{:?}", n.stmt))
+            .collect();
+        assert!(
+            kept.iter().any(|s| s.contains("FnDef")),
+            "handler removido: {kept:?}"
+        );
+        assert!(
+            !kept.iter().any(|s| s.contains("http_serve")),
+            "serve nao filtrado: {kept:?}"
+        );
+        let src_if = "fn h(req) { return \"oi\"; }\nif (true) { http_serve(18092, \"h\", {}); }\n";
+        let program_if = rhp_parser::parse_source(src_if).expect("parse");
+        let synth_if = synthetic_program(&program_if, "h", &req).expect("sintetico");
+        assert!(
+            !synth_if
+                .statements
+                .iter()
+                .any(|n| format!("{:?}", n.stmt).contains("http_serve")),
+            "serve em `if` nao filtrado"
+        );
+    }
+
+    #[test]
     fn rate_limit_allows_burst_then_blocks() {
         let mut contadores = HashMap::new();
         // limite 2/s: 2 passam, 3o bloqueia, proximo segundo reseta.
@@ -1300,10 +1456,52 @@ mod tests {
 
     #[test]
     fn percent_decode_preserva_utf8() {
-        assert_eq!(percent_decode("ola%20mundo"), "ola mundo");
-        assert_eq!(percent_decode("caf%C3%A9"), "café");
-        assert_eq!(percent_decode("%ZZ"), "%ZZ");
-        assert_eq!(percent_decode("a+b"), "a b");
-        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("ola%20mundo", true), "ola mundo");
+        assert_eq!(percent_decode("caf%C3%A9", true), "café");
+        assert_eq!(percent_decode("%ZZ", true), "%ZZ");
+        assert_eq!(percent_decode("a+b", true), "a b");
+        assert_eq!(percent_decode("a+b", false), "a+b");
+        assert_eq!(percent_decode("a%2Bb", false), "a+b");
+        assert_eq!(percent_decode("%", true), "%");
+    }
+
+    #[test]
+    fn target_normalization_and_rejections() {
+        // HTTP-001: `+` so vira espaco em query, nunca em caminho.
+        assert_eq!(percent_decode("a+b", false), "a+b");
+        // HTTP-008: forma absoluta normaliza para origem.
+        assert_eq!(strip_absolute_form("http://h/abc?q=1"), "/abc?q=1");
+        assert_eq!(strip_absolute_form("https://h/"), "/");
+        assert_eq!(strip_absolute_form("https://h"), "/");
+        assert_eq!(strip_absolute_form("/rel?q=1"), "/rel?q=1");
+    }
+
+    #[test]
+    fn read_request_rejects_obs_fold_and_nul() {
+        // HTTP-007/009: obs-fold e NUL viram 400 (antes, passavam).
+        use std::net::TcpListener;
+        fn exchange(raw: &[u8]) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("porta").port();
+            let raw = raw.to_vec();
+            std::thread::spawn(move || {
+                let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("conn");
+                use std::io::Write;
+                s.write_all(&raw).expect("envio");
+                // Mantem aberto para o servidor ler com prazo.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            });
+            let (mut stream, _) = listener.accept().expect("accept");
+            match read_request(&mut stream) {
+                Ok(_) => "ok".to_string(),
+                Err(message) => message,
+            }
+        }
+        let folded = exchange(b"GET /x HTTP/1.1\r\nHost: a\r\nX-Bad\r\n  cont\r\n\r\n");
+        assert!(folded.contains("obs-fold"), "obteve: {folded}");
+        let nul = exchange(b"GET /a\x00b HTTP/1.1\r\nHost: a\r\n\r\n");
+        assert!(nul.contains("NUL"), "obteve: {nul}");
+        let ok = exchange(b"GET /a+b?q=x+y HTTP/1.1\r\nHost: a\r\n\r\n");
+        assert_eq!(ok, "ok");
     }
 }

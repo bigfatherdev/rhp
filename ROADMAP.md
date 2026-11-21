@@ -1,5 +1,18 @@
 # ROADMAP.md — Planejamento e estado (Next Generation + limitacoes cuidadas)
 
+## RHP 0.7.2 — Auditoria de engenharia (2026-11-21, P0/P1/P2 zerados)
+
+- [x] 5 P0: for-in 2^N → linear, yield-em-try, Display abort, with_capacity
+  redis/mysql (fakes + regressões, fuzz 1000 limpo).
+- [x] P1/P2: `next` +512, HOF nativa/async, `web_finalizar`, filtro
+  `http_serve` no topo, `?` MySQL, `+`/absoluta/obs-fold/NUL/`exit`-200,
+  `catch` sem 256, `MakeFunc` no heap, CA-bundle vazio, userinfo.
+- [x] Perf: `json_parse` O(n) (~43x); docs honestas (deps/`unsafe`/limites);
+  REPL multilinha, `test` recursivo; suíte 395/395.
+- [ ] 0.8.0 planejado: TLS MySQL (RFC 0034), builder de strings (RFC),
+  `fs_chown`/ACL, prazo por handler (RFC), unificar `db_exec(SELECT)`,
+  `i64::MIN`, fuzz-gate de CI, paginação de resultados.
+
 ## RHP 0.7.1 — Complementos (2026-11-20)
 
 - [x] `fs_chmod`/`fs_stat` (85 builtins) + padrão `join` documentado.

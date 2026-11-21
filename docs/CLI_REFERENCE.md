@@ -33,7 +33,10 @@ para a mais externa); sem frames nomeados, sem pilha.
 
 REPL interativo: le linhas do stdin, compila e executa cada uma com
 estado persistente (globais e funcoes sobrevivem; erro nao mata a
-sessao). Prompt `> ` so em terminal; `sair` ou EOF encerra com 0.
+sessao). Blocos multilinha: entrada incompleta (`fim de arquivo` ou
+string nao terminada) continua com prompt `... ` ate fechar; `sair`
+sozinho cancela a continuacao. Prompt `> ` so em terminal; `sair`
+ou EOF encerra com 0.
 
 ```bash
 rhp repl
@@ -64,7 +67,8 @@ Reescreve no formato canonico (2 espacos, `;` sempre, parenteses minimos,
 
 Executa arquivos de teste (`*_test.rhp`, que usam `assert`): um por um,
 com relatorio `ok <arquivo>` / `FALHOU <arquivo>: <motivo>` e resumo final
-(`N teste(s), M falha(s)`). Exit 0 se todos passam, 1 caso contrario.
+(`N teste(s), M falha(s)`). Desce em subdiretorios (ordem por caminho).
+Exit 0 se todos passam, 1 caso contrario.
 `exit(codigo)` dentro de um teste conta como falha do arquivo (nao encerra
 o corredor). Sem argumento, usa o diretorio atual.
 
@@ -113,4 +117,4 @@ rhp check --json app.rhp | jq .diagnostics
 
 ## `rhp --help`, `rhp --version`
 
-Ajuda resumida e versao do binario (`rhp 0.1.0`; versao `unreleased`).
+Ajuda resumida e versao do binario (`rhp 0.7.2`; versao `unreleased` antes de release).

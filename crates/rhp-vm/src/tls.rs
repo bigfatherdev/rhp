@@ -44,20 +44,24 @@ impl Write for Transport {
 fn client_config() -> Result<Arc<rustls::ClientConfig>, String> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // SEC-002: vazio = so embutidas (antes, `""` tentava abrir arquivo e
+    // quebrava todo `https`; doc ja prometia esse comportamento).
     if let Ok(path) = std::env::var("RHP_CA_BUNDLE") {
-        let file =
-            std::fs::File::open(&path).map_err(|e| format!("RHP_CA_BUNDLE `{path}`: {e}"))?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut added = 0u32;
-        for cert in rustls_pemfile::certs(&mut reader) {
-            let cert = cert.map_err(|e| format!("RHP_CA_BUNDLE invalido: {e}"))?;
-            roots
-                .add(cert)
-                .map_err(|e| format!("RHP_CA_BUNDLE rejeitado: {e:?}"))?;
-            added += 1;
-        }
-        if added == 0 {
-            return Err(format!("RHP_CA_BUNDLE `{path}` sem certificados"));
+        if !path.is_empty() {
+            let file =
+                std::fs::File::open(&path).map_err(|e| format!("RHP_CA_BUNDLE `{path}`: {e}"))?;
+            let mut reader = std::io::BufReader::new(file);
+            let mut added = 0u32;
+            for cert in rustls_pemfile::certs(&mut reader) {
+                let cert = cert.map_err(|e| format!("RHP_CA_BUNDLE invalido: {e}"))?;
+                roots
+                    .add(cert)
+                    .map_err(|e| format!("RHP_CA_BUNDLE rejeitado: {e:?}"))?;
+                added += 1;
+            }
+            if added == 0 {
+                return Err(format!("RHP_CA_BUNDLE `{path}` sem certificados"));
+            }
         }
     }
     let config = rustls::ClientConfig::builder()

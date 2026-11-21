@@ -26,7 +26,7 @@ fn main() -> ExitCode {
                 Ok(max_steps) => {
                     match run_file_limited(
                         path,
-                        rest,
+                        strip_separator(rest),
                         &mut std::io::stdout(),
                         rhp_vm::VmLimits {
                             max_steps: Some(max_steps),
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
                 Ok(max_heap_bytes) if max_heap_bytes > 0 => {
                     match run_file_limited(
                         path,
-                        rest,
+                        strip_separator(rest),
                         &mut std::io::stdout(),
                         rhp_vm::VmLimits {
                             max_heap_bytes: Some(max_heap_bytes),
@@ -89,7 +89,7 @@ fn main() -> ExitCode {
         [_, cmd, flag, path, rest @ ..] if cmd == "run" && flag == "--trace" => {
             match run_file_limited(
                 path,
-                rest,
+                strip_separator(rest),
                 &mut std::io::stdout(),
                 rhp_vm::VmLimits::default(),
                 true,
@@ -499,19 +499,31 @@ fn run_tests(target: &Path) -> Result<(), String> {
     if target.is_file() {
         files.push(target.to_path_buf());
     } else if target.is_dir() {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(target)
-            .map_err(|e| format!("nao foi possivel listar `{}`: {e}", target.display()))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file()
+        // CLI-002: desce em subdiretorios (antes, `*_test.rhp` em `sub/`
+        // era ignorado em silencio). Ordem deterministica por caminho.
+        let mut stack = vec![target.to_path_buf()];
+        let mut entries: Vec<PathBuf> = Vec::new();
+        while let Some(dir) = stack.pop() {
+            let mut children: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .map_err(|e| format!("nao foi possivel listar `{}`: {e}", dir.display()))?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect();
+            children.sort();
+            for path in children {
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.is_file()
                     && path.extension().and_then(|ext| ext.to_str()) == Some("rhp")
                     && path
                         .file_stem()
                         .and_then(|stem| stem.to_str())
                         .is_some_and(|stem| stem.ends_with("_test"))
-            })
-            .collect();
+                {
+                    entries.push(path);
+                }
+            }
+        }
         entries.sort();
         files = entries;
     } else {
@@ -629,7 +641,18 @@ impl Fail {
 
 /// Executa um arquivo `.rhp`, repassando argumentos extras para `argv()`.
 fn run_file_with_args(path: &str, args: &[String], output: &mut dyn Write) -> Result<(), Fail> {
+    // LIB-004: `rhp run prog.rhp -- a b` — o separador `--` nao entra
+    // em `argv()` (antes, vazava como primeiro elemento).
+    let args = strip_separator(args);
     run_file_limited(path, args, output, rhp_vm::VmLimits::default(), false)
+}
+
+/// Tira um `--` inicial (separador CLI), preservando o resto intacto.
+fn strip_separator(args: &[String]) -> &[String] {
+    match args {
+        [first, rest @ ..] if first == "--" => rest,
+        _ => args,
+    }
 }
 
 /// REPL interativo (Etapa 4, DevX): le linhas do stdin, compila e executa
@@ -644,9 +667,12 @@ fn run_repl() -> Result<(), String> {
     // na thread (precisa ver funcoes de linhas anteriores).
     let mut session: Vec<rhp_parser::StmtNode> = Vec::new();
     let mut lines = std::io::BufReader::new(std::io::stdin()).lines();
+    // CLI-001: buffer de continuacao (blocos multilinha) — erro de sintaxe
+    // ou de compilacao NAO mata a sessao (antes, o `?` encerrava o repl).
+    let mut pending = String::new();
     loop {
         if interactive {
-            print!("> ");
+            print!("{}", if pending.is_empty() { "> " } else { "... " });
             let _ = std::io::stdout().flush();
         }
         let Some(line) = lines.next() else {
@@ -654,22 +680,54 @@ fn run_repl() -> Result<(), String> {
         };
         let line = line.map_err(|e| format!("falha lendo stdin: {e}"))?;
         let src = line.trim();
-        if src.is_empty() || src == "sair" {
+        if pending.is_empty() {
+            if src.is_empty() {
+                continue;
+            }
             if src == "sair" {
                 break;
             }
-            continue;
+            pending.push_str(&line);
+        } else {
+            if src == "sair" {
+                // `sair` sozinho cancela a continuacao em vez de sair.
+                pending.clear();
+                continue;
+            }
+            pending.push('\n');
+            pending.push_str(&line);
         }
-        let program = rhp_parser::parse_source(src).map_err(|e| format!("repl:{e}"))?;
+        let program = match rhp_parser::parse_source(&pending) {
+            Ok(program) => program,
+            Err(e) => {
+                let message = e.to_string();
+                // Entrada incompleta (bloco/string abertos): continua
+                // acumulando em vez de reportar erro.
+                if message.contains("fim de arquivo") || message.contains("nao terminada") {
+                    continue;
+                }
+                pending.clear();
+                eprintln!("rhp: repl: erro de sintaxe: {e}");
+                continue;
+            }
+        };
+        pending.clear();
+        let chunk = match rhp_bytecode::compile(&program) {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
+                eprintln!(
+                    "rhp: {}",
+                    with_code(code, help, &format!("repl: erro de compilacao: {e}"))
+                );
+                continue;
+            }
+        };
         session.extend(program.statements.iter().cloned());
         vm.set_program(Arc::new(rhp_parser::Program {
             statements: session.clone(),
             trailing_comments: Vec::new(),
         }));
-        let chunk = rhp_bytecode::compile(&program).map_err(|e| {
-            let (code, help) = rhp_diagnostic::compile_code(&e.to_string());
-            with_code(code, help, &format!("repl: erro de compilacao: {e}"))
-        })?;
         let mut out = std::io::stdout();
         if let Err(e) = vm.run_continue(&chunk, &mut out) {
             if e.exit_code().is_some() {

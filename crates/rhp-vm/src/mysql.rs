@@ -16,6 +16,10 @@ const CAPS_DB: u32 = 0x0000_0008;
 const CHARSET: u8 = 45;
 /// Teto de pacote lido (anti-DoS; MySQL permite ate 16 MiB por padrao).
 const MAX_PACKET: usize = 16 * 1024 * 1024;
+/// Colunas maximas por resultado (CONN-002: `ncol` vem da rede; MySQL
+/// limita a 4096 colunas por tabela — 100k e folga ampla sem risco de
+/// `with_capacity` abortar o processo).
+const MAX_COLUMNS: u64 = 100_000;
 /// Plugins de autenticacao suportados (RFC 0033).
 const PLUGIN_NATIVE: &str = "mysql_native_password";
 const PLUGIN_CACHING_SHA2: &str = "caching_sha2_password";
@@ -577,34 +581,103 @@ impl Connection {
     fn interpolate(sql: &str, params: &[super::sqlite::SqlValue]) -> Result<String, String> {
         let mut out = String::new();
         let mut iter = params.iter();
-        for ch in sql.chars() {
-            if ch == '?' {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| "`db`: mais `?` que parametros".to_string())?;
-                match value {
-                    super::sqlite::SqlValue::Int(n) => out.push_str(&n.to_string()),
-                    super::sqlite::SqlValue::Float(n) => out.push_str(&format!("{n}")),
-                    super::sqlite::SqlValue::Text(s) => {
-                        out.push('\'');
-                        for c in s.chars() {
-                            match c {
-                                '\0' => out.push_str("\\0"),
-                                '\n' => out.push_str("\\n"),
-                                '\r' => out.push_str("\\r"),
-                                '\\' => out.push_str("\\\\"),
-                                '\'' => out.push_str("\\'"),
-                                '"' => out.push_str("\\\""),
-                                '\x1a' => out.push_str("\\Z"),
-                                c => out.push(c),
+        // CONN-003: `?` dentro de literais ('...', "...", `...`, com
+        // escapes) nao e placeholder. Varredura com estado, sem regex.
+        let mut quote: Option<char> = None;
+        let mut chars = sql.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if let Some(q) = quote {
+                out.push(ch);
+                if ch == '\\' {
+                    // Escape: copia o proximo char literalmente.
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                    continue;
+                }
+                if ch == q {
+                    // Aspa duplicada '' = escape SQL (permanece no literal).
+                    if chars.peek() == Some(&q) {
+                        out.push(chars.next().unwrap_or(q));
+                        continue;
+                    }
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' | '`' => {
+                    quote = Some(ch);
+                    out.push(ch);
+                }
+                '?' => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| "`db`: mais `?` que parametros".to_string())?;
+                    match value {
+                        super::sqlite::SqlValue::Int(n) => out.push_str(&n.to_string()),
+                        super::sqlite::SqlValue::Float(n) => out.push_str(&format!("{n}")),
+                        super::sqlite::SqlValue::Text(s) => {
+                            out.push('\'');
+                            for c in s.chars() {
+                                match c {
+                                    '\0' => out.push_str("\\0"),
+                                    '\n' => out.push_str("\\n"),
+                                    '\r' => out.push_str("\\r"),
+                                    '\\' => out.push_str("\\\\"),
+                                    '\'' => out.push_str("\\'"),
+                                    '"' => out.push_str("\\\""),
+                                    '\x1a' => out.push_str("\\Z"),
+                                    c => out.push(c),
+                                }
+                            }
+                            out.push('\'');
+                        }
+                        super::sqlite::SqlValue::Null => out.push_str("NULL"),
+                    }
+                }
+                _ => {
+                    // Comentarios nao tem placeholder: `-- x` / `# x` ate EOL,
+                    // `/* x */` em bloco.
+                    if ch == '-' && chars.peek() == Some(&'-') {
+                        out.push(ch);
+                        out.push(chars.next().unwrap_or('-'));
+                        // MySQL so trata `--` como comentario com branco apos.
+                        if chars.peek().is_none_or(|c| c.is_whitespace()) {
+                            for c in chars.by_ref() {
+                                out.push(c);
+                                if c == '\n' {
+                                    break;
+                                }
                             }
                         }
-                        out.push('\'');
+                        continue;
                     }
-                    super::sqlite::SqlValue::Null => out.push_str("NULL"),
+                    if ch == '#' {
+                        out.push(ch);
+                        for c in chars.by_ref() {
+                            out.push(c);
+                            if c == '\n' {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if ch == '/' && chars.peek() == Some(&'*') {
+                        out.push(ch);
+                        out.push(chars.next().unwrap_or('*'));
+                        let mut prev = '\0';
+                        for c in chars.by_ref() {
+                            out.push(c);
+                            if prev == '*' && c == '/' {
+                                break;
+                            }
+                            prev = c;
+                        }
+                        continue;
+                    }
+                    out.push(ch);
                 }
-            } else {
-                out.push(ch);
             }
         }
         if iter.next().is_some() {
@@ -682,7 +755,11 @@ impl Connection {
             _ => {}
         }
         let mut pos = 0;
-        let ncol = read_lenenc(&reply, &mut pos)? as usize;
+        let ncol = read_lenenc(&reply, &mut pos)?;
+        if ncol > MAX_COLUMNS {
+            return Err(format!("`db_query`: colunas demais ({ncol})"));
+        }
+        let ncol = ncol as usize;
         // Definicoes de coluna: nome + tipo.
         let mut names = Vec::with_capacity(ncol);
         let mut types = Vec::with_capacity(ncol);
@@ -1174,6 +1251,87 @@ mod tests {
         ))
         .expect("dreno apos exec-select");
         assert_eq!(out, "erro-ok\n[{s: x, um: 1}]\nnull\n");
+    }
+
+    /// Fake que anuncia contagem de colunas absurda (CONN-002): pacote de
+    /// contagem `0xFE + u64(5_000_000_000)`. Sem o teto, `with_capacity`
+    /// abortava o processo (SIGABRT). Agora e erro tratavel.
+    fn mysql_evil_ncol(listener: TcpListener) {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .expect("timeout");
+                let mut seq = 0u8;
+                mock_greeting(&mut stream, &mut seq, b"mysql_native_password\0", MOCK_SEED);
+                let _ = mock_read(&mut stream);
+                // OK de boas-vindas (sem validar auth; o mal esta no result).
+                mock_packet(&mut stream, &mut seq, &[0, 0, 0, 2, 0, 0, 0]);
+                while let Some((cmd, _)) = mock_read_opt(&mut stream) {
+                    match cmd.first() {
+                        Some(0x01) => break, // COM_QUIT.
+                        Some(0x03) => {
+                            // Contagem de colunas = 5 bilhoes (lenenc 0xFE).
+                            let mut evil = vec![0xFEu8];
+                            evil.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+                            mock_packet(&mut stream, &mut seq, &evil);
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn mysql_interpolate_ignores_question_in_literals_and_comments() {
+        // CONN-003: `?` em literais/comentarios nao e placeholder.
+        use super::Connection;
+        use crate::sqlite::SqlValue;
+        let none: Vec<SqlValue> = vec![];
+        assert_eq!(
+            Connection::interpolate("SELECT 'a?b'", &none).expect("literal simples"),
+            "SELECT 'a?b'"
+        );
+        assert_eq!(
+            Connection::interpolate("SELECT 'it''s ?'", &none).expect("aspa duplicada"),
+            "SELECT 'it''s ?'"
+        );
+        assert_eq!(
+            Connection::interpolate("SELECT \"a?b\", `c?d`", &none).expect("aspas duplas/crase"),
+            "SELECT \"a?b\", `c?d`"
+        );
+        assert_eq!(
+            Connection::interpolate("SELECT 1 -- ops?\n, 2", &none).expect("comentario linha"),
+            "SELECT 1 -- ops?\n, 2"
+        );
+        assert_eq!(
+            Connection::interpolate("SELECT /* q? */ 1", &none).expect("comentario bloco"),
+            "SELECT /* q? */ 1"
+        );
+        // Alinhamento real: literal + placeholder misturados.
+        let one = vec![SqlValue::Int(7)];
+        assert_eq!(
+            Connection::interpolate("SELECT 'a?b', ?", &one).expect("misto"),
+            "SELECT 'a?b', 7"
+        );
+        // Placeholder de verdade sem parametro continua erro.
+        assert!(Connection::interpolate("SELECT ?", &none).is_err());
+    }
+
+    #[test]
+    fn mysql_query_rejects_absurd_column_count_without_abort() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("porta").port();
+        std::thread::spawn(move || mysql_evil_ncol(listener));
+        let open =
+            format!("db_open(\"mysql:host=127.0.0.1 port={port} user=teste password=segredo\")");
+        let err = run_mysql(&format!(
+            "let h = {open};\necho db_query(h, \"SELECT 1\", []);\n"
+        ))
+        .expect_err("contagem absurda deve falhar");
+        assert!(err.contains("colunas demais"), "erro inesperado: {err}");
     }
 
     #[test]

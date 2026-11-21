@@ -747,7 +747,10 @@ impl Vm {
                     .stack
                     .pop()
                     .ok_or_else(|| VmError::new("pilha vazia em `Print`"))?;
-                writeln!(output, "{value}")
+                // Estrito (VM-001/SEC-001): valor profundo demais vira erro
+                // tratavel, nunca abort do processo.
+                let text = value.to_display_string().map_err(VmError::new)?;
+                writeln!(output, "{text}")
                     .map_err(|e| VmError::new(format!("falha ao escrever saida: {e}")))?;
                 self.frames[idx].ip += 1;
             }
@@ -937,9 +940,9 @@ impl Vm {
                     .cloned()
                     .ok_or_else(|| VmError::new(format!("funcao {func_idx} inexistente")))?;
                 let env = self.capture_env(idx);
-                self.frames[idx]
-                    .stack
-                    .push(Value::Func(FuncValue { def, env }));
+                // VM-007: via `push_checked` (antes, o env capturado furava
+                // `max_heap_bytes`/`max_collection_len`).
+                self.push_checked(idx, Value::Func(FuncValue { def, env }))?;
                 self.frames[idx].ip += 1;
             }
             Op::Call(arity) => {
@@ -1252,7 +1255,13 @@ impl Vm {
             }
             Op::Throw => {
                 let value = self.pop(idx, "`throw`")?;
-                let original = VmError::new(format!("excecao nao capturada: {value}"));
+                // Formata antes do unwind, com teto (VM-001/SEC-001): valor
+                // profundo demais gera marcador, nunca abort — mesmo quando
+                // houver `catch` (a mensagem so e usada se nao capturado).
+                let message = value
+                    .to_display_string()
+                    .unwrap_or_else(|e| format!("<{e}>"));
+                let original = VmError::new(format!("excecao nao capturada: {message}"));
                 return self.unwind(value, original);
             }
             Op::Rethrow => {
@@ -2201,14 +2210,21 @@ impl Vm {
     /// `true` se `class` e `target` ou subclasse (cadeia `parent`).
     fn is_subclass_of(&self, idx: usize, class: &Rc<ClassDef>, target: &str) -> bool {
         let mut current: Option<Rc<ClassDef>> = Some(class.clone());
-        // Limite anti-ciclo (hierarquia valida nao tem ciclo, mas bytecode
-        // artesanal poderia forjar `parent` inconsistente).
-        for _ in 0..256 {
+        // VM-006: sem teto arbitrario de 256 (hierarquias geradas profundas
+        // erravam `catch` em silencio). Cadeia valida e aciclica — o
+        // compilador rejeita `extends` circular; ciclo so existe em bytecode
+        // artesanal e e detectado por revisita (fail-safe, sem loop).
+        let mut visited: Vec<String> = Vec::new();
+        loop {
             match current {
                 Some(c) => {
                     if c.name == target {
                         return true;
                     }
+                    if visited.iter().any(|n| n == &c.name) {
+                        return false;
+                    }
+                    visited.push(c.name.clone());
                     match c.parent.as_ref() {
                         Some(pname) => {
                             current = self.lookup_class(idx, pname);
@@ -2226,7 +2242,6 @@ impl Vm {
                 None => return false,
             }
         }
-        false
     }
 
     /// Gera tarefa para `async fn` ou metodo `async` (item metodos-async):
@@ -2332,6 +2347,14 @@ impl Vm {
             }
             _ => return Err(VmError::new("`next` exige 1 argumento".to_string())),
         };
+        // VM-003: resume tambem respeita `MAX_CALL_DEPTH` (antes, frames
+        // suspensos contornavam o teto: 2000+ frames vivos via `next`).
+        // Checa ANTES de tomar o frame: em erro, o gerador segue utilizavel.
+        if self.frames.len() >= MAX_CALL_DEPTH {
+            return Err(VmError::new(
+                "limite de chamadas excedido (recursao muito profunda?)".to_string(),
+            ));
+        }
         let frame = {
             let mut state = gen.0.borrow_mut();
             if state.done {
@@ -2685,6 +2708,20 @@ impl Vm {
                 "callback de `{name}` nao pode ser gerador (use `for x in gen` ou `next`)"
             )));
         }
+        // VM-004: nativa nao atravessa o protocolo de chamada pendente
+        // (caia no `Halt` interno). Rejeita com erro claro.
+        if func.def.native_id.is_some() {
+            return Err(VmError::new(format!(
+                "callback de `{name}` deve ser funcao RHP (nativa nao suportada)"
+            )));
+        }
+        // VM-005: `async` fora do protocolo de tarefas executava sincrono,
+        // quebrando o modelo (sem task, sem `await`/`cancel`). Rejeita.
+        if func.def.is_async {
+            return Err(VmError::new(format!(
+                "callback de `{name}` nao pode ser `async` (use `await` na tarefa)"
+            )));
+        }
         if items.is_empty() {
             self.push_checked(idx, Value::Array(Vec::new()))?;
             self.frames[idx].ip += 1;
@@ -2883,11 +2920,15 @@ impl Vm {
     /// interno preserva a mensagem original (via mapa `{tipo, mensagem}`);
     /// valor lancado a mao usa `excecao nao capturada: ...`.
     fn uncaught_message(value: &Value) -> String {
+        // Com teto (VM-001/SEC-001): nunca abort em valor profundo.
+        let shown = value
+            .to_display_string()
+            .unwrap_or_else(|e| format!("<{e}>"));
         match value {
             Value::Map(entries) if matches!(entries.get("tipo"), Some(Value::Str(t)) if t == "runtime") => {
                 match entries.get("mensagem") {
                     Some(Value::Str(message)) => message.clone(),
-                    _ => format!("{value}"),
+                    _ => shown.clone(),
                 }
             }
             other => format!("excecao nao capturada: {other}"),
@@ -5531,6 +5572,11 @@ mod tests {
             )
             .expect("ok"),
             "true\n"
+        );
+        // PERF-004: string longa com multibyte (caminho O(n) novo).
+        assert_eq!(
+            run_src("let s = json_parse(\"\\\"olá 🌍\\\"\"); echo s;").expect("ok"),
+            "olá 🌍\n"
         );
         // Numero inteiro grande alem de i64 vira Float (perda documentada).
         assert_eq!(

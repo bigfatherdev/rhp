@@ -2,16 +2,21 @@
 
 ## Garantido e testado (nao apenas alegado)
 
-- **Sem `unsafe`** em todo o workspace (verificado por inspecao; proibido
-  na Fase 1 e mantido desde entao).
+- **`unsafe` isolado no FFI SQLite** (`sqlite.rs`, com invariantes
+  documentadas e verificadas: `CString` antes do FFI, null-checks,
+  `Drop` em `Connection`/`StmtGuard`, `!Send`): sem alcance por entrada
+  RHP (ver `audit/` 0.7.2, SEC-008). Resto do workspace sem `unsafe`.
 - **Bytecode validado antes de executar**, recursivamente e com **analise
   estatica de fluxo de pilha** (underflow e juncoes divergentes viram erro
   de validacao, nao de runtime); bytecode e tratado como entrada
   nao confiavel.
 - **Sem panics em entradas nao confiaveis**: lexer/parser/compiler/VM
-  retornam erros; `unwrap()`/`expect()` so em testes. Excecao conhecida e
-  corrigida: aninhamento profundo agora e erro `profundidade maxima`
-  (limite 128), nao abort (ver `reports/AUDIT_MASTER.md`, AUD-001).
+  retornam erros (`VmError`); `unwrap()`/`expect()` fora de testes so em
+  invariantes internas (cursor apos `peek`, chaves recem-ordenadas, mutex
+  do servidor). Excecoes conhecidas e corrigidas: aninhamento sintatico
+  alem de 64 vira erro `profundidade maxima` (AUD-001); valor profundo
+  em `echo`/`str()`/`throw` vira erro tratavel em vez de abort (VM-001,
+  0.7.2).
 - **Aritmetica inteira checada** (estouro, `/0`, `%0`, `int()` estrito nos
   limites, sem saturacao silenciosa).
 - **Limites com teste**: recursao 512 frames, corpo HTTP 1 MiB, fonte

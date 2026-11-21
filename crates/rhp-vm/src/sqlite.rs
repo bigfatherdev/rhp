@@ -149,6 +149,10 @@ impl Connection {
     }
 
     fn prepare(&self, sql: &str) -> Result<*mut sqlite3_stmt, String> {
+        // CONN-005: `""` caia no `sqlite3_errmsg` generico ("not an error").
+        if sql.trim().trim_matches(';').trim().is_empty() {
+            return Err("`db`: SQL vazio".to_string());
+        }
         let text = c_string(sql, "preparar SQL")?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
         let mut tail: *const c_char = std::ptr::null();
@@ -221,6 +225,13 @@ impl Connection {
         let stmt = self.prepare(sql)?;
         let guard = StmtGuard { stmt };
         self.bind_all(guard.stmt, params)?;
+        // CONN-004: `exec(SELECT)` devolvia `sqlite3_changes` obsoleto (o do
+        // DML anterior). SELECT nao tem "linhas afetadas": devolve 0
+        // (o guard descarta o statement; sem stepped rows).
+        // (Vinculo antes: aridade/tipo de parametro continua checada.)
+        if unsafe { sqlite3_column_count(guard.stmt) } > 0 {
+            return Ok(0);
+        }
         loop {
             let code = unsafe { sqlite3_step(guard.stmt) };
             match code {
